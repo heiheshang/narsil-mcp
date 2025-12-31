@@ -10,7 +10,12 @@ use narsil_mcp::config::ConfigLoader;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+/// Mutex to serialize tests that modify NARSIL_* environment variables
+/// This prevents race conditions when tests run in parallel
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Helper to create a temporary config file
 fn create_temp_config(dir: &TempDir, filename: &str, content: &str) -> PathBuf {
@@ -35,6 +40,9 @@ fn create_project_config(content: &str) -> TempDir {
 
 #[test]
 fn test_default_config_loads() {
+    // Acquire mutex to prevent env var race conditions with parallel tests
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     // Clean up environment variables that might be set by other tests
     std::env::remove_var("NARSIL_PRESET");
     std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
@@ -127,6 +135,8 @@ tools:
 
 #[test]
 fn test_env_var_preset_override() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     // Set environment variable
     env::set_var("NARSIL_PRESET", "minimal");
 
@@ -142,6 +152,8 @@ fn test_env_var_preset_override() {
 
 #[test]
 fn test_env_var_enabled_categories() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     env::set_var("NARSIL_ENABLED_CATEGORIES", "Repository,Symbols,Search");
 
     let loader = ConfigLoader::new();
@@ -162,6 +174,8 @@ fn test_env_var_enabled_categories() {
 
 #[test]
 fn test_env_var_disabled_tools() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     env::set_var("NARSIL_DISABLED_TOOLS", "neural_search,generate_sbom");
 
     let loader = ConfigLoader::new();
@@ -179,6 +193,8 @@ fn test_env_var_disabled_tools() {
 
 #[test]
 fn test_env_var_overrides_user_config() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     // User config enables neural_search
     let user_config_content = r#"
 version: "1.0"
@@ -209,6 +225,8 @@ tools:
 
 #[test]
 fn test_env_var_config_path() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
     let custom_config_content = r#"
 version: "1.0"
 tools:
@@ -275,9 +293,13 @@ tools:
 
 #[test]
 fn test_invalid_config_returns_error() {
+    // Use a config with a type mismatch - 'enabled' should be a bool, not a string
     let invalid_config_content = r#"
-version: "999.0"
-invalid_field: "should not parse"
+version: "1.0"
+tools:
+  categories:
+    Repository:
+      enabled: "not_a_boolean"
 "#;
 
     let temp_dir = create_user_config(invalid_config_content);
@@ -286,13 +308,20 @@ invalid_field: "should not parse"
     let mut loader = ConfigLoader::new();
     loader = loader.with_user_config_path(Some(user_config_path));
 
-    // Should return error for invalid version
+    // Should return error for invalid type
     let result = loader.load();
     assert!(result.is_err());
 }
 
 #[test]
 fn test_missing_user_config_falls_back_to_default() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
+    // Clean up env vars that could affect this test
+    std::env::remove_var("NARSIL_DISABLED_TOOLS");
+    std::env::remove_var("NARSIL_PRESET");
+    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
+
     let mut loader = ConfigLoader::new();
     loader = loader.with_user_config_path(Some(PathBuf::from("/nonexistent/path/config.yaml")));
 

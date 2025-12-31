@@ -26,6 +26,8 @@ pub struct ToolConfig {
     pub editors: HashMap<String, serde_json::Value>,
 
     /// Tool configuration (categories and overrides)
+    /// Defaults to empty config when using preset-only configurations
+    #[serde(default)]
     pub tools: ToolsConfig,
 
     /// Performance budgets and limits
@@ -206,5 +208,28 @@ mod tests {
         let config = ToolConfig::default();
         // Tools not overridden should default to enabled
         assert!(config.is_tool_enabled("list_repos"));
+    }
+
+    #[test]
+    fn test_preset_only_config() {
+        // Issue #5: Preset-only configs should parse without requiring tools field
+        let yaml = r#"
+version: "1.0"
+preset: "full"
+"#;
+        let config: ToolConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.version, "1.0");
+        assert_eq!(config.preset, Some("full".to_string()));
+        assert!(config.tools.categories.is_empty());
+        assert!(config.tools.overrides.is_empty());
+    }
+
+    #[test]
+    fn test_minimal_preset_config() {
+        // Even more minimal - just preset
+        let yaml = r#"preset: "minimal""#;
+        let config: ToolConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.preset, Some("minimal".to_string()));
+        assert_eq!(config.version, "1.0"); // Should use default
     }
 }

@@ -193,17 +193,18 @@ tools:
 }
 
 #[test]
-fn test_parse_missing_required_fields() {
+fn test_parse_with_tools_field_omitted() {
+    // Issue #5: tools field should now be optional with a default
     let yaml = r#"
 version: "1.0"
 "#;
 
-    // Should fail to parse without required 'tools' field
-    let result: Result<ToolConfig, _> = serde_yaml::from_str(yaml);
-    assert!(
-        result.is_err(),
-        "Should fail without required 'tools' field"
-    );
+    // Should succeed - tools field now has a default
+    let config: ToolConfig = serde_yaml::from_str(yaml).expect("Should parse without tools field");
+    assert_eq!(config.version, "1.0");
+    // Tools should be empty by default
+    assert!(config.tools.categories.is_empty());
+    assert!(config.tools.overrides.is_empty());
 }
 
 #[test]
