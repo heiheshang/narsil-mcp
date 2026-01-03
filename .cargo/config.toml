@@ -1,0 +1,36 @@
+# Cargo configuration for faster builds
+#
+# This project can benefit from using faster linkers. The default system linker
+# is often the bottleneck for large Rust projects.
+#
+# Linker recommendations by platform:
+# - Linux (Rust 1.90+): lld is already the default! mold is even faster (~2x)
+# - macOS: zld is recommended (lld has issues on Mach-O). ~40-50% faster.
+# - Windows: lld can be used with MSVC toolchain
+#
+# Install instructions:
+#   Linux:  sudo apt install mold  OR  brew install mold
+#   macOS:  brew install michaeleisel/zld/zld
+#
+# After installing, uncomment the appropriate section below.
+
+# ============================================================================
+# Linux: Use mold for fastest linking (5x faster than GNU ld, 2x faster than lld)
+# Note: lld is already the default on Linux with Rust 1.90+, so this is optional
+# ============================================================================
+# [target.'cfg(target_os = "linux")']
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# ============================================================================
+# macOS: Use zld for faster linking (~40-50% faster than default Apple linker)
+# Install: brew install michaeleisel/zld/zld
+# ============================================================================
+# [target.'cfg(target_os = "macos")']
+# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/zld"]
+
+# ============================================================================
+# Windows: Use lld for faster linking
+# Requires LLVM to be installed (winget install LLVM)
+# ============================================================================
+# [target.'cfg(target_os = "windows")']
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
