@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor, Tree};
 
@@ -12,6 +13,42 @@ pub struct LanguageConfig {
     pub language: Language,
     pub extensions: Vec<&'static str>,
     pub symbol_query: &'static str,
+}
+
+/// Language configuration with lazily-compiled query
+/// Query is compiled on first use, warnings logged once, then cached
+struct LazyLanguageConfig {
+    config: LanguageConfig,
+    /// Lazily compiled query (None if compilation failed)
+    compiled_query: OnceLock<Option<Arc<Query>>>,
+}
+
+impl LazyLanguageConfig {
+    fn new(config: LanguageConfig) -> Self {
+        Self {
+            config,
+            compiled_query: OnceLock::new(),
+        }
+    }
+
+    /// Get the compiled query, compiling on first access
+    fn get_query(&self) -> Option<&Arc<Query>> {
+        self.compiled_query
+            .get_or_init(
+                || match Query::new(&self.config.language, self.config.symbol_query) {
+                    Ok(q) => Some(Arc::new(q)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Query compilation failed for {} (this warning appears once): {:?}",
+                            self.config.name,
+                            e
+                        );
+                        None
+                    }
+                },
+            )
+            .as_ref()
+    }
 }
 
 /// A parsed file with extracted information
@@ -27,7 +64,7 @@ pub struct ParsedFile {
 
 /// Multi-language parser using tree-sitter
 pub struct LanguageParser {
-    configs: Vec<LanguageConfig>,
+    configs: Vec<LazyLanguageConfig>,
 }
 
 impl LanguageParser {
@@ -133,7 +170,7 @@ impl LanguageParser {
                     (class_specifier name: (type_identifier) @class.name) @class.def
                     (struct_specifier name: (type_identifier) @struct.name) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name) @enum.def
-                    (namespace_definition name: (identifier) @namespace.name) @namespace.def
+                    (namespace_definition name: (namespace_identifier) @namespace.name) @namespace.def
                 "#,
             },
             // Java
@@ -238,33 +275,40 @@ impl LanguageParser {
             },
         ];
 
-        Ok(Self { configs })
+        // Wrap configs in lazy wrappers (queries compiled on first use, not during init)
+        let lazy_configs = configs.into_iter().map(LazyLanguageConfig::new).collect();
+
+        Ok(Self {
+            configs: lazy_configs,
+        })
     }
 
     /// Get language config for a file extension
-    fn get_config(&self, path: &Path) -> Option<&LanguageConfig> {
+    fn get_config(&self, path: &Path) -> Option<&LazyLanguageConfig> {
         let ext = path.extension()?.to_str()?;
-        self.configs.iter().find(|c| c.extensions.contains(&ext))
+        self.configs
+            .iter()
+            .find(|c| c.config.extensions.contains(&ext))
     }
 
     /// Parse a file and extract symbols
     pub fn parse_file(&self, path: &Path, content: &str) -> Result<ParsedFile> {
-        let config = self
+        let lazy_config = self
             .get_config(path)
             .ok_or_else(|| anyhow!("Unsupported file type: {:?}", path))?;
 
         let mut parser = Parser::new();
-        parser.set_language(&config.language)?;
+        parser.set_language(&lazy_config.config.language)?;
 
         let tree = parser
             .parse(content, None)
             .ok_or_else(|| anyhow!("Failed to parse file"))?;
 
-        let symbols = self.extract_symbols(&tree, content, config)?;
+        let symbols = self.extract_symbols(&tree, content, lazy_config)?;
 
         Ok(ParsedFile {
             path: path.to_string_lossy().to_string(),
-            language: config.name.clone(),
+            language: lazy_config.config.name.clone(),
             symbols,
             tree: Some(tree),
         })
@@ -273,12 +317,12 @@ impl LanguageParser {
     /// Parse a file and return just the tree (for call graph analysis)
     #[allow(dead_code)]
     pub fn parse_to_tree(&self, path: &Path, content: &str) -> Result<Tree> {
-        let config = self
+        let lazy_config = self
             .get_config(path)
             .ok_or_else(|| anyhow!("Unsupported file type: {:?}", path))?;
 
         let mut parser = Parser::new();
-        parser.set_language(&config.language)?;
+        parser.set_language(&lazy_config.config.language)?;
 
         parser
             .parse(content, None)
@@ -290,22 +334,19 @@ impl LanguageParser {
         &self,
         tree: &Tree,
         source: &str,
-        config: &LanguageConfig,
+        lazy_config: &LazyLanguageConfig,
     ) -> Result<Vec<Symbol>> {
         let mut symbols = Vec::new();
         let source_bytes = source.as_bytes();
 
-        // Parse the query
-        let query = match Query::new(&config.language, config.symbol_query) {
-            Ok(q) => q,
-            Err(e) => {
-                tracing::warn!("Query error for {}: {:?}", config.name, e);
-                return Ok(symbols);
-            }
+        // Get lazily-compiled query (errors logged once on first access)
+        let query = match lazy_config.get_query() {
+            Some(q) => q,
+            None => return Ok(symbols), // Query compilation failed, return empty
         };
 
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+        let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
 
         while let Some(match_) = matches.next() {
             let mut name: Option<String> = None;
@@ -354,7 +395,7 @@ impl LanguageParser {
     pub fn supported_extensions(&self) -> Vec<&'static str> {
         self.configs
             .iter()
-            .flat_map(|c| c.extensions.iter().copied())
+            .flat_map(|c| c.config.extensions.iter().copied())
             .collect()
     }
 }
@@ -544,6 +585,54 @@ func standaloneFunction() {
             names.contains(&&"Direction".to_string()),
             "Should find enum"
         );
+        assert!(
+            names.contains(&&"standaloneFunction".to_string()),
+            "Should find function"
+        );
+    }
+
+    #[test]
+    fn test_parse_cpp() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+namespace MyNamespace {
+    class MyClass {
+    public:
+        void myMethod() {}
+    };
+
+    struct MyStruct {
+        int x;
+        int y;
+    };
+
+    enum MyEnum {
+        VALUE_A,
+        VALUE_B
+    };
+}
+
+void standaloneFunction() {
+    // do something
+}
+        "#;
+
+        let parsed = parser.parse_file(Path::new("test.cpp"), content).unwrap();
+        assert_eq!(parsed.language, "cpp");
+        assert!(!parsed.symbols.is_empty());
+
+        let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&"MyNamespace".to_string()),
+            "Should find namespace, found: {:?}",
+            names
+        );
+        assert!(names.contains(&&"MyClass".to_string()), "Should find class");
+        assert!(
+            names.contains(&&"MyStruct".to_string()),
+            "Should find struct"
+        );
+        assert!(names.contains(&&"MyEnum".to_string()), "Should find enum");
         assert!(
             names.contains(&&"standaloneFunction".to_string()),
             "Should find function"
