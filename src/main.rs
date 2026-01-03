@@ -37,7 +37,7 @@ mod type_inference;
 
 use anyhow::Result;
 use clap::{Parser as ClapParser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -178,6 +178,15 @@ async fn main() -> Result<()> {
         let discovered = repo::discover_repos(&discover_path, 3)?;
         info!("Found {} repositories", discovered.len());
         repos.extend(discovered);
+    }
+
+    // Expand "." to current directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let dot_path = Path::new(".");
+
+        if let Some(path) = repos.iter_mut().find(|p| *p == dot_path) {
+            *path = cwd;
+        }
     }
 
     info!("Repos to index: {:?}", repos);
