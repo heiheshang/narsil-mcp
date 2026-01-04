@@ -774,17 +774,16 @@ impl CodeIntelEngine {
 
         let indent = "  ".repeat(depth);
         let name = current.file_name().and_then(|n| n.to_str()).unwrap_or(".");
-        let is_root = depth == 0;
 
         if current.is_dir() {
-            // Skip hidden and common non-essential directories
-            if !is_root
+            // Skip hidden and common non-essential directories (but not at root level,
+            // since the repo itself might be in a hidden directory like ~/.dotfiles)
+            if depth > 0
                 && (name.starts_with('.')
                     || name == "node_modules"
                     || name == "target"
                     || name == "__pycache__"
-                    || name == "venv"
-                    || name == ".git")
+                    || name == "venv")
             {
                 return Ok(());
             }
