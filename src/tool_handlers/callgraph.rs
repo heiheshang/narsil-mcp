@@ -19,7 +19,10 @@ impl ToolHandler for GetCallGraphHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let function = args.get_str("function").unwrap_or("");
         let depth = args.get_u64_or("depth", 3) as usize;
-        engine.get_call_graph(repo, function, depth).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .get_call_graph(repo, function, depth, exclude_tests)
+            .await
     }
 }
 
@@ -37,8 +40,9 @@ impl ToolHandler for GetCallersHandler {
         let function = args.get_str("function").unwrap_or("");
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .get_callers(repo, function, transitive, max_depth)
+            .get_callers(repo, function, transitive, max_depth, exclude_tests)
             .await
     }
 }
@@ -57,8 +61,9 @@ impl ToolHandler for GetCalleesHandler {
         let function = args.get_str("function").unwrap_or("");
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .get_callees(repo, function, transitive, max_depth)
+            .get_callees(repo, function, transitive, max_depth, exclude_tests)
             .await
     }
 }
@@ -108,6 +113,9 @@ impl ToolHandler for GetFunctionHotspotsHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let min_connections = args.get_u64_or("min_connections", 5) as usize;
-        engine.get_function_hotspots(repo, min_connections).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .get_function_hotspots(repo, min_connections, exclude_tests)
+            .await
     }
 }

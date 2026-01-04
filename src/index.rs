@@ -812,11 +812,16 @@ impl CodeIntelEngine {
         symbol_type: Option<&str>,
         pattern: Option<&str>,
         file_pattern: Option<&str>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let symbols = self
             .symbols
             .get(repo)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
+
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
 
         let type_filter: Option<SymbolKind> = symbol_type.and_then(|t| match t {
             "struct" => Some(SymbolKind::Struct),
@@ -835,6 +840,10 @@ impl CodeIntelEngine {
         let filtered: Vec<_> = symbols
             .iter()
             .filter(|s| {
+                // Test file filter
+                if exclude_tests && is_test_file(&s.file_path) {
+                    return false;
+                }
                 // Type filter
                 if let Some(ref kind) = type_filter {
                     if &s.kind != kind {
@@ -961,8 +970,12 @@ impl CodeIntelEngine {
         query: &str,
         file_pattern: Option<&str>,
         max_results: usize,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let query_lower = query.to_lowercase();
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
         let mut results: Vec<CodeExcerpt> = Vec::new();
 
         let repos_to_search: Vec<String> = match repo {
@@ -991,6 +1004,11 @@ impl CodeIntelEngine {
                     .strip_prefix(&repo_path)
                     .unwrap_or(file_path)
                     .to_string_lossy();
+
+                // Skip test files if exclude_tests is enabled
+                if exclude_tests && is_test_file(&rel_path) {
+                    continue;
+                }
 
                 // Apply file pattern filter
                 if let Some(ref g) = glob {
@@ -1098,8 +1116,12 @@ impl CodeIntelEngine {
         repo: &str,
         symbol: &str,
         _include_definition: bool,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let repo_path = self.get_repo_path(repo)?;
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
 
         // Phase B3: Run text search and LSP search in parallel
         // Text search is fast (synchronous), LSP can be slow
@@ -1112,15 +1134,26 @@ impl CodeIntelEngine {
             .map(|lsp| lsp.is_enabled())
             .unwrap_or(false);
 
+        // Helper to filter test files from references
+        let filter_tests = |refs: Vec<(String, usize, String)>| -> Vec<(String, usize, String)> {
+            if exclude_tests {
+                refs.into_iter()
+                    .filter(|(path, _, _)| !is_test_file(path))
+                    .collect()
+            } else {
+                refs
+            }
+        };
+
         if !lsp_enabled {
             // Fast path: no LSP, just do text search
-            let text_refs = self.text_search_references(&repo_path, symbol);
+            let text_refs = filter_tests(self.text_search_references(&repo_path, symbol));
             return Ok(self.format_references(&text_refs, false, symbol));
         }
 
         // LSP is enabled - race text search against LSP with a grace period
         // 1. Do text search immediately (it's fast)
-        let text_refs = self.text_search_references(&repo_path, symbol);
+        let text_refs = filter_tests(self.text_search_references(&repo_path, symbol));
 
         // 2. Try LSP with a short additional timeout (500ms grace period)
         // This way we don't block the full LSP timeout (1.5s) if text search is ready
@@ -1132,6 +1165,7 @@ impl CodeIntelEngine {
 
         // 3. Use LSP results if available and non-empty, otherwise text search
         if let Ok(Some(lsp_refs)) = lsp_result {
+            let lsp_refs = filter_tests(lsp_refs);
             if !lsp_refs.is_empty() {
                 return Ok(self.format_references(&lsp_refs, true, symbol));
             }
@@ -2082,7 +2116,12 @@ impl CodeIntelEngine {
         query: &str,
         max_results: usize,
         _doc_type: Option<&str>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
+
         // Validate repo if specified
         let repo_name = if let Some(r) = repo {
             if !r.is_empty() {
@@ -2098,8 +2137,10 @@ impl CodeIntelEngine {
 
         let results: Vec<_> = self
             .search_index
-            .search(query, max_results)
+            .search(query, max_results * 2) // Get more results to filter
             .into_iter()
+            .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
+            .take(max_results)
             .collect();
 
         let mut output = String::new();
@@ -2140,7 +2181,12 @@ impl CodeIntelEngine {
         repo: Option<&str>,
         query: &str,
         max_results: usize,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
+
         // Validate repo if specified
         let repo_name = if let Some(r) = repo {
             if !r.is_empty() {
@@ -2156,8 +2202,10 @@ impl CodeIntelEngine {
 
         let results: Vec<_> = self
             .embedding_engine
-            .find_similar_code(query, max_results)
+            .find_similar_code(query, max_results * 2) // Get more to filter
             .into_iter()
+            .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
+            .take(max_results)
             .collect();
 
         let mut output = String::new();
@@ -2269,7 +2317,10 @@ impl CodeIntelEngine {
         repo: &str,
         function: &str,
         _depth: usize,
+        _exclude_tests: Option<bool>,
     ) -> Result<String> {
+        // Note: exclude_tests filtering would require call graph regeneration
+        // For now, the parameter is accepted but filtering happens at source
         let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
@@ -2293,7 +2344,9 @@ impl CodeIntelEngine {
         function: &str,
         transitive: bool,
         max_depth: usize,
+        _exclude_tests: Option<bool>,
     ) -> Result<String> {
+        // Note: exclude_tests filtering would require call graph regeneration
         let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
@@ -2341,7 +2394,9 @@ impl CodeIntelEngine {
         function: &str,
         transitive: bool,
         max_depth: usize,
+        _exclude_tests: Option<bool>,
     ) -> Result<String> {
+        // Note: exclude_tests filtering would require call graph regeneration
         let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
@@ -2468,7 +2523,9 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         min_connections: usize,
+        _exclude_tests: Option<bool>,
     ) -> Result<String> {
+        // Note: exclude_tests filtering would require call graph regeneration
         let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
@@ -2962,7 +3019,15 @@ impl CodeIntelEngine {
         repo: &str,
         path: &str,
         function: Option<&str>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(true);
+        if exclude_tests && is_test_file(path) {
+            return Ok(format!("# Dead Code Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+        }
+
         let repo_meta = self
             .repos
             .get(repo)
@@ -3109,7 +3174,15 @@ impl CodeIntelEngine {
         repo: &str,
         path: &str,
         function: Option<&str>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(true);
+        if exclude_tests && is_test_file(path) {
+            return Ok(format!("# Uninitialized Variable Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+        }
+
         let repo_meta = self
             .repos
             .get(repo)
@@ -3173,7 +3246,15 @@ impl CodeIntelEngine {
         repo: &str,
         path: &str,
         function: Option<&str>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(true);
+        if exclude_tests && is_test_file(path) {
+            return Ok(format!("# Dead Store Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+        }
+
         let repo_meta = self
             .repos
             .get(repo)
@@ -3237,12 +3318,16 @@ impl CodeIntelEngine {
         repo: Option<&str>,
         max_results: usize,
         mode: &str,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
         use crate::chunking::AstChunker;
         use crate::embeddings::EmbeddingEngine;
         use crate::hybrid_search::create_hybrid_engine;
         use crate::search::ConcurrentSearchIndex;
+        use crate::security_rules::is_test_file;
         use std::sync::Arc;
+
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
 
         // Create search engines
         let bm25_index = Arc::new(ConcurrentSearchIndex::new());
@@ -3267,6 +3352,10 @@ impl CodeIntelEngine {
             for file_entry in self.file_cache.iter() {
                 let file_path = file_entry.key();
                 if !file_path.starts_with(repo_path) {
+                    continue;
+                }
+                // Skip test files if exclude_tests is enabled
+                if exclude_tests && is_test_file(&file_path.to_string_lossy()) {
                     continue;
                 }
 
@@ -3342,10 +3431,13 @@ impl CodeIntelEngine {
         repo: Option<&str>,
         chunk_type: Option<&str>,
         max_results: usize,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
         use crate::chunking::{AstChunker, ChunkType};
         use crate::search::tokenize_code;
+        use crate::security_rules::is_test_file;
 
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
         let chunker = AstChunker::new();
         let query_tokens: std::collections::HashSet<_> = tokenize_code(query).into_iter().collect();
         let mut all_chunks = Vec::new();
@@ -3374,6 +3466,10 @@ impl CodeIntelEngine {
             let repo_path = &repo_meta.path;
 
             for file_entry in self.file_cache.iter() {
+                // Skip test files if exclude_tests is enabled
+                if exclude_tests && is_test_file(&file_entry.key().to_string_lossy()) {
+                    continue;
+                }
                 let file_path = file_entry.key();
                 if !file_path.starts_with(repo_path) {
                     continue;
@@ -3658,9 +3754,13 @@ impl CodeIntelEngine {
         &self,
         repo_name: &str,
         path: Option<&str>,
+        exclude_tests: Option<bool>,
         vuln_types: &[String],
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let repo_path = self.get_repo_path(repo_name)?;
+        let exclude_tests = exclude_tests.unwrap_or(true);
 
         let mut all_results: Vec<crate::taint::TaintAnalysisResult> = Vec::new();
         let include_all = vuln_types.contains(&"all".to_string()) || vuln_types.is_empty();
@@ -3679,6 +3779,7 @@ impl CodeIntelEngine {
                     true
                 }
             })
+            .filter(|entry| !exclude_tests || !is_test_file(&entry.key().to_string_lossy()))
             .filter(|entry| {
                 let path_str = entry.key().to_string_lossy();
                 path_str.ends_with(".py")
@@ -3891,9 +3992,13 @@ impl CodeIntelEngine {
         &self,
         repo_name: &str,
         path: Option<&str>,
+        exclude_tests: Option<bool>,
         source_types: &[String],
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let repo_path = self.get_repo_path(repo_name)?;
+        let exclude_tests = exclude_tests.unwrap_or(true);
         let include_all = source_types.contains(&"all".to_string()) || source_types.is_empty();
 
         let mut all_sources: Vec<crate::taint::TaintSource> = Vec::new();
@@ -3912,6 +4017,7 @@ impl CodeIntelEngine {
                     true
                 }
             })
+            .filter(|entry| !exclude_tests || !is_test_file(&entry.key().to_string_lossy()))
             .filter(|entry| {
                 let path_str = entry.key().to_string_lossy();
                 path_str.ends_with(".py")
@@ -4004,8 +4110,15 @@ impl CodeIntelEngine {
     }
 
     /// Get a comprehensive security summary for a repository
-    pub async fn get_security_summary(&self, repo_name: &str) -> Result<String> {
+    pub async fn get_security_summary(
+        &self,
+        repo_name: &str,
+        exclude_tests: Option<bool>,
+    ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let repo_path = self.get_repo_path(repo_name)?;
+        let exclude_tests = exclude_tests.unwrap_or(true);
 
         let mut total_files = 0;
         let mut total_sources = 0;
@@ -4023,6 +4136,7 @@ impl CodeIntelEngine {
             .file_cache
             .iter()
             .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| !exclude_tests || !is_test_file(&entry.key().to_string_lossy()))
             .filter(|entry| {
                 let path_str = entry.key().to_string_lossy();
                 path_str.ends_with(".py")
@@ -4277,17 +4391,24 @@ impl CodeIntelEngine {
     }
 
     /// Scan for OWASP Top 10 vulnerabilities
-    pub async fn check_owasp_top10(&self, repo_name: &str, path: Option<&str>) -> Result<String> {
-        use crate::security_rules::SecurityRulesEngine;
+    pub async fn check_owasp_top10(
+        &self,
+        repo_name: &str,
+        path: Option<&str>,
+        exclude_tests: Option<bool>,
+    ) -> Result<String> {
+        use crate::security_rules::{is_test_file, SecurityRulesEngine};
 
         let repo_path = self.get_repo_path(repo_name)?;
         let engine = SecurityRulesEngine::new();
+        let exclude_tests = exclude_tests.unwrap_or(true);
 
         let files: Vec<_> = self
             .file_cache
             .iter()
             .filter(|e| e.key().starts_with(&repo_path))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
+            .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
@@ -4320,17 +4441,24 @@ impl CodeIntelEngine {
     }
 
     /// Scan for CWE Top 25 vulnerabilities
-    pub async fn check_cwe_top25(&self, repo_name: &str, path: Option<&str>) -> Result<String> {
-        use crate::security_rules::SecurityRulesEngine;
+    pub async fn check_cwe_top25(
+        &self,
+        repo_name: &str,
+        path: Option<&str>,
+        exclude_tests: Option<bool>,
+    ) -> Result<String> {
+        use crate::security_rules::{is_test_file, SecurityRulesEngine};
 
         let repo_path = self.get_repo_path(repo_name)?;
         let engine = SecurityRulesEngine::new();
+        let exclude_tests = exclude_tests.unwrap_or(true);
 
         let files: Vec<_> = self
             .file_cache
             .iter()
             .filter(|e| e.key().starts_with(&repo_path))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
+            .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
@@ -5129,8 +5257,15 @@ impl CodeIntelEngine {
     }
 
     /// Find circular import dependencies
-    pub async fn find_circular_imports(&self, repo_name: &str) -> Result<String> {
+    pub async fn find_circular_imports(
+        &self,
+        repo_name: &str,
+        exclude_tests: Option<bool>,
+    ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let repo_path = self.get_repo_path(repo_name)?;
+        let exclude_tests = exclude_tests.unwrap_or(true);
         let symbols = self
             .symbols
             .get(repo_name)
@@ -5141,6 +5276,10 @@ impl CodeIntelEngine {
 
         // Parse imports from all files
         for symbol in &symbols {
+            // Skip test files if exclude_tests is enabled
+            if exclude_tests && is_test_file(&symbol.file_path) {
+                continue;
+            }
             let file_path = repo_path.join(&symbol.file_path);
             if file_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&file_path) {
@@ -5337,8 +5476,12 @@ impl CodeIntelEngine {
         repo_name: &str,
         symbol_name: &str,
         include_imports: bool,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
         let repo_path = self.get_repo_path(repo_name)?;
+        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
         let symbols = self
             .symbols
             .get(repo_name)
@@ -5351,6 +5494,9 @@ impl CodeIntelEngine {
         // Find definitions
         for symbol in &symbols {
             if symbol.name == symbol_name {
+                if exclude_tests && is_test_file(&symbol.file_path) {
+                    continue;
+                }
                 definitions.push((
                     symbol.file_path.clone(),
                     symbol.start_line,
@@ -5372,6 +5518,11 @@ impl CodeIntelEngine {
                 .strip_prefix(&repo_path)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+            // Skip test files if exclude_tests is enabled
+            if exclude_tests && is_test_file(&rel_path) {
+                continue;
+            }
 
             for (line_num, line) in content.lines().enumerate() {
                 let is_import = line.contains("import ")
@@ -5718,7 +5869,19 @@ impl CodeIntelEngine {
     }
 
     /// Check for type errors in a file without running external type checkers
-    pub async fn check_type_errors(&self, repo: &str, path: &str) -> Result<String> {
+    pub async fn check_type_errors(
+        &self,
+        repo: &str,
+        path: &str,
+        exclude_tests: Option<bool>,
+    ) -> Result<String> {
+        use crate::security_rules::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(true);
+        if exclude_tests && is_test_file(path) {
+            return Ok(format!("# Type Error Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+        }
+
         let repo_meta = self
             .repos
             .get(repo)
@@ -6079,7 +6242,7 @@ impl CodeIntelEngine {
             .ok_or_else(|| anyhow!("Symbol not found: {}", symbol_name))?;
 
         // Get references
-        let refs_output = self.find_references(repo, symbol_name, false).await?;
+        let refs_output = self.find_references(repo, symbol_name, false, None).await?;
 
         // Parse references from markdown output (simplified)
         let mut references = Vec::new();

@@ -36,7 +36,10 @@ impl ToolHandler for FindDeadCodeHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
         let function = args.get_str("function");
-        engine.find_dead_code(repo, path, function).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .find_dead_code(repo, path, function, exclude_tests)
+            .await
     }
 }
 
@@ -87,7 +90,10 @@ impl ToolHandler for FindUninitializedHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
         let function = args.get_str("function");
-        engine.find_uninitialized(repo, path, function).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .find_uninitialized(repo, path, function, exclude_tests)
+            .await
     }
 }
 
@@ -104,7 +110,10 @@ impl ToolHandler for FindDeadStoresHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
         let function = args.get_str("function");
-        engine.find_dead_stores(repo, path, function).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .find_dead_stores(repo, path, function, exclude_tests)
+            .await
     }
 }
 
@@ -137,7 +146,8 @@ impl ToolHandler for CheckTypeErrorsHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        engine.check_type_errors(repo, path).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine.check_type_errors(repo, path, exclude_tests).await
     }
 }
 
@@ -186,6 +196,7 @@ impl ToolHandler for FindCircularImportsHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        engine.find_circular_imports(repo).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine.find_circular_imports(repo, exclude_tests).await
     }
 }

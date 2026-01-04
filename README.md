@@ -360,163 +360,88 @@ narsil-mcp config export > my-config.yaml
 
 ### Visualization Frontend
 
-narsil-mcp includes an optional web-based visualization frontend for exploring call graphs, import dependencies, and code structure interactively.
-
-**Option 1: Embedded Frontend (Recommended)**
-
-Build with the `frontend` feature to embed the visualization UI in the binary:
+Explore call graphs, imports, and code structure interactively in your browser.
 
 ```bash
 # Build with embedded frontend
 cargo build --release --features frontend
 
-# Run with HTTP server (MCP server still works on stdio)
-./target/release/narsil-mcp --repos ~/project --http --call-graph
-
-# Open http://localhost:3000 in your browser
-# You can also use this with editor integration (Zed, VS Code, etc.)
-# The MCP server runs on stdio while HTTP server runs in background
+# Run with HTTP server
+narsil-mcp --repos ~/project --http --call-graph
+# Open http://localhost:3000
 ```
 
-**Option 2: Development Mode**
+Features: interactive graphs, complexity overlays, security highlighting, multiple layouts.
 
-For frontend development, run the backend and frontend separately:
+> **Full documentation:** See [docs/frontend.md](docs/frontend.md) for setup, API endpoints, and development mode.
+
+### Neural Semantic Search
+
+Find similar code using neural embeddings - even when variable names and structure differ.
 
 ```bash
-# Terminal 1: Start the API server
-./target/release/narsil-mcp --repos ~/project --http --call-graph
+# Quick setup with wizard
+narsil-mcp config init --neural
 
-# Terminal 2: Start the frontend dev server
-cd frontend
-npm install
-npm run dev
-# Frontend runs on http://localhost:5173, connects to API on :3000
+# Or manually with Voyage AI
+export VOYAGE_API_KEY="your-key"
+narsil-mcp --repos ~/project --neural --neural-model voyage-code-2
 ```
 
-**Features:**
-- Interactive graph visualization with Cytoscape.js
-- Multiple views: call graph, import graph, symbol references
-- Complexity metrics overlay with color coding
-- Security vulnerability highlighting
-- Depth control and focused exploration (double-click to drill down)
-- Multiple layout algorithms (hierarchical, breadth-first, circle)
+Supports Voyage AI, OpenAI, custom endpoints, and local ONNX models.
 
-### Neural Semantic Search (Phase 7)
+> **Full documentation:** See [docs/neural-search.md](docs/neural-search.md) for setup, backends, and use cases.
 
-Neural embeddings enable true semantic code search - finding functionally similar code even when variable names, comments, and structure differ. This is powered by code-specialized embedding models.
+### Type Inference
 
-**Supported Backends:**
+Built-in type inference for Python, JavaScript, and TypeScript - no mypy or tsc required.
 
-| Backend | Flag | Models | Best For |
-|---------|------|--------|----------|
-| Voyage AI | `--neural-backend api` | `voyage-code-2`, `voyage-code-3` | Code-specific embeddings, best accuracy |
-| OpenAI | `--neural-backend api` | `text-embedding-3-small`, `text-embedding-3-large` | General embeddings, wide availability |
-| Custom/Self-hosted | `--neural-backend api` | Any compatible | Local deployment, custom models (use `EMBEDDING_SERVER_ENDPOINT`) |
-| ONNX | `--neural-backend onnx` | Local models | Offline usage, no API costs |
-
-**Setup:**
-
-```bash
-# Using Voyage AI (recommended for code)
-export VOYAGE_API_KEY="your-key-here"
-narsil-mcp --repos ~/project --neural --neural-backend api --neural-model voyage-code-2
-
-# Using OpenAI
-export OPENAI_API_KEY="your-key-here"
-narsil-mcp --repos ~/project --neural --neural-backend api --neural-model text-embedding-3-small
-
-# Using custom/self-hosted embedding server
-export EMBEDDING_SERVER_ENDPOINT="http://localhost:8080/v1/embeddings"
-export EMBEDDING_API_KEY="your-optional-api-key"  # Optional, depends on your server
-narsil-mcp --repos ~/project --neural --neural-backend api --neural-model custom-model
-
-# Using local ONNX model (no API key needed)
-narsil-mcp --repos ~/project --neural --neural-backend onnx
-```
-
-**Security Note for Custom Endpoints:**
-- Use HTTPS for production endpoints to prevent credential exposure
-- HTTP is allowed for local development (localhost/private IPs) but will generate warnings
-- The endpoint must use `http://` or `https://` scheme - other protocols are rejected for security
-- API keys are optional for custom endpoints if your server doesn't require authentication
-
-**Use Cases:**
-
-- **Semantic clone detection**: Find copy-pasted code that was renamed/refactored
-- **Similar function search**: "Find functions that do pagination" even if named differently
-- **Code deduplication**: Identify candidates for extracting shared utilities
-- **Learning from examples**: Find similar patterns to code you're working with
-
-**Example queries:**
-
-```
-# These find similar code even with different naming:
-neural_search("function that validates email addresses")
-neural_search("error handling with retry logic")
-find_semantic_clones("my_function")  # Find Type-3/4 clones
-```
-
-### Type Inference (Phase 8)
-
-Built-in type inference for dynamic languages without requiring external type checkers (mypy, tsc). Uses data flow analysis to infer types at each program point.
-
-**Supported Languages:** Python, JavaScript, TypeScript
-
-**How it works:**
-
-1. Analyzes assignments, function calls, and operators
-2. Tracks type flow through variables
-3. Infers types at each usage point
-4. Detects potential type errors
-
-**Example usage:**
+| Tool | Description |
+|------|-------------|
+| `infer_types` | Get inferred types for all variables in a function |
+| `check_type_errors` | Find potential type mismatches |
+| `get_typed_taint_flow` | Enhanced security analysis with type info |
 
 ```python
-# Python code
 def process(data):
     result = data.split(",")  # result: list[str]
     count = len(result)       # count: int
     return count * 2          # returns: int
 ```
 
-The `infer_types` tool will show:
-- `data` - `str` (inferred from `.split()` call)
-- `result` - `list[str]`
-- `count` - `int`
-
-**Available tools:**
-
-| Tool | Description |
-|------|-------------|
-| `infer_types` | Get inferred types for all variables in a function |
-| `check_type_errors` | Find potential type mismatches without running mypy/tsc |
-| `get_typed_taint_flow` | Enhanced security analysis combining types with taint tracking |
-
-**Type error detection examples:**
-
-```javascript
-// JavaScript - detected issues:
-function calc(x) {
-    if (typeof x === 'string') {
-        return x * 2;  // Warning: string * number
-    }
-    return x.toUpperCase();  // Warning: number has no toUpperCase
-}
-```
-
 ### MCP Configuration
 
-**Claude Desktop** (`claude_desktop_config.json`):
+Add narsil-mcp to your AI assistant by creating a configuration file. Here are the recommended setups:
+
+---
+
+**Claude Code** (`.mcp.json` in project root - Recommended):
+
+Create `.mcp.json` in your project directory for per-project configuration:
 ```json
 {
   "mcpServers": {
     "narsil-mcp": {
-      "command": "/path/to/narsil-mcp",
-      "args": ["--repos", "/path/to/your/projects"]
+      "command": "narsil-mcp",
+      "args": ["--repos", ".", "--git", "--call-graph"]
     }
   }
 }
 ```
+
+Then start Claude Code in your project:
+```bash
+cd /path/to/project
+claude
+```
+
+Using `.` for `--repos` automatically indexes the current directory. Claude now has access to 76 code intelligence tools.
+
+> **Tip**: Add `--persist --index-path .claude/cache` for faster startup on subsequent runs.
+
+For global configuration, edit `~/.claude/settings.json` instead. See [Claude Code Integration](docs/playbooks/integrations/claude-code.md) for advanced setups.
+
+---
 
 **Cursor** (`.cursor/mcp.json`):
 ```json
@@ -524,23 +449,21 @@ function calc(x) {
   "mcpServers": {
     "narsil-mcp": {
       "command": "narsil-mcp",
-      "args": ["--repos", "~/code/my-project"]
+      "args": ["--repos", ".", "--git", "--call-graph"]
     }
   }
 }
 ```
+
+---
 
 **VS Code + GitHub Copilot** (`.vscode/mcp.json`):
 ```json
 {
   "servers": {
     "narsil-mcp": {
-      "command": "/path/to/narsil-mcp",
-      "args": [
-        "--repos", "${workspaceFolder}",
-        "--git",
-        "--call-graph"
-      ]
+      "command": "narsil-mcp",
+      "args": ["--repos", ".", "--git", "--call-graph"]
     }
   }
 }
@@ -548,19 +471,37 @@ function calc(x) {
 
 > **Note for Copilot Enterprise**: MCP support requires VS Code 1.102+ and must be enabled by your organization administrator.
 
+---
+
+**Claude Desktop** (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "narsil-mcp": {
+      "command": "narsil-mcp",
+      "args": ["--repos", "/path/to/your/projects", "--git"]
+    }
+  }
+}
+```
+
+---
+
 **Zed** (`settings.json` → Context Servers):
 ```json
 {
   "context_servers": {
     "narsil-mcp": {
       "command": "narsil-mcp",
-      "args": ["--repos", "/path/to/your/projects"]
+      "args": ["--repos", ".", "--git"]
     }
   }
 }
 ```
 
-> **Note for Zed**: narsil-mcp now starts immediately and indexes in the background, preventing initialization timeouts.
+> **Note for Zed**: narsil-mcp starts immediately and indexes in the background, preventing initialization timeouts.
+
+---
 
 ### Claude Code Plugin
 
@@ -608,199 +549,24 @@ See **[docs/playbooks](docs/playbooks/)** for practical usage guides:
 
 Each playbook shows the exact tool chains Claude uses to answer your questions.
 
-### WebAssembly (Browser) Usage (Phase 9)
+### WebAssembly (Browser) Usage
 
-narsil-mcp can run entirely in the browser via WebAssembly. This provides symbol extraction, search, and similarity analysis without a backend server - perfect for browser-based IDEs, code review tools, or educational platforms.
-
-**Features available in WASM:**
-- Multi-language parsing (Rust, Python, JS, TS, Go, C, C++, Java, C#)
-- Symbol extraction (functions, classes, structs, etc.)
-- Full-text search with BM25 ranking
-- TF-IDF code similarity search
-- In-memory file storage
-
-**Not available in WASM** (requires native build):
-- Git integration
-- File system watching
-- LSP integration
-- Neural embeddings (API calls)
-- Index persistence
-
-**Building the WASM module:**
-
-The WASM build requires a C compiler that supports WASM targets (for tree-sitter and compression libraries).
-
-```bash
-# Prerequisites
-rustup target add wasm32-unknown-unknown
-cargo install wasm-pack
-
-# Install WASM-compatible C toolchain (choose one):
-# Option 1: Using Emscripten (recommended)
-brew install emscripten  # macOS
-# or: sudo apt install emscripten  # Ubuntu
-
-# Option 2: Using WASI SDK
-# Download from https://github.com/WebAssembly/wasi-sdk/releases
-
-# Build for web (browsers)
-./scripts/build-wasm.sh
-
-# Build for bundlers (webpack, vite, etc.)
-./scripts/build-wasm.sh bundler
-
-# Build for Node.js
-./scripts/build-wasm.sh nodejs
-
-# Output will be in pkg/
-```
-
-**Build targets:**
-
-| Target | Use Case | Output |
-|--------|----------|--------|
-| `web` | Direct browser usage, CDN | ES modules with init() |
-| `bundler` | Webpack, Vite, Rollup | ES modules for bundlers |
-| `nodejs` | Node.js applications | CommonJS modules |
-| `deno` | Deno runtime | ES modules for Deno |
-
-**Installation (npm):**
+narsil-mcp can run entirely in the browser via WebAssembly - perfect for browser-based IDEs, code review tools, or educational platforms.
 
 ```bash
 npm install @narsil-mcp/wasm
-# or
-yarn add @narsil-mcp/wasm
 ```
-
-**Basic Usage (JavaScript/TypeScript):**
 
 ```typescript
 import { CodeIntelClient } from '@narsil-mcp/wasm';
 
-// Create and initialize the client
 const client = new CodeIntelClient();
 await client.init();
-
-// Index files
 client.indexFile('src/main.rs', rustSourceCode);
-client.indexFile('src/lib.py', pythonSourceCode);
-
-// Find symbols
 const symbols = client.findSymbols('Handler');
-const classes = client.findSymbols(null, 'class');
-
-// Search code
-const results = client.search('error handling');
-
-// Find similar code
-const similar = client.findSimilar('fn process_request(req: Request) -> Response');
-
-// Get statistics
-console.log(client.stats()); // { files: 2, symbols: 15, embeddings: 12 }
 ```
 
-**React Example:**
-
-```tsx
-import { useEffect, useState } from 'react';
-import { CodeIntelClient, Symbol } from '@narsil-mcp/wasm';
-
-function CodeExplorer({ files }: { files: Record<string, string> }) {
-  const [client, setClient] = useState<CodeIntelClient | null>(null);
-  const [symbols, setSymbols] = useState<Symbol[]>([]);
-
-  useEffect(() => {
-    const init = async () => {
-      const c = new CodeIntelClient();
-      await c.init();
-
-      // Index all files
-      for (const [path, content] of Object.entries(files)) {
-        c.indexFile(path, content);
-      }
-
-      setClient(c);
-      setSymbols(c.findSymbols());
-    };
-    init();
-  }, [files]);
-
-  return (
-    <ul>
-      {symbols.map(s => (
-        <li key={`${s.file_path}:${s.name}`}>
-          {s.kind}: {s.name} ({s.file_path}:{s.start_line})
-        </li>
-      ))}
-    </ul>
-  );
-}
-```
-
-**Low-Level API (WasmCodeIntel):**
-
-For more control, use the low-level `WasmCodeIntel` class directly:
-
-```typescript
-import init, { WasmCodeIntel } from '@narsil-mcp/wasm';
-
-await init();  // Initialize WASM module
-
-const engine = new WasmCodeIntel();
-engine.index_file('main.rs', code);
-
-// Returns JSON strings - parse them yourself
-const symbolsJson = engine.find_symbols(null, 'function');
-const symbols = JSON.parse(symbolsJson);
-```
-
-**WASM API Reference:**
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `indexFile(path, content)` | Index a single file | `boolean` |
-| `indexFiles(files)` | Bulk index `[{path, content}]` | `number` (count) |
-| `findSymbols(pattern?, kind?)` | Find symbols by pattern/kind | `Symbol[]` |
-| `search(query, maxResults?)` | Full-text search with BM25 | `SearchResult[]` |
-| `findSimilar(code, maxResults?)` | TF-IDF similarity search | `SimilarCode[]` |
-| `getFile(path)` | Get file content | `string \| null` |
-| `symbolAt(path, line)` | Get symbol at line | `Symbol \| null` |
-| `symbolsInFile(path)` | List symbols in file | `Symbol[]` |
-| `listFiles()` | List indexed file paths | `string[]` |
-| `stats()` | Get engine statistics | `Stats` |
-| `clear()` | Clear all indexed data | `void` |
-
-**TypeScript Types:**
-
-```typescript
-interface Symbol {
-  name: string;
-  kind: string;  // 'function' | 'class' | 'struct' | etc.
-  file_path: string;
-  start_line: number;
-  end_line: number;
-  signature?: string;
-  doc_comment?: string;
-}
-
-interface SearchResult {
-  file: string;
-  start_line: number;
-  end_line: number;
-  content: string;
-  score: number;
-}
-
-interface Stats {
-  files: number;
-  symbols: number;
-  embeddings: number;
-}
-```
-
-**Supported Symbol Kinds:** `function`, `method`, `class`, `struct`, `enum`, `interface`, `trait`, `type`, `module`, `namespace`, `constant`, `variable`
-
-**Bundle Size:** ~2-3MB gzipped (includes tree-sitter parsers for all languages)
+> **Full documentation:** See [docs/wasm.md](docs/wasm.md) for build instructions, React examples, and API reference.
 
 ## Available Tools (76)
 

@@ -1055,6 +1055,11 @@ impl NeuralEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Global mutex to serialize tests that modify environment variables
+    // This prevents race conditions when tests run in parallel
+    static ENV_VAR_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_cosine_similarity() {
@@ -1125,6 +1130,8 @@ mod tests {
 
         #[test]
         fn test_with_api_custom_endpoint_with_key() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Set up environment
             std::env::set_var(
                 "EMBEDDING_SERVER_ENDPOINT",
@@ -1150,6 +1157,8 @@ mod tests {
 
         #[test]
         fn test_with_api_custom_endpoint_without_key() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Set up environment (no API key - should work for custom endpoints)
             std::env::set_var(
                 "EMBEDDING_SERVER_ENDPOINT",
@@ -1179,6 +1188,8 @@ mod tests {
 
         #[test]
         fn test_with_api_invalid_custom_endpoint() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Set up environment with invalid endpoint
             std::env::set_var(
                 "EMBEDDING_SERVER_ENDPOINT",
@@ -1206,8 +1217,13 @@ mod tests {
 
         #[test]
         fn test_with_api_fallback_to_voyage() {
-            // No custom endpoint, should require API key
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
+            // Clean all API-related env vars first to avoid race conditions
             std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            // Now set only the one we need
             std::env::set_var("VOYAGE_API_KEY", "test-voyage-key");
 
             let config = NeuralConfig {
@@ -1226,6 +1242,8 @@ mod tests {
 
         #[test]
         fn test_with_api_no_endpoint_no_key() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Clean up environment completely first
             std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
             std::env::remove_var("EMBEDDING_API_KEY");
@@ -1400,6 +1418,8 @@ mod tests {
 
         #[test]
         fn test_dimension_bounds_validation() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Clean environment first
             std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
             std::env::remove_var("EMBEDDING_API_KEY");
@@ -1437,6 +1457,8 @@ mod tests {
 
         #[test]
         fn test_dimension_valid_bounds() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Clean environment first
             std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
             std::env::remove_var("EMBEDDING_API_KEY");
@@ -1453,7 +1475,8 @@ mod tests {
             let result = NeuralEngine::with_api(config);
             assert!(result.is_ok());
 
-            // Max valid dimension
+            // Max valid dimension (re-set API key since env vars can be cleared)
+            std::env::set_var("VOYAGE_API_KEY", "test-key");
             let config = NeuralConfig {
                 enabled: true,
                 backend: "api".to_string(),
@@ -1471,6 +1494,8 @@ mod tests {
 
         #[test]
         fn test_model_name_validation() {
+            let _guard = super::ENV_VAR_MUTEX.lock().unwrap();
+
             // Clean environment first
             std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
             std::env::remove_var("EMBEDDING_API_KEY");

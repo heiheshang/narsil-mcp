@@ -64,3 +64,8 @@ CLAUDE.md
 TAINT_ANALYSIS_IMPROVEMENTS.md
 SECURITY_PATCH.md
 /docs/NARSIL_BACKEND_MASTER_PLAN.md
+
+# npm package artifacts (created during install)
+npm/bin/
+npm/node_modules/
+npm/*.tgz

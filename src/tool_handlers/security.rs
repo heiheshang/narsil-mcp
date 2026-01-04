@@ -51,7 +51,8 @@ impl ToolHandler for CheckOwaspTop10Handler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path");
-        engine.check_owasp_top10(repo, path).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine.check_owasp_top10(repo, path, exclude_tests).await
     }
 }
 
@@ -67,7 +68,8 @@ impl ToolHandler for CheckCweTop25Handler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path");
-        engine.check_cwe_top25(repo, path).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine.check_cwe_top25(repo, path, exclude_tests).await
     }
 }
 
@@ -83,6 +85,7 @@ impl ToolHandler for FindInjectionVulnerabilitiesHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path");
+        let exclude_tests = args.get_bool("exclude_tests");
         let vulnerability_types: Vec<String> = args
             .get_array("vulnerability_types")
             .map(|arr| {
@@ -92,7 +95,7 @@ impl ToolHandler for FindInjectionVulnerabilitiesHandler {
             })
             .unwrap_or_else(|| vec!["all".to_string()]);
         engine
-            .find_injection_vulnerabilities(repo, path, &vulnerability_types)
+            .find_injection_vulnerabilities(repo, path, exclude_tests, &vulnerability_types)
             .await
     }
 }
@@ -126,6 +129,7 @@ impl ToolHandler for GetTaintSourcesHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path");
+        let exclude_tests = args.get_bool("exclude_tests");
         let source_types: Vec<String> = args
             .get_array("source_types")
             .map(|arr| {
@@ -134,7 +138,9 @@ impl ToolHandler for GetTaintSourcesHandler {
                     .collect()
             })
             .unwrap_or_else(|| vec!["all".to_string()]);
-        engine.get_taint_sources(repo, path, &source_types).await
+        engine
+            .get_taint_sources(repo, path, exclude_tests, &source_types)
+            .await
     }
 }
 
@@ -149,7 +155,8 @@ impl ToolHandler for GetSecuritySummaryHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        engine.get_security_summary(repo).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine.get_security_summary(repo, exclude_tests).await
     }
 }
 

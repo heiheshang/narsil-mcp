@@ -125,6 +125,7 @@ async fn test_persistence_index_loading() -> Result<()> {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
         assert!(symbols.contains("User"));
@@ -150,6 +151,7 @@ async fn test_persistence_index_loading() -> Result<()> {
         let symbols = engine2
             .find_symbols(
                 repo.path().file_name().unwrap().to_str().unwrap(),
+                None,
                 None,
                 None,
                 None,
@@ -237,6 +239,7 @@ async fn test_persistence_stale_file_detection() -> Result<()> {
                 None,
                 Some("Modified"),
                 None,
+                None,
             )
             .await?;
         assert!(symbols.contains("ModifiedStruct"));
@@ -284,6 +287,7 @@ async fn test_persistence_disabled() -> Result<()> {
     let symbols = engine
         .find_symbols(
             repo.path().file_name().unwrap().to_str().unwrap(),
+            None,
             None,
             None,
             None,
@@ -349,6 +353,7 @@ async fn test_empty_persisted_index() -> Result<()> {
         let symbols = engine2
             .find_symbols(
                 repo.path().file_name().unwrap().to_str().unwrap(),
+                None,
                 None,
                 None,
                 None,

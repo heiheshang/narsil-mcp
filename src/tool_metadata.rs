@@ -339,7 +339,8 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
                     "pattern": {"type": "string", "description": "Glob or regex pattern to filter symbol names"},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py')"}
+                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py')"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["repo"]
             }),
@@ -381,7 +382,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Symbol name to find references for"},
-                    "include_definition": {"type": "boolean", "description": "Include the definition location (default: true)"}
+                    "include_definition": {"type": "boolean", "description": "Include the definition location (default: true)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -423,7 +425,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string"},
-                    "include_imports": {"type": "boolean", "description": "Include import statements (default: true)"}
+                    "include_imports": {"type": "boolean", "description": "Include import statements (default: true)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -488,7 +491,8 @@ lazy_static! {
                     "query": {"type": "string", "description": "Search query - can be natural language or code pattern"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
             }),
@@ -510,7 +514,8 @@ lazy_static! {
                     "query": {"type": "string"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
                     "doc_type": {"type": "string", "enum": ["file", "function", "class", "struct", "method"], "description": "Filter by document type"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
             }),
@@ -532,7 +537,8 @@ lazy_static! {
                     "query": {"type": "string"},
                     "repo": {"type": "string", "description": "Optional: limit to specific repository"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
-                    "mode": {"type": "string", "enum": ["hybrid", "bm25", "tfidf"], "description": "Search mode: hybrid (default), bm25 only, or tfidf only"}
+                    "mode": {"type": "string", "enum": ["hybrid", "bm25", "tfidf"], "description": "Search mode: hybrid (default), bm25 only, or tfidf only"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
             }),
@@ -575,7 +581,8 @@ lazy_static! {
                     "query": {"type": "string"},
                     "repo": {"type": "string", "description": "Optional: limit to specific repository"},
                     "chunk_type": {"type": "string", "enum": ["function", "method", "class", "trait", "module", "all"], "description": "Filter by chunk type"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
             }),
@@ -596,7 +603,8 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Code snippet to find similar code for"},
                     "repo": {"type": "string", "description": "Repository to search in (optional, searches all if omitted)"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
             }),
@@ -728,7 +736,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Focus on specific function (optional)"},
-                    "depth": {"type": "integer", "description": "Maximum depth to traverse (default: 3)"}
+                    "depth": {"type": "integer", "description": "Maximum depth to traverse (default: 3)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
                 },
                 "required": ["repo"]
             }),
@@ -750,7 +759,8 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find callers of"},
                     "transitive": {"type": "boolean", "description": "Include transitive callers (default: false)"},
-                    "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"}
+                    "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
                 },
                 "required": ["repo", "function"]
             }),
@@ -772,7 +782,8 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find callees of"},
                     "transitive": {"type": "boolean", "description": "Include transitive callees (default: false)"},
-                    "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"}
+                    "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
                 },
                 "required": ["repo", "function"]
             }),
@@ -833,7 +844,8 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "min_connections": {"type": "integer", "description": "Minimum total connections (incoming + outgoing) to be considered a hotspot (default: 5)"}
+                    "min_connections": {"type": "integer", "description": "Minimum total connections (incoming + outgoing) to be considered a hotspot (default: 5)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
                 },
                 "required": ["repo"]
             }),
@@ -1197,7 +1209,8 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "path": {"type": "string", "description": "Optional specific file or directory path to scan"}
+                    "path": {"type": "string", "description": "Optional specific file or directory path to scan"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from scanning (default: true)"}
                 },
                 "required": ["repo"]
             }),
@@ -1217,7 +1230,8 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "path": {"type": "string", "description": "Optional specific file or directory path to scan"}
+                    "path": {"type": "string", "description": "Optional specific file or directory path to scan"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from scanning (default: true)"}
                 },
                 "required": ["repo"]
             }),
@@ -1238,7 +1252,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "Optional: specific file to analyze"},
-                    "vulnerability_types": {"type": "array", "items": {"type": "string", "enum": ["sql", "xss", "command", "path", "all"]}, "description": "Types of vulnerabilities to find (default: all)"}
+                    "vulnerability_types": {"type": "array", "items": {"type": "string", "enum": ["sql", "xss", "command", "path", "all"]}, "description": "Types of vulnerabilities to find (default: all)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from scanning (default: true)"}
                 },
                 "required": ["repo"]
             }),
@@ -1280,7 +1295,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "Optional: specific file to analyze"},
-                    "source_types": {"type": "array", "items": {"type": "string", "enum": ["user_input", "file_read", "database", "environment", "network", "all"]}, "description": "Types of sources to find (default: all)"}
+                    "source_types": {"type": "array", "items": {"type": "string", "enum": ["user_input", "file_read", "database", "environment", "network", "all"]}, "description": "Types of sources to find (default: all)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from scanning (default: true)"}
                 },
                 "required": ["repo"]
             }),
@@ -1299,7 +1315,8 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string"}
+                    "repo": {"type": "string"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from scanning (default: true)"}
                 },
                 "required": ["repo"]
             }),
@@ -1470,7 +1487,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path to analyze"},
-                    "function": {"type": "string", "description": "Optional: specific function to analyze"}
+                    "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
             }),
@@ -1533,7 +1551,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string", "description": "Optional: specific function to analyze"}
+                    "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
             }),
@@ -1554,7 +1573,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string", "description": "Optional: specific function to analyze"}
+                    "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
             }),
@@ -1595,7 +1615,8 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "path": {"type": "string"}
+                    "path": {"type": "string"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
             }),
@@ -1656,7 +1677,8 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string"}
+                    "repo": {"type": "string"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo"]
             }),

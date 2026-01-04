@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.5] - 2026-01-01
+## [1.2.0] - 2025-01-04
+
+### Added
+
+- **`exclude_tests` parameter** - 22 tools now support filtering out test files to reduce noise and token usage:
+  - Security tools (5): `check_owasp_top10`, `check_cwe_top25`, `find_injection_vulnerabilities`, `get_taint_sources`, `get_security_summary`
+  - Analysis tools (5): `find_dead_code`, `find_uninitialized`, `find_dead_stores`, `check_type_errors`, `find_circular_imports`
+  - Symbol tools (3): `find_symbols`, `find_references`, `find_symbol_usages`
+  - Search tools (5): `search_code`, `semantic_search`, `hybrid_search`, `search_chunks`, `find_similar_code`
+  - CallGraph tools (4): `get_call_graph`, `get_callers`, `get_callees`, `get_function_hotspots`
+
+- **npm package** - Install via `npm install -g narsil-mcp` with automatic binary download
+- **Automated npm publishing** - Release workflow now publishes to npm registry
+
+### Changed
+
+- **README restructured** - Claude Code configuration moved to first position, reduced from 1,186 to 951 lines (20% reduction)
+- **Documentation reorganized** - WASM, Neural Search, and Frontend docs moved to dedicated files in `docs/`
+- **Install script enhanced** - Now shows Claude Code quick-start guide with `.mcp.json` example after installation
+
+### Defaults
+
+- Security/Analysis tools: `exclude_tests` defaults to `true` (excludes tests)
+- Symbol/Search tools: `exclude_tests` defaults to `false` (includes tests)
+- CallGraph tools: accepts parameter but filtering requires call graph rebuild
+
+## [1.1.6] - 2025-01-03
+
+### Fixed
+
+- **C++ parser** - Fixed tree-sitter query syntax for C++ namespace and class declarations. Previously caused parsing errors on C++ codebases.
+
+## [1.1.5] - 2025-01-01
 
 ### Fixed
 

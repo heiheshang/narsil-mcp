@@ -20,8 +20,9 @@ impl ToolHandler for SearchCodeHandler {
         let query = args.get_str("query").unwrap_or("");
         let file_pattern = args.get_str("file_pattern");
         let max_results = args.get_u64_or("max_results", 10) as usize;
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .search_code(repo, query, file_pattern, max_results)
+            .search_code(repo, query, file_pattern, max_results, exclude_tests)
             .await
     }
 }
@@ -40,8 +41,9 @@ impl ToolHandler for SemanticSearchHandler {
         let query = args.get_str("query").unwrap_or("");
         let max_results = args.get_u64_or("max_results", 10) as usize;
         let doc_type = args.get_str("doc_type");
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .semantic_search(repo, query, max_results, doc_type)
+            .semantic_search(repo, query, max_results, doc_type, exclude_tests)
             .await
     }
 }
@@ -60,7 +62,10 @@ impl ToolHandler for HybridSearchHandler {
         let query = args.get_str("query").unwrap_or("");
         let max_results = args.get_u64_or("max_results", 10) as usize;
         let mode = args.get_str("mode").unwrap_or("hybrid");
-        engine.hybrid_search(query, repo, max_results, mode).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .hybrid_search(query, repo, max_results, mode, exclude_tests)
+            .await
     }
 }
 
@@ -95,8 +100,9 @@ impl ToolHandler for SearchChunksHandler {
         let query = args.get_str("query").unwrap_or("");
         let chunk_type = args.get_str("chunk_type");
         let max_results = args.get_u64_or("max_results", 10) as usize;
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .search_chunks(query, repo, chunk_type, max_results)
+            .search_chunks(query, repo, chunk_type, max_results, exclude_tests)
             .await
     }
 }
@@ -114,7 +120,10 @@ impl ToolHandler for FindSimilarCodeHandler {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
         let max_results = args.get_u64_or("max_results", 10) as usize;
-        engine.find_similar_code(repo, query, max_results).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .find_similar_code(repo, query, max_results, exclude_tests)
+            .await
     }
 }
 

@@ -20,8 +20,9 @@ impl ToolHandler for FindSymbolsHandler {
         let symbol_type = args.get_str("symbol_type");
         let pattern = args.get_str("pattern");
         let file_pattern = args.get_str("file_pattern");
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .find_symbols(repo, symbol_type, pattern, file_pattern)
+            .find_symbols(repo, symbol_type, pattern, file_pattern, exclude_tests)
             .await
     }
 }
@@ -58,7 +59,10 @@ impl ToolHandler for FindReferencesHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let symbol = args.get_str("symbol").unwrap_or("");
         let include_def = args.get_bool_or("include_definition", true);
-        engine.find_references(repo, symbol, include_def).await
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .find_references(repo, symbol, include_def, exclude_tests)
+            .await
     }
 }
 
@@ -92,8 +96,9 @@ impl ToolHandler for FindSymbolUsagesHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let symbol = args.get_str("symbol").unwrap_or("");
         let include_imports = args.get_bool_or("include_imports", true);
+        let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .find_symbol_usages(repo, symbol, include_imports)
+            .find_symbol_usages(repo, symbol, include_imports, exclude_tests)
             .await
     }
 }
