@@ -475,6 +475,34 @@ def process(data):
     return count * 2          # returns: int
 ```
 
+### Forgemax Integration (Experimental)
+
+For large-scale agentic workflows, narsil-mcp can be used through [Forgemax](https://github.com/postrv/forgemax) — a Code Mode MCP gateway that collapses all 90 tools into just 2 (`search` + `execute`), reducing tool schema overhead from ~12,000 tokens to ~1,000.
+
+```bash
+# Install Forgemax
+cargo install forgemax
+
+# Run narsil-mcp through Forgemax (uses forge.toml in repo root)
+forgemax
+```
+
+The included `forge.toml` configures narsil-mcp with sensible defaults:
+
+```toml
+[servers.narsil]
+command = "narsil-mcp"
+args = ["--repos", ".", "--git", "--call-graph", "--persist", "--watch"]
+transport = "stdio"
+
+[sandbox]
+timeout_secs = 10
+max_heap_mb = 64
+max_concurrent = 8
+```
+
+The LLM writes JavaScript that calls through typed proxy objects inside a sandboxed V8 isolate — credentials, file paths, and internal state never leave the host. This approach is particularly useful when working with multiple MCP servers simultaneously, as it keeps the total tool context small and predictable.
+
 ### MCP Configuration
 
 Add narsil-mcp to your AI assistant by creating a configuration file. Here are the recommended setups:

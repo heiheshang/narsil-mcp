@@ -581,6 +581,7 @@ impl CodeIntelEngine {
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
+            .require_git(false)
             .build();
 
         let files: Vec<PathBuf> = walker

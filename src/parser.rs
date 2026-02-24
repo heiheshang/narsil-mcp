@@ -566,8 +566,8 @@ impl LanguageParser {
 
                     // Extract first line as signature (safe byte boundary)
                     let first_line_end = text.find('\n').unwrap_or(text.len());
-                    let sig_end = first_line_end.min(200);
-                    signature = Some(text.get(..sig_end).unwrap_or(text).to_string());
+                    let sig_end = text.floor_char_boundary(first_line_end.min(200));
+                    signature = Some(text[..sig_end].to_string());
                 }
             }
 
@@ -1734,5 +1734,38 @@ println greeting
             names.contains(&&"Status".to_string()),
             "Should find enum Status"
         );
+    }
+
+    #[test]
+    fn test_signature_truncation_at_multibyte_utf8_boundary() {
+        let parser = LanguageParser::new().unwrap();
+        // Build a JS function whose name + params span past byte 200 using Cyrillic chars.
+        // Each Cyrillic char is 2 bytes in UTF-8, so 100 Cyrillic chars = 200 bytes.
+        // Place "function " (9 bytes) then 96 Cyrillic chars (192 bytes) = 201 bytes total,
+        // which puts byte 200 right in the middle of the last Cyrillic char.
+        let cyrillic_name: String = "Б".repeat(96);
+        let content = format!("function {}() {{\n  return 1;\n}}\n", cyrillic_name);
+
+        // This must not panic — the truncation must land on a valid char boundary
+        let parsed = parser
+            .parse_file(Path::new("test_utf8.js"), &content)
+            .unwrap();
+        assert_eq!(parsed.language, "javascript");
+        assert!(
+            !parsed.symbols.is_empty(),
+            "Should find the function symbol"
+        );
+
+        // Verify the signature was truncated safely (no panic, valid UTF-8)
+        let sym = parsed.symbols.iter().find(|s| s.name == cyrillic_name);
+        assert!(sym.is_some(), "Should find the Cyrillic-named function");
+        if let Some(sig) = &sym.unwrap().signature {
+            assert!(
+                sig.len() <= 200,
+                "Signature should be truncated to <= 200 bytes"
+            );
+            // Verify it's valid UTF-8 (it is, since it's a String, but let's be explicit)
+            assert!(std::str::from_utf8(sig.as_bytes()).is_ok());
+        }
     }
 }

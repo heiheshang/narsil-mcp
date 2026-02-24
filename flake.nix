@@ -25,7 +25,7 @@
         # Only evaluated when withFrontend = true.
         frontendDist = pkgs.buildNpmPackage {
           pname = "narsil-mcp-frontend";
-          version = "1.6.0";
+          version = "1.6.1";
           src = ./frontend;
           npmDepsHash = "sha256-zwO2ek9o4QMJ9jeTzPVGZzgG46NEpHEnpE5OMiXXixQ=";
           # The build script is "tsc -b && vite build"
@@ -40,7 +40,7 @@
         mkPkg = { buildFeatures, withFrontend ? false, checksEnabled ? true }:
           pkgs.rustPlatform.buildRustPackage {
             pname = "narsil-mcp";
-            version = "1.6.0";
+            version = "1.6.1";
 
             src = pkgs.lib.cleanSource ./.;
 
