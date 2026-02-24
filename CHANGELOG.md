@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-02-24
+
+### Fixed
+
+- **UTF-8 boundary panic** - Fixed signature truncation in `parser.rs` and `chunking.rs` that could panic when byte offset 200/500 landed inside a multi-byte UTF-8 character (Cyrillic, CJK, emoji). Now uses `floor_char_boundary()` for safe truncation.
+- **`.gitignore` respected without `.git`** - Added `.require_git(false)` to `WalkBuilder` so `.gitignore` rules are applied even in projects without a `.git` directory, preventing `node_modules/` from being indexed.
+
+### Added
+
+- **Forgemax integration** - Added `forge.toml` configuration for using narsil-mcp through the [Forgemax](https://github.com/postrv/forgemax) Code Mode gateway, collapsing 90 tools into 2 for significant token savings (~1,000 vs ~12,000 tokens).
+
 ## [1.6.0] - 2026-02-16
 
 ### Fixed

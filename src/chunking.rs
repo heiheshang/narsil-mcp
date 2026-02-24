@@ -470,7 +470,7 @@ impl AstChunker {
 
         // Get the first line or until opening brace
         let start_byte = node.start_byte();
-        let end_byte = node.end_byte().min(start_byte + 500); // Limit signature length
+        let end_byte = content.floor_char_boundary(node.end_byte().min(start_byte + 500));
         let text = content.get(start_byte..end_byte)?;
 
         // Find the end of signature (before body)

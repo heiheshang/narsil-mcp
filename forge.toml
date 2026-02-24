@@ -1,0 +1,24 @@
+# Forgemax — narsil-mcp development config
+#
+# Wraps narsil-mcp in Forgemax's Code Mode gateway.
+# 90 tools → 2 tools (~1,000 tokens in LLM context).
+
+# ─── Code Intelligence ────────────────────────────────────────────────
+
+[servers.narsil]
+command = "narsil-mcp"
+args = ["--repos", ".", "--git", "--call-graph", "--persist", "--watch"]
+transport = "stdio"
+timeout_secs = 30
+circuit_breaker = true
+failure_threshold = 3
+recovery_timeout_secs = 60
+
+# ─── Sandbox Settings ────────────────────────────────────────────────
+
+[sandbox]
+timeout_secs = 10
+max_heap_mb = 64
+max_concurrent = 8
+max_tool_calls = 50
+execution_mode = "child_process"
