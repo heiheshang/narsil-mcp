@@ -344,6 +344,8 @@ Exit criteria:
 ### Phase 4: 1C Repository Detection
 Goal: identify when a repository or subtree should be treated as a 1C dump.
 
+Status: completed on `feat/1c-phase5-xml-metadata-parsing`.
+
 Tasks:
 - Add `OneCRepositoryDetector`
 - Detect common markers such as:
@@ -362,8 +364,15 @@ Deliverables:
 Exit criteria:
 - the engine can reliably detect a 1C dump root in fixtures
 
+Completed:
+- `src/repo.rs` now includes `OneCRepositoryDetector` with support for `Configuration.xml`, `ConfigDumpInfo.xml`, known metadata directory layouts, and `Ext/` + metadata object patterns
+- repository discovery now finds both whole-repo 1C dumps and nested 1C subtrees inside mixed repositories
+- positive and negative detection tests cover marker-based detection and nested subtree discovery
+
 ### Phase 5: XML Metadata Parsing and Normalization
 Goal: transform raw 1C XML metadata into useful internal documents.
+
+Status: completed on `feat/1c-phase5-xml-metadata-parsing`.
 
 Tasks:
 - Add `src/ingest/onec.rs`
@@ -402,6 +411,12 @@ Deliverables:
 
 Exit criteria:
 - metadata summaries can be searched and returned independently of raw XML
+
+Completed:
+- added `src/ingest/onec.rs` with a namespace-aware `quick-xml` reader for `MetaDataObject`-based 1C metadata files
+- introduced a minimal `NormalizedDocument` / `OneCMetadataSummary` model for flattened metadata summary documents
+- metadata normalization now extracts object type, object name, relative path, selected boolean properties, discovered module links, and nearby forms/commands where the layout allows it
+- fixture-based tests cover catalog, common module, and form metadata, plus malformed XML handling and non-metadata XML skip behavior
 
 ### Phase 6: Linking Metadata and Modules
 Goal: connect XML metadata and BSL modules into coherent search documents.
@@ -718,6 +733,8 @@ The best first slice for actual development is:
 This slice produces immediate user value with limited architectural risk and creates the foundation needed for XML-aware 1C ingestion.
 
 ## Last Updated
+2026-04-29 - Phase 5 completed: XML metadata can now be normalized into flattened 1C summary documents with fixture coverage.
+2026-04-29 - Phase 4 completed: repository detection now identifies full 1C dumps and nested 1C subtrees.
 2026-04-29 - Phase 3 completed: BSL files now produce AST-aware chunks with preserved procedure/function boundaries.
 2026-04-29 - Phase 1 completed: unsupported textual files now remain searchable and chunkable.
 2026-04-29 - Initial implementation plan for adding 1C code embedding and XML-aware indexing support.
