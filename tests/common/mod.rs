@@ -9,6 +9,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use walkdir::WalkDir;
 
 /// Unique request ID generator for JSON-RPC
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -272,6 +274,15 @@ impl TestRepo {
             "large_codebase" => {
                 repo.add_large_codebase()?;
             }
+            "onec_config_dump" => {
+                repo.copy_fixture_tree("onec/config-dump")?;
+            }
+            "onec_common_modules" => {
+                repo.copy_fixture_tree("onec/common-modules")?;
+            }
+            "mixed_repo_with_onec_subtree" => {
+                repo.copy_fixture_tree("onec/mixed-repo")?;
+            }
             _ => {
                 anyhow::bail!("Unknown fixture: {}", fixture_name);
             }
@@ -294,15 +305,45 @@ impl TestRepo {
     pub fn add_file(&self, relative_path: &str, content: &str) -> Result<PathBuf> {
         let path = self.dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, content)?;
+        fs::write(&path, content)?;
         Ok(path)
     }
 
     /// Add a .gitignore file
     pub fn add_gitignore(&self, content: &str) -> Result<()> {
         self.add_file(".gitignore", content)?;
+        Ok(())
+    }
+
+    fn copy_fixture_tree(&mut self, fixture_relative_path: &str) -> Result<()> {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-fixtures")
+            .join(fixture_relative_path);
+
+        if !fixture_root.is_dir() {
+            anyhow::bail!("Fixture directory not found: {}", fixture_root.display());
+        }
+
+        for entry in WalkDir::new(&fixture_root).into_iter().filter_map(|e| e.ok()) {
+            let source_path = entry.path();
+            let relative_path = source_path.strip_prefix(&fixture_root)?;
+            let target_path = self.path().join(relative_path);
+
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target_path)?;
+                continue;
+            }
+
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            fs::copy(source_path, &target_path)?;
+            self.files.push(target_path);
+        }
+
         Ok(())
     }
 
@@ -910,3 +951,4 @@ macro_rules! assert_content_contains {
         );
     }};
 }
+
