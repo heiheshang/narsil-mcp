@@ -407,6 +407,12 @@ impl AstChunker {
                 "enum_specifier" => Some((ChunkType::Enum, SymbolKind::Enum)),
                 _ => None,
             },
+            "bsl" => match kind {
+                "procedure_definition" | "function_definition" => {
+                    Some((ChunkType::Function, SymbolKind::Function))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -460,6 +466,7 @@ impl AstChunker {
             "function_item"
                 | "function_declaration"
                 | "function_definition"
+                | "procedure_definition"
                 | "method_definition"
                 | "method_declaration"
                 | "function"
@@ -478,6 +485,7 @@ impl AstChunker {
             "rust" => text.find('{'),
             "python" => text.find(':'),
             "go" => text.find('{'),
+            "bsl" => text.find('\n').or_else(|| text.find('\r')),
             _ => text.find('{'),
         };
 
@@ -790,6 +798,7 @@ impl AstChunker {
                 if combined_lines <= self.config.max_chunk_lines
                     && (curr_lines < self.config.min_chunk_lines
                         || chunk_lines < self.config.min_chunk_lines)
+                    && (curr.symbol_context.is_none() || chunk.symbol_context.is_none())
                     && chunk.start_line <= curr.end_line + 2
                 {
                     // Merge chunks
@@ -828,6 +837,7 @@ impl AstChunker {
             "go" => "go",
             "java" => "java",
             "cs" => "c_sharp",
+            "bsl" => "bsl",
             "c" | "h" => "c",
             "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
             _ => "unknown",
@@ -1165,9 +1175,102 @@ fn d() {}
         assert_eq!(chunker.detect_language("test.go"), "go");
         assert_eq!(chunker.detect_language("test.java"), "java");
         assert_eq!(chunker.detect_language("test.cs"), "c_sharp");
+        assert_eq!(chunker.detect_language("test.bsl"), "bsl");
         assert_eq!(chunker.detect_language("test.c"), "c");
         assert_eq!(chunker.detect_language("test.cpp"), "cpp");
         assert_eq!(chunker.detect_language("test.unknown"), "unknown");
+    }
+
+    #[test]
+    fn test_chunk_bsl_multiple_procedures_and_comments() {
+        let code = r#"
+// Подготовка документа перед записью
+Процедура ПередЗаписью(Отказ, РежимЗаписи) Экспорт
+    Если Отказ Тогда
+        Возврат;
+    КонецЕсли;
+КонецПроцедуры
+
+// Возвращает имя для отображения
+Функция ПолучитьНаименование(Код) Экспорт
+    Возврат "Тест";
+КонецФункции
+"#;
+        let chunker = AstChunker::new();
+        let chunks = chunker.chunk_file(code, "module.bsl");
+
+        assert_eq!(
+            chunks.iter().filter(|c| c.chunk_type == ChunkType::Function).count(),
+            2
+        );
+
+        let procedure_chunk = chunks
+            .iter()
+            .find(|c| c.content.contains("Процедура ПередЗаписью"))
+            .expect("Should create procedure chunk");
+        assert_eq!(procedure_chunk.language, "bsl");
+        assert!(
+            procedure_chunk
+                .content
+                .contains("// Подготовка документа перед записью")
+        );
+        let procedure_ctx = procedure_chunk
+            .symbol_context
+            .as_ref()
+            .expect("Procedure chunk should have symbol context");
+        assert_eq!(procedure_ctx.name, "ПередЗаписью");
+        assert_eq!(
+            procedure_ctx.signature.as_deref(),
+            Some("Процедура ПередЗаписью(Отказ, РежимЗаписи) Экспорт")
+        );
+
+        let function_chunk = chunks
+            .iter()
+            .find(|c| c.content.contains("Функция ПолучитьНаименование"))
+            .expect("Should create function chunk");
+        let function_ctx = function_chunk
+            .symbol_context
+            .as_ref()
+            .expect("Function chunk should have symbol context");
+        assert_eq!(function_ctx.name, "ПолучитьНаименование");
+        assert_eq!(
+            function_ctx.signature.as_deref(),
+            Some("Функция ПолучитьНаименование(Код) Экспорт")
+        );
+    }
+
+    #[test]
+    fn test_large_bsl_procedure_splitting() {
+        let mut code = String::from("Процедура ДлиннаяПроцедура() Экспорт\n");
+        for i in 0..120 {
+            code.push_str(&format!("    Сообщить(\"Строка{}\");\n", i));
+        }
+        code.push_str("КонецПроцедуры\n");
+
+        let config = ChunkerConfig {
+            max_chunk_lines: 40,
+            overlap_lines: 5,
+            ..Default::default()
+        };
+        let chunker = AstChunker::with_config(config);
+        let chunks = chunker.chunk_file(&code, "common_module.bsl");
+
+        assert!(chunks.len() > 1, "Large BSL procedure should be split");
+        assert_eq!(chunks[0].chunk_type, ChunkType::Function);
+        assert_eq!(chunks[0].language, "bsl");
+        assert_eq!(
+            chunks[0]
+                .symbol_context
+                .as_ref()
+                .map(|ctx| ctx.name.as_str()),
+            Some("ДлиннаяПроцедура")
+        );
+        assert!(
+            chunks[1..]
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::SplitBlock),
+            "Continuation chunks should use split block type"
+        );
     }
 
     #[test]

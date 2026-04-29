@@ -312,6 +312,8 @@ Exit criteria:
 ### Phase 3: BSL Chunking Support
 Goal: produce useful chunks from BSL modules.
 
+Status: completed on `feat/1c-phase3-bsl-chunking`.
+
 Tasks:
 - Add `bsl` detection in `src/chunking.rs`
 - Verify AST boundaries from `tree-sitter-bsl`
@@ -328,6 +330,12 @@ Tasks:
 Deliverables:
 - BSL AST-aware chunks
 - chunk stats coverage
+
+Completed:
+- `src/chunking.rs` now recognizes `.bsl` files and classifies `procedure_definition` / `function_definition` nodes as chunk boundaries
+- BSL signatures are extracted from the declaration line so `get_chunks` surfaces readable procedure/function headers
+- adjacent symbol chunks are no longer merged together, preserving separate procedures/functions as distinct search chunks
+- chunking tests now cover multiple BSL procedures/functions with comments and splitting of large BSL procedures
 
 Exit criteria:
 - `get_chunks` produces meaningful chunks for BSL files
@@ -710,5 +718,6 @@ The best first slice for actual development is:
 This slice produces immediate user value with limited architectural risk and creates the foundation needed for XML-aware 1C ingestion.
 
 ## Last Updated
+2026-04-29 - Phase 3 completed: BSL files now produce AST-aware chunks with preserved procedure/function boundaries.
 2026-04-29 - Phase 1 completed: unsupported textual files now remain searchable and chunkable.
 2026-04-29 - Initial implementation plan for adding 1C code embedding and XML-aware indexing support.
