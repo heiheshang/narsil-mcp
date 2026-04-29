@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+  <Catalog uuid="33333333-3333-3333-3333-333333333333">
+    <Name>Products</Name>
+    <Synonym>
+      <item lang="en">Products</item>
+    </Synonym>
+  </Catalog>
+</MetaDataObject>
