@@ -12,6 +12,7 @@ pub mod dfg;
 pub mod embeddings;
 pub mod extract;
 pub mod hybrid_search;
+pub mod ingest;
 pub mod incremental;
 pub mod metrics;
 pub mod parser;
