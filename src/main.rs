@@ -19,6 +19,7 @@ mod git;
 mod http_server;
 mod hybrid_search;
 mod incremental;
+mod ingest;
 mod index;
 mod lsp;
 mod mcp;
