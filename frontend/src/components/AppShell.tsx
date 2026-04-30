@@ -77,6 +77,13 @@ export function AppShell() {
               v{health?.version ?? '?'}
             </span>
 
+            <Link
+              to="/tools"
+              className="text-sm text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white transition-colors"
+            >
+              Tools
+            </Link>
+
             {/* Repo selector in header */}
             {repos && repos.length > 0 && (
               <>
