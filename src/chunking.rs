@@ -1200,7 +1200,10 @@ fn d() {}
         let chunks = chunker.chunk_file(code, "module.bsl");
 
         assert_eq!(
-            chunks.iter().filter(|c| c.chunk_type == ChunkType::Function).count(),
+            chunks
+                .iter()
+                .filter(|c| c.chunk_type == ChunkType::Function)
+                .count(),
             2
         );
 
@@ -1209,11 +1212,9 @@ fn d() {}
             .find(|c| c.content.contains("Процедура ПередЗаписью"))
             .expect("Should create procedure chunk");
         assert_eq!(procedure_chunk.language, "bsl");
-        assert!(
-            procedure_chunk
-                .content
-                .contains("// Подготовка документа перед записью")
-        );
+        assert!(procedure_chunk
+            .content
+            .contains("// Подготовка документа перед записью"));
         let procedure_ctx = procedure_chunk
             .symbol_context
             .as_ref()

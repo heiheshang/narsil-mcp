@@ -23,13 +23,14 @@ use crate::cfg;
 use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
 use crate::git::GitRepo;
+use crate::ingest::{DocumentKind as NormalizedDocumentKind, NormalizedDocument, OneCIngestor};
 use crate::lsp::{LspConfig, LspManager};
 use crate::metrics::Metrics;
 use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
-use crate::search::ConcurrentSearchIndex;
+use crate::search::{ConcurrentSearchIndex, DocType, SearchDocument};
 use crate::streaming::StreamingConfig;
 use crate::symbols::{Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
@@ -143,6 +144,8 @@ pub struct CodeIntelEngine {
     symbols: DashMap<String, Vec<Symbol>>,
     /// File content cache (path -> content)
     file_cache: DashMap<PathBuf, Arc<String>>,
+    /// Synthetic normalized documents indexed separately from raw files
+    normalized_docs: DashMap<String, Vec<NormalizedDocument>>,
     /// Language parser
     parser: Arc<LanguageParser>,
     /// Git repository handles (when git is enabled)
@@ -320,6 +323,7 @@ impl CodeIntelEngine {
             repos: DashMap::new(),
             symbols: DashMap::new(),
             file_cache: DashMap::new(),
+            normalized_docs: DashMap::new(),
             parser: Arc::new(LanguageParser::new()?),
             git_repos: DashMap::new(),
             call_graphs: DashMap::new(),
@@ -572,6 +576,7 @@ impl CodeIntelEngine {
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
         let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
+        let mut normalized_docs_vec: Vec<NormalizedDocument> = Vec::new();
         let mut file_count = 0;
         let mut total_lines = 0;
 
@@ -680,6 +685,11 @@ impl CodeIntelEngine {
             self.file_cache
                 .insert(file_path.clone(), Arc::new(content.clone()));
             self.search_index.index_file(&relative_path, &content);
+
+            for document in collect_onec_normalized_documents(path, file_path.as_path()) {
+                self.index_normalized_document(&document);
+                normalized_docs_vec.push(document);
+            }
         }
 
         let metadata = RepoMetadata {
@@ -722,6 +732,8 @@ impl CodeIntelEngine {
 
         self.repos.insert(repo_name.clone(), metadata);
         self.symbols.insert(repo_name.clone(), symbols_vec);
+        self.normalized_docs
+            .insert(repo_name.clone(), normalized_docs_vec);
 
         // Build call graph if enabled
         if self.options.call_graph_enabled && !trees_for_callgraph.is_empty() {
@@ -782,10 +794,45 @@ impl CodeIntelEngine {
         Ok(())
     }
 
+    fn index_normalized_document(&self, document: &NormalizedDocument) {
+        let file_path = normalized_document_primary_source(document);
+        let content = render_normalized_search_content(document);
+        let start_line = 1;
+        let end_line = content.lines().count();
+        let tokens = crate::search::tokenize_code(&content);
+        let term_freq = tokens
+            .iter()
+            .cloned()
+            .fold(HashMap::new(), |mut acc, token| {
+                *acc.entry(token).or_default() += 1;
+                acc
+            });
+
+        self.search_index.add_document(SearchDocument {
+            id: document.id.clone(),
+            file_path: file_path.clone(),
+            content: content.clone(),
+            doc_type: DocType::Other,
+            start_line,
+            end_line,
+            tokens,
+            term_freq,
+        });
+
+        self.embedding_engine.index_snippet(
+            document.id.clone(),
+            file_path,
+            content,
+            start_line,
+            end_line,
+        );
+    }
+
     pub async fn reindex_all(&self) -> Result<()> {
         self.repos.clear();
         self.symbols.clear();
         self.file_cache.clear();
+        self.normalized_docs.clear();
         self.search_index.clear();
         self.embedding_engine.clear();
         // Clear all caches on full reindex
@@ -800,6 +847,7 @@ impl CodeIntelEngine {
                 let path = self.get_repo_path(name)?;
                 self.repos.remove(name);
                 self.symbols.remove(name);
+                self.normalized_docs.remove(name);
                 // Invalidate caches for this repo only
                 self.query_cache.invalidate_for_repo(name);
                 self.index_repo(&path).await?;
@@ -1323,6 +1371,50 @@ impl CodeIntelEngine {
                             language: get_language_id(&rel_path).to_string(),
                             relevance_score: score,
                         });
+                    }
+                }
+            }
+
+            if let Some(documents) = self.normalized_docs.get(&repo_name) {
+                for document in documents.iter() {
+                    let primary_source = normalized_document_primary_source(document);
+
+                    if exclude_tests && is_test_file(&primary_source) {
+                        continue;
+                    }
+
+                    if let Some(ref g) = glob {
+                        if !g.matches(&primary_source) && !g.matches(&document.id) {
+                            continue;
+                        }
+                    }
+
+                    let searchable_content = render_normalized_search_content(document);
+                    let lines: Vec<&str> = searchable_content.lines().collect();
+
+                    for (line_num, line) in lines.iter().enumerate() {
+                        if line.to_lowercase().contains(&query_lower) {
+                            let start = line_num.saturating_sub(3);
+                            let end = (line_num + 4).min(lines.len());
+
+                            let excerpt_content: String = lines[start..end]
+                                .iter()
+                                .enumerate()
+                                .map(|(i, l)| format!("{:4} | {}", start + i + 1, l))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+
+                            let score = calculate_relevance(line, &query_lower);
+
+                            results.push(CodeExcerpt {
+                                file_path: primary_source.clone(),
+                                start_line: start + 1,
+                                end_line: end,
+                                content: excerpt_content,
+                                language: "text".to_string(),
+                                relevance_score: score,
+                            });
+                        }
                     }
                 }
             }
@@ -1864,6 +1956,25 @@ impl CodeIntelEngine {
                         // Update search index
                         self.search_index.index_file(&rel_path, &content);
 
+                        let normalized_documents =
+                            collect_onec_normalized_documents(repo_path, &change.path);
+                        let normalized_primary_source =
+                            normalize_primary_source_for_match(&rel_path);
+                        if let Some(mut docs) = self.normalized_docs.get_mut(&repo_name) {
+                            docs.retain(|doc| {
+                                normalize_primary_source_for_match(
+                                    &normalized_document_primary_source(doc),
+                                ) != normalized_primary_source
+                            });
+                            docs.extend(normalized_documents.clone());
+                        } else if !normalized_documents.is_empty() {
+                            self.normalized_docs
+                                .insert(repo_name.clone(), normalized_documents.clone());
+                        }
+                        for document in normalized_documents {
+                            self.index_normalized_document(&document);
+                        }
+
                         // Smart cache invalidation - only invalidate entries that depend on this file
                         self.query_cache.invalidate_for_file(&rel_path);
 
@@ -1886,6 +1997,15 @@ impl CodeIntelEngine {
 
                     // Remove from file cache
                     self.file_cache.remove(&change.path);
+
+                    let normalized_primary_source = normalize_primary_source_for_match(&rel_path);
+                    if let Some(mut docs) = self.normalized_docs.get_mut(&repo_name) {
+                        docs.retain(|doc| {
+                            normalize_primary_source_for_match(&normalized_document_primary_source(
+                                doc,
+                            )) != normalized_primary_source
+                        });
+                    }
 
                     // Smart cache invalidation - only invalidate entries that depend on this file
                     self.query_cache.invalidate_for_file(&rel_path);
@@ -3717,6 +3837,44 @@ impl CodeIntelEngine {
                     hybrid_engine.index_chunk(&chunk);
                 }
             }
+
+            if let Some(documents) = self.normalized_docs.get(repo_name) {
+                for document in documents.iter() {
+                    let primary_source = normalized_document_primary_source(document);
+                    if exclude_tests && is_test_file(&primary_source) {
+                        continue;
+                    }
+
+                    let content = render_normalized_search_content(document);
+                    let tokens = crate::search::tokenize_code(&content);
+                    let term_freq = tokens.iter().cloned().fold(
+                        std::collections::HashMap::new(),
+                        |mut acc, token| {
+                            *acc.entry(token).or_default() += 1;
+                            acc
+                        },
+                    );
+
+                    bm25_index.add_document(SearchDocument {
+                        id: document.id.clone(),
+                        file_path: primary_source.clone(),
+                        content: content.clone(),
+                        doc_type: DocType::Other,
+                        start_line: 1,
+                        end_line: content.lines().count(),
+                        tokens,
+                        term_freq,
+                    });
+
+                    tfidf_engine.index_snippet(
+                        document.id.clone(),
+                        primary_source,
+                        content.clone(),
+                        1,
+                        content.lines().count(),
+                    );
+                }
+            }
         }
 
         // Perform search based on mode
@@ -3855,6 +4013,49 @@ impl CodeIntelEngine {
 
                     if score > 0.0 {
                         all_chunks.push((chunk, score));
+                    }
+                }
+            }
+
+            if let Some(documents) = self.normalized_docs.get(repo_name) {
+                for document in documents.iter() {
+                    if let Some(ref target) = target_type {
+                        if *target != ChunkType::Module {
+                            continue;
+                        }
+                    }
+
+                    let primary_source = normalized_document_primary_source(document);
+                    if exclude_tests && is_test_file(&primary_source) {
+                        continue;
+                    }
+
+                    let content = render_normalized_search_content(document);
+                    let chunk_tokens: std::collections::HashSet<_> =
+                        tokenize_code(&content).into_iter().collect();
+                    let common = query_tokens.intersection(&chunk_tokens).count();
+                    let score = if query_tokens.is_empty() {
+                        0.0
+                    } else {
+                        common as f64 / query_tokens.len() as f64
+                    };
+
+                    if score > 0.0 {
+                        all_chunks.push((
+                            crate::chunking::CodeChunk {
+                                id: document.id.clone(),
+                                content: content.clone(),
+                                file_path: primary_source,
+                                start_line: 1,
+                                end_line: content.lines().count(),
+                                language: "text".to_string(),
+                                symbol_context: None,
+                                chunk_type: ChunkType::Module,
+                                doc_comment: None,
+                                imports: Vec::new(),
+                            },
+                            score,
+                        ));
                     }
                 }
             }
@@ -7952,6 +8153,75 @@ fn read_indexable_text_file(path: &Path) -> Option<String> {
     }
 
     String::from_utf8(bytes).ok()
+}
+
+fn collect_onec_normalized_documents(
+    repo_root: &Path,
+    file_path: &Path,
+) -> Vec<NormalizedDocument> {
+    if file_path.extension().and_then(|ext| ext.to_str()) != Some("xml") {
+        return Vec::new();
+    }
+
+    match OneCIngestor::new().ingest_metadata_documents(repo_root, file_path) {
+        Ok(documents) => documents,
+        Err(error) => {
+            warn!(
+                "Failed to normalize 1C metadata {}: {}",
+                file_path.display(),
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn normalized_document_primary_source(document: &NormalizedDocument) -> String {
+    document
+        .metadata
+        .get("primary_source_path")
+        .cloned()
+        .unwrap_or_else(|| document.id.clone())
+}
+
+fn normalize_primary_source_for_match(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn normalized_document_kind_label(kind: &NormalizedDocumentKind) -> &'static str {
+    match kind {
+        NormalizedDocumentKind::OneCMetadataSummary => "1c_metadata_summary",
+        NormalizedDocumentKind::OneCObjectBundle => "1c_object_bundle",
+        NormalizedDocumentKind::OneCFormModuleBundle => "1c_form_module_bundle",
+    }
+}
+
+fn render_normalized_search_content(document: &NormalizedDocument) -> String {
+    let mut lines = vec![
+        format!("Synthetic Document: {}", document.id),
+        format!(
+            "Primary Source: {}",
+            normalized_document_primary_source(document)
+        ),
+        format!(
+            "Document Kind: {}",
+            normalized_document_kind_label(&document.kind)
+        ),
+    ];
+
+    if let Some(object_type) = document.metadata.get("object_type") {
+        lines.push(format!("Object Type: {}", object_type));
+    }
+    if let Some(object_name) = document.metadata.get("object_name") {
+        lines.push(format!("Object Name: {}", object_name));
+    }
+    if let Some(summary_document_id) = document.metadata.get("summary_document_id") {
+        lines.push(format!("Summary Document: {}", summary_document_id));
+    }
+
+    lines.push(String::new());
+    lines.push(document.content.clone());
+    lines.join("\n")
 }
 
 // Helper functions
