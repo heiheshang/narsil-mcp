@@ -142,7 +142,10 @@ impl TestMcpServer {
     pub fn start_with_features(repo_path: &Path, features: &[&str]) -> Result<Self> {
         let binary_path = get_binary_path();
 
-        let mut args = vec!["--repos".to_string(), repo_path.to_string_lossy().to_string()];
+        let mut args = vec![
+            "--repos".to_string(),
+            repo_path.to_string_lossy().to_string(),
+        ];
 
         for feature in features {
             args.push(format!("--{}", feature));
@@ -326,7 +329,10 @@ impl TestRepo {
             anyhow::bail!("Fixture directory not found: {}", fixture_root.display());
         }
 
-        for entry in WalkDir::new(&fixture_root).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&fixture_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let source_path = entry.path();
             let relative_path = source_path.strip_prefix(&fixture_root)?;
             let target_path = self.path().join(relative_path);
@@ -814,10 +820,7 @@ impl TestMetrics {
 
     fn record_call(&self, tool: &str, duration: Duration) {
         let mut calls = self.calls.lock().unwrap();
-        calls
-            .entry(tool.to_string())
-            .or_default()
-            .push(duration);
+        calls.entry(tool.to_string()).or_default().push(duration);
     }
 
     /// Get average duration for a tool
@@ -951,4 +954,3 @@ macro_rules! assert_content_contains {
         );
     }};
 }
-
