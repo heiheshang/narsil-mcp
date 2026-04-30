@@ -437,8 +437,17 @@ fn split_identifier(ident: &str) -> Vec<String> {
 
     for i in 0..chars.len() {
         let ch = chars[i];
-        let prev_lower = i > 0 && chars[i - 1].is_lowercase();
+        let prev = i.checked_sub(1).map(|idx| chars[idx]);
+        let prev_lower = prev.is_some_and(|c| c.is_lowercase());
         let next_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
+        let split_before = prev.is_some_and(|prev_ch| {
+            (prev_ch.is_ascii_digit() && !ch.is_ascii_digit())
+                || (!prev_ch.is_ascii_digit() && ch.is_ascii_digit())
+                || is_script_boundary(prev_ch, ch)
+                || (ch.is_uppercase()
+                    && (prev_lower || (i + 1 < chars.len() && next_lower))
+                    && !current.is_empty())
+        });
 
         // Split on underscore
         if ch == '_' {
@@ -449,11 +458,8 @@ fn split_identifier(ident: &str) -> Vec<String> {
             continue;
         }
 
-        // Split on camelCase boundary
-        if ch.is_uppercase()
-            && (prev_lower || (i + 1 < chars.len() && next_lower))
-            && !current.is_empty()
-        {
+        // Split on digit/letter boundaries, Latin/Cyrillic transitions, and camelCase edges.
+        if split_before {
             parts.push(current.clone());
             current.clear();
         }
@@ -469,6 +475,35 @@ fn split_identifier(ident: &str) -> Vec<String> {
     parts.push(ident.to_string());
 
     parts
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptGroup {
+    Latin,
+    Cyrillic,
+}
+
+fn script_group(ch: char) -> Option<ScriptGroup> {
+    if ch.is_ascii_alphabetic() {
+        Some(ScriptGroup::Latin)
+    } else if ('\u{0400}'..='\u{04FF}').contains(&ch)
+        || ('\u{0500}'..='\u{052F}').contains(&ch)
+        || ('\u{2DE0}'..='\u{2DFF}').contains(&ch)
+        || ('\u{A640}'..='\u{A69F}').contains(&ch)
+        || ch == 'ё'
+        || ch == 'Ё'
+    {
+        Some(ScriptGroup::Cyrillic)
+    } else {
+        None
+    }
+}
+
+fn is_script_boundary(prev: char, current: char) -> bool {
+    matches!(
+        (script_group(prev), script_group(current)),
+        (Some(left), Some(right)) if left != right
+    )
 }
 
 /// Count term frequencies
@@ -588,6 +623,33 @@ mod tests {
         assert!(parts.contains(&"User".to_string()));
         assert!(parts.contains(&"By".to_string()));
         assert!(parts.contains(&"ID".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_cyrillic_camel_case() {
+        let tokens = tokenize_code("ОбработатьXMLДанные");
+        assert!(tokens.contains(&"обработать".to_string()));
+        assert!(tokens.contains(&"xml".to_string()));
+        assert!(tokens.contains(&"данные".to_string()));
+        assert!(tokens.contains(&"обработатьxmlданные".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_mixed_script_identifier() {
+        let tokens = tokenize_code("xmlклиент");
+        assert!(tokens.contains(&"xml".to_string()));
+        assert!(tokens.contains(&"клиент".to_string()));
+        assert!(tokens.contains(&"xmlклиент".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_mixed_digits_and_cyrillic() {
+        let tokens = tokenize_code("УТ11ОбменXML");
+        assert!(tokens.contains(&"ут".to_string()));
+        assert!(tokens.contains(&"11".to_string()));
+        assert!(tokens.contains(&"обмен".to_string()));
+        assert!(tokens.contains(&"xml".to_string()));
+        assert!(tokens.contains(&"ут11обменxml".to_string()));
     }
 
     #[test]
