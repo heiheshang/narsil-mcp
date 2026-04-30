@@ -1,5 +1,22 @@
 import type { GraphRequest, GraphResponse, ToolCallRequest, ToolCallResponse } from '../types/graph';
 
+export interface ToolMetadata {
+  name: string;
+  description: string;
+  category: string;
+  stability: string;
+  performance: string;
+  requires_api_key: boolean;
+  required_flags: string[];
+  tags: string[];
+  aliases: string[];
+  input_schema: {
+    type?: string;
+    properties?: Record<string, { type?: string; description?: string }>;
+    required?: string[];
+  };
+}
+
 /**
  * Determine the API base URL:
  * - In development (Vite dev server): use localhost:3000 where narsil-mcp runs
@@ -35,13 +52,13 @@ export class CodeIntelClient {
   /**
    * List available tools
    */
-  async listTools(): Promise<string[]> {
+  async listTools(): Promise<ToolMetadata[]> {
     const response = await fetch(`${this.baseUrl}/tools`);
     if (!response.ok) {
       throw new Error(`Failed to list tools: ${response.statusText}`);
     }
     const data = await response.json();
-    return data.tools.map((t: { name: string }) => t.name);
+    return data.tools as ToolMetadata[];
   }
 
   /**
