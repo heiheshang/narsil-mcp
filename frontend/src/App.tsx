@@ -7,6 +7,7 @@ import { DashboardPage } from './pages/DashboardPage';
 import { RepoOverviewPage } from './pages/RepoOverviewPage';
 import { GraphPage } from './pages/GraphPage';
 import { FilePage } from './pages/FilePage';
+import { ToolsPage } from './pages/ToolsPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -64,6 +65,9 @@ function App() {
               <Route element={<AppShell />}>
                 {/* Dashboard — repo picker */}
                 <Route index element={<DashboardPage />} />
+
+                {/* Tool catalog */}
+                <Route path="tools" element={<ToolsPage />} />
 
                 {/* Repo overview */}
                 <Route path=":repo" element={<RepoOverviewPage />} />

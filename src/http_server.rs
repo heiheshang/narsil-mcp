@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::index::CodeIntelEngine;
+use crate::tool_metadata::TOOL_METADATA;
 use crate::tool_handlers::ToolRegistry;
 
 // Embedded frontend assets (only when frontend feature is enabled)
@@ -86,6 +87,15 @@ pub struct ListToolsResponse {
 #[derive(Debug, Serialize)]
 pub struct ToolInfo {
     name: String,
+    description: String,
+    category: String,
+    stability: String,
+    performance: String,
+    requires_api_key: bool,
+    required_flags: Vec<String>,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    input_schema: Value,
 }
 
 impl HttpServer {
@@ -158,8 +168,35 @@ async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
         .tool_registry
         .tool_names()
         .iter()
-        .map(|name| ToolInfo {
-            name: name.to_string(),
+        .filter_map(|name| {
+            TOOL_METADATA.get(name).map(|meta| {
+                let mut required_flags: Vec<String> = meta
+                    .required_flags
+                    .iter()
+                    .map(|flag| format!("{:?}", flag))
+                    .collect();
+                required_flags.sort();
+
+                let mut tags: Vec<String> = meta.tags.iter().map(|tag| tag.to_string()).collect();
+                tags.sort();
+
+                let mut aliases: Vec<String> =
+                    meta.aliases.iter().map(|alias| alias.to_string()).collect();
+                aliases.sort();
+
+                ToolInfo {
+                    name: meta.name.to_string(),
+                    description: meta.description.to_string(),
+                    category: meta.category.to_string(),
+                    stability: format!("{:?}", meta.stability),
+                    performance: format!("{:?}", meta.performance),
+                    requires_api_key: meta.requires_api_key,
+                    required_flags,
+                    tags,
+                    aliases,
+                    input_schema: meta.input_schema.clone(),
+                }
+            })
         })
         .collect();
 

@@ -691,6 +691,11 @@ Mitigation:
 - Phases 9 and 10 completed
 - user-facing docs and optional neural support are in place
 
+### Current Phase 9 Status
+- HTTP `/tools` now exposes rich tool metadata derived from `TOOL_METADATA`, not just tool names.
+- The frontend now consumes typed tool metadata and exposes a dedicated `Tools` catalog page for browsing categories, requirements, aliases, and input schemas.
+- This completes the "frontend mappings" slice of phase 9 and leaves user-facing documentation polish plus optional neural support as the remaining work toward Milestone 5.
+
 ## Suggested Task Breakdown
 The work can be implemented in this order:
 
@@ -733,6 +738,7 @@ The best first slice for actual development is:
 This slice produces immediate user value with limited architectural risk and creates the foundation needed for XML-aware 1C ingestion.
 
 ## Last Updated
+2026-04-30 - Phase 9 frontend mappings completed: the HTTP `/tools` endpoint now exposes rich metadata and the frontend includes a typed tools catalog page.
 2026-04-29 - Phase 5 completed: XML metadata can now be normalized into flattened 1C summary documents with fixture coverage.
 2026-04-29 - Phase 4 completed: repository detection now identifies full 1C dumps and nested 1C subtrees.
 2026-04-29 - Phase 3 completed: BSL files now produce AST-aware chunks with preserved procedure/function boundaries.
