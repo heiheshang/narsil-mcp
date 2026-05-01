@@ -3,7 +3,7 @@
 # narsil-mcp installer
 # One-click installation for narsil-mcp MCP server
 #
-# Usage: curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash
 #
 
 set -e
@@ -16,7 +16,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-REPO="postrv/narsil-mcp"
+REPO="heiheshang/narsil-mcp"
 BINARY_NAME="narsil-mcp"
 INSTALL_DIR="${HOME}/.local/bin"
 IS_WINDOWS=false
@@ -347,7 +347,7 @@ main() {
     echo ""
     echo -e "${BLUE}NEED HELP?${NC}"
     echo "  Documentation: https://github.com/${REPO}"
-    echo "  Plugin: /plugin install github:postrv/narsil-mcp/narsil-plugin"
+    echo "  Plugin: /plugin install github:${REPO}/narsil-plugin"
     echo ""
 }
 
