@@ -120,6 +120,20 @@ impl ToolMetadata {
                 .iter()
                 .any(|alias| alias.to_lowercase().contains(&query_lower))
     }
+
+    /// Build MCP tool annotations from richer internal metadata.
+    pub fn mcp_annotations(&self) -> serde_json::Value {
+        let is_read_only = !matches!(self.name, "reindex");
+        let is_idempotent = !matches!(self.name, "reindex");
+
+        json!({
+            "title": self.name.replace('_', " "),
+            "readOnlyHint": is_read_only,
+            "destructiveHint": false,
+            "idempotentHint": is_idempotent,
+            "openWorldHint": false,
+        })
+    }
 }
 
 lazy_static! {

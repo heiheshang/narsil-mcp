@@ -38,6 +38,7 @@ fn generate_tools_list_response(filter: &ToolFilter) -> serde_json::Value {
                 "name": meta.name,
                 "description": meta.description,
                 "inputSchema": meta.input_schema,
+                "annotations": meta.mcp_annotations(),
             })
         })
         .collect();

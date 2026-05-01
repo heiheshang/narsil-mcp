@@ -23,7 +23,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: narsil-mcp-linux-x86_64
+            artifact: x86_64-unknown-linux-gnu
             binary: narsil-mcp
           # Native ARM64 Linux build via GitHub-hosted Graviton runners.
           # No cross-compile toolchain required — addresses issue #20
@@ -33,20 +33,24 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: narsil-mcp-linux-aarch64
             binary: narsil-mcp
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: x86_64-unknown-linux-musl
+            binary: narsil-mcp
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: narsil-mcp-macos-x86_64
+            artifact: x86_64-apple-darwin
             binary: narsil-mcp
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: narsil-mcp-macos-aarch64
+            artifact: aarch64-apple-darwin
             binary: narsil-mcp
           # Pin Windows release builds to the stable VS2022 image. The
           # moving windows-latest image has broken rust-cache during hosted
           # image transitions, which can fail the binary job before compile.
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            artifact: narsil-mcp-windows-x86_64
+            artifact: windows-x86_64
             binary: narsil-mcp.exe
 
     steps:

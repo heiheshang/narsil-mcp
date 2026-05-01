@@ -35,33 +35,33 @@ pnpm add -g narsil-mcp
 **Nix:**
 ```bash
 # Run directly without installing
-nix run github:postrv/narsil-mcp -- --repos ./my-project
+nix run github:heiheshang/narsil-mcp -- --repos ./my-project
 
 # Install to profile
-nix profile install github:postrv/narsil-mcp
+nix profile install github:heiheshang/narsil-mcp
 
 # With web visualization frontend
-nix profile install github:postrv/narsil-mcp#with-frontend
+nix profile install github:heiheshang/narsil-mcp#with-frontend
 
 # Development shell
-nix develop github:postrv/narsil-mcp
+nix develop github:heiheshang/narsil-mcp
 ```
 
 ### One-Click Install Script
 
 **macOS / Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.ps1 | iex
 ```
 
 **Windows (Git Bash / MSYS2):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash
 ```
 
 > **Note for Windows users:** The PowerShell installer provides better error messages and native Windows integration. It will automatically configure your PATH and check for required build tools if building from source.
@@ -74,7 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh |
 
 ```bash
 # Clone and build
-git clone git@github.com:postrv/narsil-mcp.git
+git clone git@github.com:heiheshang/narsil-mcp.git
 cd narsil-mcp
 cargo build --release
 
