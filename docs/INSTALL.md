@@ -26,7 +26,7 @@ yarn global add narsil-mcp
 
 **Install script** (curl):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash
 ```
 
 ### Windows
@@ -105,7 +105,7 @@ If you prefer to build from source:
 
 ```bash
 # Clone the repository
-git clone https://github.com/postrv/narsil-mcp.git
+git clone https://github.com/heiheshang/narsil-mcp.git
 cd narsil-mcp
 
 # Build release binary
@@ -159,7 +159,7 @@ If `cargo install` fails:
 ### Windows Installation Issues
 
 If install script fails on Windows:
-1. Use the PowerShell version: `irm https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.ps1 | iex`
+1. Use the PowerShell version: `irm https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.ps1 | iex`
 2. Or use Scoop instead: `scoop install narsil-mcp`
 3. Or build from source with cargo
 

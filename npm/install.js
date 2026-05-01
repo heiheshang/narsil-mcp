@@ -12,7 +12,7 @@ const { execSync } = require("child_process");
 const zlib = require("zlib");
 
 const PACKAGE_VERSION = require("./package.json").version;
-const REPO = "postrv/narsil-mcp";
+const REPO = "heiheshang/narsil-mcp";
 const BINARY_NAME = process.platform === "win32" ? "narsil-mcp.exe" : "narsil-mcp";
 
 // Map Node.js platform/arch to Rust target artifacts
@@ -170,9 +170,9 @@ async function main() {
   } catch (err) {
     console.error(`\nInstallation failed: ${err.message}`);
     console.error("\nAlternative installation methods:");
-    console.error("  1. Shell installer:  curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash");
+    console.error("  1. Shell installer:  curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash");
     console.error("  2. Build from source: cargo install narsil-mcp");
-    console.error("  3. Download manually: https://github.com/postrv/narsil-mcp/releases");
+    console.error("  3. Download manually: https://github.com/heiheshang/narsil-mcp/releases");
     process.exit(1);
   }
 }
@@ -200,9 +200,9 @@ QUICK START - Claude Code:
 
 ALTERNATIVE - Claude Desktop / Cursor / Windsurf:
 
-  See: https://github.com/postrv/narsil-mcp#mcp-configuration
+  See: https://github.com/heiheshang/narsil-mcp#mcp-configuration
 
-DOCUMENTATION: https://github.com/postrv/narsil-mcp
+DOCUMENTATION: https://github.com/heiheshang/narsil-mcp
 ================================================================================
 `);
 }

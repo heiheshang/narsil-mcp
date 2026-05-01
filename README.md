@@ -2,12 +2,14 @@
 
 > The blazing-fast, privacy-first MCP server for deep code intelligence
 
+[English](README.md) | [Русский](README.ru.md)
+
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-1763%2B%20passed-brightgreen.svg)](https://github.com/postrv/narsil-mcp)
+[![Tests](https://img.shields.io/badge/tests-1763%2B%20passed-brightgreen.svg)](https://github.com/heiheshang/narsil-mcp)
 [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg)](https://modelcontextprotocol.io)
 
-A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 90 specialized tools.
+A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 90 specialized tools, including support for 1C/BSL repositories and configuration dumps.
 
 ## Why narsil-mcp?
 
@@ -79,6 +81,7 @@ A Rust-powered MCP (Model Context Protocol) server providing AI assistants with 
 | **PowerShell** | `.ps1`, `.psm1`, `.psd1` | functions, classes, enums |
 | **Nix** | `.nix` | bindings |
 | **Groovy** | `.groovy`, `.gradle` | methods, classes, interfaces, enums, functions |
+| **1C / BSL** | `.bsl`, `Configuration.xml`, `ConfigDumpInfo.xml` | procedures, functions, normalized metadata documents, configuration dump artifacts |
 
 ## Installation
 
@@ -120,33 +123,33 @@ pnpm add -g narsil-mcp
 **Nix:**
 ```bash
 # Run directly without installing
-nix run github:postrv/narsil-mcp -- --repos ./my-project
+nix run github:heiheshang/narsil-mcp -- --repos ./my-project
 
 # Install to profile
-nix profile install github:postrv/narsil-mcp
+nix profile install github:heiheshang/narsil-mcp
 
 # With web visualization frontend
-nix profile install github:postrv/narsil-mcp#with-frontend
+nix profile install github:heiheshang/narsil-mcp#with-frontend
 
 # Development shell
-nix develop github:postrv/narsil-mcp
+nix develop github:heiheshang/narsil-mcp
 ```
 
 ### One-Click Install Script
 
 **macOS / Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.ps1 | iex
 ```
 
 **Windows (Git Bash / MSYS2):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.sh | bash
 ```
 
 > **Note for Windows users:** The PowerShell installer provides better error messages and native Windows integration. It will automatically configure your PATH and check for required build tools if building from source.
@@ -159,7 +162,7 @@ curl -fsSL https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.sh |
 
 ```bash
 # Clone and build
-git clone git@github.com:postrv/narsil-mcp.git
+git clone git@github.com:heiheshang/narsil-mcp.git
 cd narsil-mcp
 cargo build --release
 
@@ -604,7 +607,7 @@ For **Claude Code** users, we provide a plugin with slash commands and a skill f
 **Install via Marketplace (Recommended):**
 ```shell
 # Add the narsil-mcp marketplace
-/plugin marketplace add postrv/narsil-mcp
+/plugin marketplace add heiheshang/narsil-mcp
 
 # Install the plugin
 /plugin install narsil@narsil-mcp
@@ -612,7 +615,7 @@ For **Claude Code** users, we provide a plugin with slash commands and a skill f
 
 **Or install directly from GitHub:**
 ```shell
-/plugin install github:postrv/narsil-mcp/narsil-plugin
+/plugin install github:heiheshang/narsil-mcp/narsil-plugin
 ```
 
 **What's included:**

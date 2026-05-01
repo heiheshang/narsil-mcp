@@ -23,23 +23,23 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: narsil-mcp-linux-x86_64
+            artifact: x86_64-unknown-linux-gnu
             binary: narsil-mcp
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            artifact: narsil-mcp-linux-x86_64-musl
+            artifact: x86_64-unknown-linux-musl
             binary: narsil-mcp
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: narsil-mcp-macos-x86_64
+            artifact: x86_64-apple-darwin
             binary: narsil-mcp
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: narsil-mcp-macos-aarch64
+            artifact: aarch64-apple-darwin
             binary: narsil-mcp
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: narsil-mcp-windows-x86_64
+            artifact: windows-x86_64
             binary: narsil-mcp.exe
 
     steps:

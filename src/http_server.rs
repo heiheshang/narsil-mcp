@@ -22,8 +22,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::index::CodeIntelEngine;
-use crate::tool_metadata::TOOL_METADATA;
 use crate::tool_handlers::ToolRegistry;
+use crate::tool_metadata::TOOL_METADATA;
 
 // Embedded frontend assets (only when frontend feature is enabled)
 #[cfg(feature = "frontend")]
@@ -96,6 +96,7 @@ pub struct ToolInfo {
     tags: Vec<String>,
     aliases: Vec<String>,
     input_schema: Value,
+    annotations: Value,
 }
 
 impl HttpServer {
@@ -195,6 +196,7 @@ async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
                     tags,
                     aliases,
                     input_schema: meta.input_schema.clone(),
+                    annotations: meta.mcp_annotations(),
                 }
             })
         })
