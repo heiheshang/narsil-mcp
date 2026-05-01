@@ -14,15 +14,15 @@
     "code-analysis",
     "security-scanning"
   ],
-  "author": "postrv",
+  "author": "heiheshang",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/postrv/narsil-mcp.git"
+    "url": "git+https://github.com/heiheshang/narsil-mcp.git"
   },
-  "homepage": "https://github.com/postrv/narsil-mcp#readme",
+  "homepage": "https://github.com/heiheshang/narsil-mcp#readme",
   "bugs": {
-    "url": "https://github.com/postrv/narsil-mcp/issues"
+    "url": "https://github.com/heiheshang/narsil-mcp/issues"
   },
   "bin": {
     "narsil-mcp": "bin/narsil-mcp"

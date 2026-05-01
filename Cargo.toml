@@ -2,10 +2,10 @@
 name = "narsil-mcp"
 version = "1.6.1"
 edition = "2021"
-authors = ["postrv"]
+authors = ["heiheshang"]
 description = "A blazingly fast MCP server for code intelligence - enumerates repos, data structures, algorithms, and returns relevant code context"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/postrv/narsil-mcp"
+repository = "https://github.com/heiheshang/narsil-mcp"
 readme = "README.md"
 keywords = ["mcp", "code-intelligence", "tree-sitter", "lsp", "ai"]
 categories = ["development-tools", "command-line-utilities", "parsing"]

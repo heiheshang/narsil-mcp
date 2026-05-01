@@ -238,6 +238,21 @@ fn test_tools_list() -> Result<()> {
     assert!(tool_names.contains(&"get_dependencies"));
     assert!(tool_names.contains(&"reindex"));
 
+    let list_repos = tools
+        .iter()
+        .find(|tool| tool["name"] == "list_repos")
+        .expect("list_repos should be present");
+    assert_eq!(list_repos["annotations"]["readOnlyHint"], true);
+    assert_eq!(list_repos["annotations"]["destructiveHint"], false);
+    assert_eq!(list_repos["annotations"]["idempotentHint"], true);
+
+    let reindex = tools
+        .iter()
+        .find(|tool| tool["name"] == "reindex")
+        .expect("reindex should be present");
+    assert_eq!(reindex["annotations"]["readOnlyHint"], false);
+    assert_eq!(reindex["annotations"]["idempotentHint"], false);
+
     Ok(())
 }
 

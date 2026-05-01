@@ -185,14 +185,14 @@ jobs:
 
             if [[ "$artifact_name" == *"windows"* ]]; then
               # Windows: Create .zip
-              (cd "$dir" && zip "${RELEASE_DIR}/narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip" narsil-mcp.exe)
+              (cd "$dir" && zip "${RELEASE_DIR}/narsil-mcp-v${VERSION}-${artifact_name}.zip" narsil-mcp.exe)
               # Generate SHA256
-              (cd release-assets && shasum -a 256 "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip" > "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip.sha256")
+              (cd release-assets && shasum -a 256 "narsil-mcp-v${VERSION}-${artifact_name}.zip" > "narsil-mcp-v${VERSION}-${artifact_name}.zip.sha256")
             else
               # Unix: Create .tar.gz
-              (cd "$dir" && tar -czf "${RELEASE_DIR}/narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz" narsil-mcp)
+              (cd "$dir" && tar -czf "${RELEASE_DIR}/narsil-mcp-v${VERSION}-${artifact_name}.tar.gz" narsil-mcp)
               # Generate SHA256
-              (cd release-assets && shasum -a 256 "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz" > "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz.sha256")
+              (cd release-assets && shasum -a 256 "narsil-mcp-v${VERSION}-${artifact_name}.tar.gz" > "narsil-mcp-v${VERSION}-${artifact_name}.tar.gz.sha256")
             fi
           done
 

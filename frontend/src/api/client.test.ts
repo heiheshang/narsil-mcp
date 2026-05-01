@@ -26,6 +26,13 @@ describe('CodeIntelClient.listTools', () => {
             tags: ['repository', 'list'],
             aliases: ['repos'],
             input_schema: { type: 'object', properties: {}, required: [] },
+            annotations: {
+              title: 'list repos',
+              readOnlyHint: true,
+              destructiveHint: false,
+              idempotentHint: true,
+              openWorldHint: false,
+            },
           },
         ],
       }),
@@ -39,6 +46,10 @@ describe('CodeIntelClient.listTools', () => {
       name: 'list_repos',
       category: 'Repository',
       tags: ['repository', 'list'],
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+      },
     });
   });
 
