@@ -20,6 +20,7 @@ pub mod repo;
 pub mod search;
 pub mod security_config;
 pub mod security_rules;
+pub mod store;
 pub mod supply_chain;
 pub mod symbols;
 pub mod taint;
