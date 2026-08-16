@@ -49,6 +49,8 @@ pub struct NeuralConfig {
     pub max_seq_length: usize,
     /// Batch size for bulk embedding
     pub batch_size: usize,
+    /// Directory for the persistent embedding cache (None disables caching)
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for NeuralConfig {
@@ -63,6 +65,7 @@ impl Default for NeuralConfig {
             dimension: default_dimension_for_model(Some("voyage-code-2")),
             max_seq_length: 512,
             batch_size: 32,
+            cache_dir: None,
         }
     }
 }
@@ -762,6 +765,27 @@ pub struct NeuralEngine {
     config: NeuralConfig,
 }
 
+/// Wrap a backend in the on-disk embedding cache when one is configured.
+///
+/// Failing to open the cache is not fatal: indexing then simply pays the full
+/// price again instead of refusing to start.
+fn with_embedding_cache(
+    backend: Arc<dyn EmbeddingBackend>,
+    config: &NeuralConfig,
+) -> Arc<dyn EmbeddingBackend> {
+    let Some(ref dir) = config.cache_dir else {
+        return backend;
+    };
+    let model = config.model_name.as_deref().unwrap_or("default");
+    match crate::neural_cache::EmbeddingCache::open(dir, model, config.dimension) {
+        Ok(cache) => Arc::new(crate::neural_cache::CachedBackend::new(backend, cache)),
+        Err(e) => {
+            tracing::warn!("Embedding cache disabled: {}", e);
+            backend
+        }
+    }
+}
+
 impl NeuralEngine {
     /// Create a new neural engine with API backend
     ///
@@ -863,6 +887,7 @@ impl NeuralEngine {
             };
         }
 
+        let backend = with_embedding_cache(backend, &config);
         let store = SimpleVectorStore::new(config.dimension);
 
         Ok(Self {
@@ -889,6 +914,7 @@ impl NeuralEngine {
             Path::new(model_path),
             Path::new(tokenizer_path),
         )?);
+        let backend = with_embedding_cache(backend, &config);
 
         let store = SimpleVectorStore::new(config.dimension);
 

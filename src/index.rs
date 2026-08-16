@@ -240,7 +240,13 @@ impl CodeIntelEngine {
         };
         // Initialize neural engine if enabled
         let neural_engine = if options.neural_config.enabled {
-            match NeuralEngine::new(options.neural_config.clone()) {
+            // Vectors are cached next to the index so a restart does not
+            // re-embed the whole repository.
+            let mut neural_config = options.neural_config.clone();
+            if neural_config.cache_dir.is_none() {
+                neural_config.cache_dir = Some(expanded_index.clone());
+            }
+            match NeuralEngine::new(neural_config) {
                 Ok(engine) => {
                     info!(
                         "Neural embedding engine initialized (backend={}, model={:?})",
@@ -472,9 +478,22 @@ impl CodeIntelEngine {
 
             // Check if already loaded from persistence
             if self.repos.contains_key(&repo_name) {
-                info!("Repository {} already loaded from cache", repo_name);
-                self.indexed_repos_count.fetch_add(1, Ordering::Release);
-                continue;
+                // Neural vectors live outside the persisted index, and they are
+                // only built while walking a repository. Skipping that walk left
+                // `neural_search` silently empty whenever --persist had a warm
+                // cache, so re-walk when neural is on. The embeddings themselves
+                // come from the on-disk cache, so this costs a parse, not an API
+                // round trip per symbol.
+                if self.neural_engine.is_some() {
+                    info!(
+                        "Repository {} loaded from cache; re-walking to build neural vectors",
+                        repo_name
+                    );
+                } else {
+                    info!("Repository {} already loaded from cache", repo_name);
+                    self.indexed_repos_count.fetch_add(1, Ordering::Release);
+                    continue;
+                }
             }
 
             if repo_path.exists() {
