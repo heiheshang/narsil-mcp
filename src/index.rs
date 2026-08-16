@@ -636,100 +636,159 @@ impl CodeIntelEngine {
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        // Parse files in parallel
+        // Process in chunks so the whole corpus's content + tree-sitter trees
+        // are never resident at once. The pre-streaming `collect()` held every
+        // file's parse tree simultaneously — the 20 GB OOM on the 1С config.
+        // Each chunk's trees are dropped before the next chunk is parsed.
+        const CHUNK_SIZE: usize = 200;
         let metrics = Arc::clone(&self.metrics);
-        let indexed_files: Vec<_> = files
-            .par_iter()
-            .filter_map(|file_path| {
-                let parse_start = std::time::Instant::now();
-                let content = read_indexable_text_file(file_path)?;
-                let parsed = self.parser.parse_file(file_path, &content).ok();
-                metrics.record_file_parse(parse_start.elapsed());
-                Some((file_path.clone(), content, parsed))
-            })
-            .collect();
 
-        // Collect parsed trees for call graph construction
-        let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+        // Parse + extract in chunks; the call graph is fed incrementally
+        // (function defs in pass 1, call sites in pass 2). The DashMap ref is
+        // scoped to this block so the non-Send guard never crosses the neural
+        // `.await` below.
+        {
+            let call_graph = if self.options.call_graph_enabled {
+                self.call_graphs.get(&repo_name)
+            } else {
+                None
+            };
 
-        for (file_path, content, parsed) in indexed_files {
-            file_count += 1;
-            let lines = content.lines().count();
-            total_lines += lines;
+            for chunk in files.chunks(CHUNK_SIZE) {
+                let parsed_chunk: Vec<_> = chunk
+                    .par_iter()
+                    .filter_map(|file_path| {
+                        let parse_start = std::time::Instant::now();
+                        let content = read_indexable_text_file(file_path)?;
+                        let parsed = self.parser.parse_file(file_path, &content).ok();
+                        metrics.record_file_parse(parse_start.elapsed());
+                        Some((file_path.clone(), content, parsed))
+                    })
+                    .collect();
 
-            // Track parseable languages separately from text-only files.
-            let language_key = parsed
-                .as_ref()
-                .map(|parsed| parsed.language.clone())
-                .unwrap_or_else(|| {
-                    file_path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(ext_to_language)
-                        .filter(|lang| !lang.is_empty())
-                        .unwrap_or_else(|| "text".to_string())
-                });
-            let lang_stats = languages.entry(language_key).or_default();
-            lang_stats.file_count += 1;
-            lang_stats.line_count += lines;
-            lang_stats.byte_count += content.len();
+                let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-            // Collect symbols with file path and index for embeddings
-            let relative_path = file_path
-                .strip_prefix(path)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
+                for (file_path, content, parsed) in parsed_chunk {
+                    file_count += 1;
+                    let lines = content.lines().count();
+                    total_lines += lines;
 
-            if let Some(parsed) = parsed {
-                let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
+                    // Track parseable languages separately from text-only files.
+                    let language_key = parsed
+                        .as_ref()
+                        .map(|parsed| parsed.language.clone())
+                        .unwrap_or_else(|| {
+                            file_path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .map(ext_to_language)
+                                .filter(|lang| !lang.is_empty())
+                                .unwrap_or_else(|| "text".to_string())
+                        });
+                    let lang_stats = languages.entry(language_key).or_default();
+                    lang_stats.file_count += 1;
+                    lang_stats.line_count += lines;
+                    lang_stats.byte_count += content.len();
 
-                for mut symbol in symbols {
-                    symbol.file_path = relative_path.clone();
+                    // Collect symbols with file path and index for embeddings
+                    let relative_path = file_path
+                        .strip_prefix(path)
+                        .unwrap_or(&file_path)
+                        .to_string_lossy()
+                        .to_string();
 
-                    // Index symbol into embedding engine for similarity search
-                    if let Some(ref sig) = symbol.signature {
-                        let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                        self.embedding_engine.index_snippet(
-                            symbol_id.clone(),
-                            relative_path.clone(),
-                            sig.clone(),
-                            symbol.start_line,
-                            symbol.end_line,
-                        );
+                    if let Some(parsed) = parsed {
+                        let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
 
-                        // Collect for neural batch indexing if enabled
-                        if self.neural_engine.is_some() {
-                            neural_docs.push(crate::neural::NeuralDocument {
-                                id: symbol_id,
-                                file_path: relative_path.clone(),
-                                content: sig.clone(),
-                                start_line: symbol.start_line,
-                                end_line: symbol.end_line,
-                                symbol_name: Some(symbol.name.clone()),
-                            });
+                        for mut symbol in symbols {
+                            symbol.file_path = relative_path.clone();
+
+                            // Index symbol into embedding engine for similarity search
+                            if let Some(ref sig) = symbol.signature {
+                                let symbol_id = format!("{}::{}", relative_path, symbol.name);
+                                self.embedding_engine.index_snippet(
+                                    symbol_id.clone(),
+                                    relative_path.clone(),
+                                    sig.clone(),
+                                    symbol.start_line,
+                                    symbol.end_line,
+                                );
+
+                                // Collect for neural batch indexing if enabled
+                                if self.neural_engine.is_some() {
+                                    neural_docs.push(crate::neural::NeuralDocument {
+                                        id: symbol_id,
+                                        file_path: relative_path.clone(),
+                                        content: sig.clone(),
+                                        start_line: symbol.start_line,
+                                        end_line: symbol.end_line,
+                                        symbol_name: Some(symbol.name.clone()),
+                                    });
+                                }
+                            }
+
+                            symbols_vec.push(symbol);
+                        }
+
+                        // Collect tree for call graph if enabled and tree exists
+                        if self.options.call_graph_enabled {
+                            if let Some(tree) = tree {
+                                chunk_trees.push((relative_path.clone(), content.clone(), tree));
+                            }
                         }
                     }
 
-                    symbols_vec.push(symbol);
+                    // Cache and index all textual files, even without parser support.
+                    self.file_cache
+                        .insert(file_path.clone(), Arc::new(content.clone()));
+                    self.search_index.index_file(&relative_path, &content);
+
+                    for document in collect_onec_normalized_documents(path, file_path.as_path()) {
+                        self.index_normalized_document(&document);
+                        normalized_docs_vec.push(document);
+                    }
                 }
 
-                // Collect tree for call graph if enabled and tree exists
-                if self.options.call_graph_enabled {
-                    if let Some(tree) = tree {
-                        trees_for_callgraph.push((relative_path.clone(), content.clone(), tree));
-                    }
+                // Call-graph pass 1: function definitions for this chunk.
+                if let Some(cg) = call_graph.as_ref() {
+                    cg.collect_functions(&chunk_trees)?;
                 }
             }
 
-            // Cache and index all textual files, even without parser support.
-            self.file_cache
-                .insert(file_path.clone(), Arc::new(content.clone()));
-            self.search_index.index_file(&relative_path, &content);
+            // Call-graph pass 2: call sites, resolved against every function
+            // gathered in pass 1. Re-parse per chunk and drop trees as we go
+            // (call graph is opt-in, so the double parse only happens for it).
+            if let Some(cg) = call_graph.as_ref() {
+                for chunk in files.chunks(CHUNK_SIZE) {
+                    let parsed_chunk: Vec<_> = chunk
+                        .par_iter()
+                        .filter_map(|file_path| {
+                            let content = read_indexable_text_file(file_path)?;
+                            let parsed = self.parser.parse_file(file_path, &content).ok();
+                            Some((file_path.clone(), content, parsed))
+                        })
+                        .collect();
 
-            for document in collect_onec_normalized_documents(path, file_path.as_path()) {
-                self.index_normalized_document(&document);
-                normalized_docs_vec.push(document);
+                    let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+                    for (file_path, content, parsed) in parsed_chunk {
+                        if let Some(parsed) = parsed {
+                            let relative_path = file_path
+                                .strip_prefix(path)
+                                .unwrap_or(&file_path)
+                                .to_string_lossy()
+                                .to_string();
+                            if let Some(tree) = parsed.tree {
+                                chunk_trees.push((relative_path, content, tree));
+                            }
+                        }
+                    }
+
+                    cg.collect_calls(&chunk_trees)?;
+                }
+                info!(
+                    "Built call graph for {} with {} files",
+                    repo_name, file_count
+                );
             }
         }
 
@@ -765,8 +824,8 @@ impl CodeIntelEngine {
                 let neural = Arc::clone(neural);
                 match tokio::task::spawn_blocking(move || neural.index_batch(&items)).await {
                     Ok(Ok(())) => info!("Neural embeddings indexed successfully"),
-                    Ok(Err(e)) => warn!("Failed to batch index neural embeddings: {}", e),
-                    Err(e) => warn!("Neural embedding task panicked: {}", e),
+                    Ok(Err(e)) => warn!("Failed to batch index neural embeddings: {e}"),
+                    Err(e) => warn!("Neural embedding task panicked: {e}"),
                 }
             }
         }
@@ -780,21 +839,6 @@ impl CodeIntelEngine {
         self.symbols.insert(repo_name.clone(), symbols_vec);
         self.normalized_docs
             .insert(repo_name.clone(), normalized_docs_vec);
-
-        // Build call graph if enabled
-        if self.options.call_graph_enabled && !trees_for_callgraph.is_empty() {
-            if let Some(call_graph) = self.call_graphs.get(&repo_name) {
-                if let Err(e) = call_graph.build_from_files(&trees_for_callgraph) {
-                    warn!("Failed to build call graph for {}: {}", repo_name, e);
-                } else {
-                    info!(
-                        "Built call graph for {} with {} files",
-                        repo_name,
-                        trees_for_callgraph.len()
-                    );
-                }
-            }
-        }
 
         // Transform symbols to RDF knowledge graph if enabled
         #[cfg(feature = "graph")]
