@@ -287,6 +287,7 @@ impl HybridSearchEngine {
             _ => DocType::Other,
         };
 
+        let term_freq = crate::search::count_terms(&crate::search::tokenize_code(&chunk.content));
         let search_doc = SearchDocument {
             id: chunk.id.clone(),
             file_path: chunk.file_path.clone(),
@@ -294,13 +295,7 @@ impl HybridSearchEngine {
             doc_type,
             start_line: chunk.start_line,
             end_line: chunk.end_line,
-            tokens: crate::search::tokenize_code(&chunk.content),
-            term_freq: crate::search::tokenize_code(&chunk.content)
-                .into_iter()
-                .fold(std::collections::HashMap::new(), |mut acc, t| {
-                    *acc.entry(t).or_default() += 1;
-                    acc
-                }),
+            term_freq,
         };
 
         self.bm25_index.inner.write().add_document(search_doc);

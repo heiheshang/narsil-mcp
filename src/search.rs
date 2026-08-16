@@ -4,7 +4,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Validate regex pattern to prevent ReDoS attacks
 fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
@@ -33,9 +33,9 @@ pub struct SearchDocument {
     pub doc_type: DocType,
     pub start_line: usize,
     pub end_line: usize,
-    /// Pre-computed tokens
-    pub tokens: Vec<String>,
-    /// Token frequencies
+    /// Token frequencies (unique term -> count). The document length (total
+    /// term count) is `term_freq.values().sum()`, so the per-occurrence token
+    /// list is not stored — it was the dominant memory hog on large corpora.
     pub term_freq: HashMap<String, usize>,
 }
 
@@ -83,6 +83,8 @@ pub struct SearchIndex {
     doc_freq: HashMap<String, usize>,
     /// Average document length
     avg_doc_len: f64,
+    /// Running total of all document lengths (term counts), for O(1) avg update
+    total_doc_terms: usize,
     /// BM25 parameters
     params: BM25Params,
     /// Code-specific synonyms
@@ -102,6 +104,7 @@ impl SearchIndex {
             inverted_index: HashMap::new(),
             doc_freq: HashMap::new(),
             avg_doc_len: 0.0,
+            total_doc_terms: 0,
             params: BM25Params::default(),
             synonyms: Self::build_code_synonyms(),
         }
@@ -163,25 +166,23 @@ impl SearchIndex {
     pub fn add_document(&mut self, doc: SearchDocument) {
         let doc_idx = self.documents.len();
 
-        // Update inverted index
-        for token in &doc.tokens {
+        // Update inverted index + doc frequency from unique terms only. The
+        // old code iterated the per-occurrence token list, pushing `doc_idx`
+        // once per occurrence — bloating postings lists with duplicates.
+        for token in doc.term_freq.keys() {
             self.inverted_index
                 .entry(token.clone())
                 .or_default()
                 .push(doc_idx);
-        }
-
-        // Update document frequencies
-        let unique_tokens: HashSet<_> = doc.tokens.iter().collect();
-        for token in unique_tokens {
             *self.doc_freq.entry(token.clone()).or_default() += 1;
         }
 
+        let doc_len: usize = doc.term_freq.values().sum();
+        self.total_doc_terms += doc_len;
+
         self.documents.push(doc);
 
-        // Recalculate average document length
-        let total_len: usize = self.documents.iter().map(|d| d.tokens.len()).sum();
-        self.avg_doc_len = total_len as f64 / self.documents.len() as f64;
+        self.avg_doc_len = self.total_doc_terms as f64 / self.documents.len() as f64;
     }
 
     /// Index content from a file
@@ -196,7 +197,6 @@ impl SearchIndex {
             doc_type: DocType::File,
             start_line: 1,
             end_line: content.lines().count(),
-            tokens,
             term_freq,
         });
     }
@@ -221,7 +221,6 @@ impl SearchIndex {
             doc_type,
             start_line,
             end_line,
-            tokens,
             term_freq,
         });
     }
@@ -248,7 +247,7 @@ impl SearchIndex {
                 for &doc_idx in doc_indices {
                     let doc = &self.documents[doc_idx];
                     let tf = doc.term_freq.get(token).copied().unwrap_or(0) as f64;
-                    let doc_len = doc.tokens.len() as f64;
+                    let doc_len = doc.term_freq.values().sum::<usize>() as f64;
 
                     let bm25_score = self.bm25_score(tf, doc_len, idf);
 
@@ -385,6 +384,7 @@ impl SearchIndex {
         self.inverted_index.clear();
         self.doc_freq.clear();
         self.avg_doc_len = 0.0;
+        self.total_doc_terms = 0;
     }
 }
 
@@ -504,7 +504,7 @@ fn is_script_boundary(prev: char, current: char) -> bool {
 }
 
 /// Count term frequencies
-fn count_terms(tokens: &[String]) -> HashMap<String, usize> {
+pub fn count_terms(tokens: &[String]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for token in tokens {
         *counts.entry(token.clone()).or_default() += 1;

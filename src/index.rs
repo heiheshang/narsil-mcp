@@ -889,14 +889,7 @@ impl CodeIntelEngine {
         let content = render_normalized_search_content(document);
         let start_line = 1;
         let end_line = content.lines().count();
-        let tokens = crate::search::tokenize_code(&content);
-        let term_freq = tokens
-            .iter()
-            .cloned()
-            .fold(HashMap::new(), |mut acc, token| {
-                *acc.entry(token).or_default() += 1;
-                acc
-            });
+        let term_freq = crate::search::count_terms(&crate::search::tokenize_code(&content));
 
         self.search_index.add_document(SearchDocument {
             id: document.id.clone(),
@@ -905,7 +898,6 @@ impl CodeIntelEngine {
             doc_type: DocType::Other,
             start_line,
             end_line,
-            tokens,
             term_freq,
         });
 
@@ -3960,14 +3952,8 @@ impl CodeIntelEngine {
                     }
 
                     let content = render_normalized_search_content(document);
-                    let tokens = crate::search::tokenize_code(&content);
-                    let term_freq = tokens.iter().cloned().fold(
-                        std::collections::HashMap::new(),
-                        |mut acc, token| {
-                            *acc.entry(token).or_default() += 1;
-                            acc
-                        },
-                    );
+                    let term_freq =
+                        crate::search::count_terms(&crate::search::tokenize_code(&content));
 
                     bm25_index.add_document(SearchDocument {
                         id: document.id.clone(),
@@ -3976,7 +3962,6 @@ impl CodeIntelEngine {
                         doc_type: DocType::Other,
                         start_line: 1,
                         end_line: content.lines().count(),
-                        tokens,
                         term_freq,
                     });
 

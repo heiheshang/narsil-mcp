@@ -6,6 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/postrv/narsil-mcp)
 [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg)](https://modelcontextprotocol.io)
+[![1C (BSL)](https://img.shields.io/badge/1C-BSL-yellow.svg)](https://1c.ru)
 
 A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 90 specialized tools.
 
@@ -79,6 +80,7 @@ A Rust-powered MCP (Model Context Protocol) server providing AI assistants with 
 | **PowerShell** | `.ps1`, `.psm1`, `.psd1` | functions, classes, enums |
 | **Nix** | `.nix` | bindings |
 | **Groovy** | `.groovy`, `.gradle` | methods, classes, interfaces, enums, functions |
+| **1C (BSL)** | `.bsl` | procedures, functions |
 
 ## Installation
 
