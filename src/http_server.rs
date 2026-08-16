@@ -10,18 +10,21 @@
 use anyhow::Result;
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+use uuid::Uuid;
 
 use crate::index::CodeIntelEngine;
+use crate::mcp::McpServer;
 use crate::tool_metadata::TOOL_METADATA;
 use crate::tool_handlers::ToolRegistry;
 
@@ -52,6 +55,7 @@ struct FrontendAssets;
 /// HTTP Server for the visualization frontend
 pub struct HttpServer {
     engine: Arc<CodeIntelEngine>,
+    mcp: Arc<McpServer>,
     tool_registry: ToolRegistry,
     port: u16,
 }
@@ -61,6 +65,9 @@ pub struct HttpServer {
 pub struct AppState {
     engine: Arc<CodeIntelEngine>,
     tool_registry: Arc<ToolRegistry>,
+    mcp: Arc<McpServer>,
+    /// Active MCP streamable-http sessions.
+    sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Request body for tool calls
@@ -109,9 +116,10 @@ pub struct ToolInfo {
 
 impl HttpServer {
     /// Create a new HTTP server
-    pub fn new(engine: Arc<CodeIntelEngine>, port: u16) -> Self {
+    pub fn new(engine: Arc<CodeIntelEngine>, mcp: Arc<McpServer>, port: u16) -> Self {
         Self {
             engine,
+            mcp,
             tool_registry: ToolRegistry::new(),
             port,
         }
@@ -122,6 +130,8 @@ impl HttpServer {
         let state = AppState {
             engine: self.engine,
             tool_registry: Arc::new(self.tool_registry),
+            mcp: self.mcp,
+            sessions: Arc::new(Mutex::new(HashSet::new())),
         };
 
         // Configure CORS to allow frontend access (needed for development mode)
@@ -135,7 +145,8 @@ impl HttpServer {
             .route("/health", get(health_check))
             .route("/tools", get(list_tools))
             .route("/tools/call", post(call_tool))
-            .route("/graph", get(get_graph));
+            .route("/graph", get(get_graph))
+            .route("/mcp", post(mcp_post).delete(mcp_delete));
 
         // Add embedded frontend routes when feature is enabled
         #[cfg(feature = "frontend")]
@@ -414,6 +425,113 @@ async fn get_graph(
             })),
         ),
     }
+}
+
+/// MCP streamable-http endpoint (`POST /mcp`).
+///
+/// JSON-RPC messages arrive as HTTP request bodies; session state is carried
+/// by the `Mcp-Session-Id` header. An `initialize` without a session mints a
+/// new session and returns its id; every other request must present a known
+/// session id (or the request must itself be the initial `initialize`).
+async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // A session id to return to the client (only set when minting one).
+    let mut session_to_issue: Option<String> = None;
+
+    match (&session_id, is_initialize(&body)) {
+        // First contact: initialize starts a fresh session.
+        (None, true) => {
+            let sid = Uuid::new_v4().to_string();
+            state.sessions.lock().unwrap().insert(sid.clone());
+            info!("MCP streamable-http session started: {}", sid);
+            session_to_issue = Some(sid);
+        }
+        // A non-initialize request without a session is a protocol error.
+        (None, false) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32000,
+                        "message": "Missing Mcp-Session-Id header: call initialize first"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        // Validate an existing session id.
+        (Some(sid), _) => {
+            if !state.sessions.lock().unwrap().contains(sid) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": -32001,
+                            "message": "Unknown Mcp-Session-Id"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let response_body = match state.mcp.handle_message(&body).await {
+        Some(json_str) => json_str,
+        // Notification (no id): acknowledged with 202 and no body.
+        None => {
+            let mut resp = StatusCode::ACCEPTED.into_response();
+            if let Some(sid) = session_to_issue {
+                resp.headers_mut().insert(
+                    "mcp-session-id",
+                    HeaderValue::from_str(&sid).expect("uuid is a valid header value"),
+                );
+            }
+            return resp;
+        }
+    };
+
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        response_body,
+    )
+        .into_response();
+    if let Some(sid) = session_to_issue {
+        resp.headers_mut().insert(
+            "mcp-session-id",
+            HeaderValue::from_str(&sid).expect("uuid is a valid header value"),
+        );
+    }
+    resp
+}
+
+/// MCP streamable-http session termination (`DELETE /mcp`).
+async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+    if let Some(sid) = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        if state.sessions.lock().unwrap().remove(sid) {
+            info!("MCP streamable-http session terminated: {}", sid);
+        }
+    }
+    StatusCode::OK
+}
+
+/// Whether a JSON-RPC body is an `initialize` request.
+fn is_initialize(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .map(|v| v.get("method").and_then(|m| m.as_str()) == Some("initialize"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
