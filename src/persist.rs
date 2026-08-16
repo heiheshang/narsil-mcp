@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 #[cfg(feature = "native")]
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,7 +38,7 @@ pub struct PersistedIndex {
 }
 
 impl PersistedIndex {
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -58,7 +58,7 @@ impl PersistedIndex {
     /// Load index from disk
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path).context("Failed to read index file")?;
-        let index: Self = bincode::deserialize(&data).context("Failed to deserialize index")?;
+        let index: Self = postcard::from_bytes(&data).context("Failed to deserialize index")?;
 
         if index.version != Self::CURRENT_VERSION {
             return Err(anyhow::anyhow!(
@@ -73,7 +73,7 @@ impl PersistedIndex {
 
     /// Save index to disk
     pub fn save(&self, path: &Path) -> Result<()> {
-        let data = bincode::serialize(self).context("Failed to serialize index")?;
+        let data = postcard::to_stdvec(self).context("Failed to serialize index")?;
 
         // Write to temp file then rename for atomicity
         let temp_path = path.with_extension("tmp");
@@ -232,7 +232,7 @@ impl IndexStore {
 /// File watcher for incremental updates (legacy, sync-based polling)
 #[cfg(feature = "native")]
 pub struct FileWatcher {
-    watcher: RecommendedWatcher,
+    watcher: PollWatcher,
     rx: std::sync::mpsc::Receiver<Result<Event, notify::Error>>,
     watched_paths: Vec<PathBuf>,
 }
@@ -242,9 +242,12 @@ impl FileWatcher {
     pub fn new() -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let watcher = notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
-        })?;
+        let watcher = PollWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            Config::default().with_poll_interval(Duration::from_millis(500)),
+        )?;
 
         Ok(Self {
             watcher,
@@ -282,13 +285,7 @@ impl FileWatcher {
                         _ => continue,
                     };
 
-                    // Filter to source files
-                    if is_source_file(&path) {
-                        changes.push(FileChange {
-                            path: path.to_path_buf(),
-                            change_type,
-                        });
-                    }
+                    changes.extend(source_changes_for_path(&path, change_type));
                 }
             }
         }
@@ -313,12 +310,7 @@ impl FileWatcher {
                     _ => continue,
                 };
 
-                if is_source_file(&path) {
-                    changes.push(FileChange {
-                        path: path.to_path_buf(),
-                        change_type,
-                    });
-                }
+                changes.extend(source_changes_for_path(&path, change_type));
             }
         }
 
@@ -332,7 +324,7 @@ impl FileWatcher {
 /// Async file watcher for event-driven incremental updates
 #[cfg(feature = "native")]
 pub struct AsyncFileWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: PollWatcher,
     watched_paths: Vec<PathBuf>,
 }
 
@@ -345,9 +337,12 @@ impl AsyncFileWatcher {
         // Create a channel for the notify watcher
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
 
-        let watcher = notify::recommended_watcher(move |res| {
-            let _ = notify_tx.send(res);
-        })?;
+        let watcher = PollWatcher::new(
+            move |res| {
+                let _ = notify_tx.send(res);
+            },
+            Config::default().with_poll_interval(Duration::from_millis(500)),
+        )?;
 
         // Spawn a task to process notify events and send batched changes
         tokio::spawn(async move {
@@ -369,11 +364,9 @@ impl AsyncFileWatcher {
                                     _ => continue,
                                 };
 
-                                // Filter to source files
-                                if is_source_file(&path) {
+                                for change in source_changes_for_path(&path, change_type.clone()) {
                                     // Add to debounce buffer (overwrites previous events for same file)
-                                    let path_buf = path.to_path_buf();
-                                    debounce_buffer.insert(path_buf.clone(), FileChange { path: path_buf, change_type });
+                                    debounce_buffer.insert(change.path.clone(), change);
                                 }
                             }
                         }
@@ -447,6 +440,47 @@ fn is_source_file(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| extensions.contains(&e))
         .unwrap_or(false)
+}
+
+/// Convert a notify path into source-file changes.
+///
+/// Some platforms, especially macOS FSEvents and network/container mounts,
+/// can report a directory as modified instead of the exact file. When that
+/// happens, scan the reported directory for source files so watch mode does
+/// not silently miss the change.
+fn source_changes_for_path(path: &Path, change_type: ChangeType) -> Vec<FileChange> {
+    if is_source_file(path) {
+        return vec![FileChange {
+            path: path.to_path_buf(),
+            change_type,
+        }];
+    }
+
+    if change_type == ChangeType::Deleted || !path.is_dir() {
+        return Vec::new();
+    }
+
+    let mut changes = Vec::new();
+    collect_source_files(path, change_type, &mut changes);
+    changes
+}
+
+fn collect_source_files(path: &Path, change_type: ChangeType, changes: &mut Vec<FileChange>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if is_source_file(&entry_path) {
+            changes.push(FileChange {
+                path: entry_path,
+                change_type: change_type.clone(),
+            });
+        } else if entry_path.is_dir() {
+            collect_source_files(&entry_path, change_type.clone(), changes);
+        }
+    }
 }
 
 /// Incremental indexer that combines persistence and watching
@@ -548,6 +582,81 @@ impl IncrementalIndexer {
 
         Ok(needs_reindex)
     }
+}
+
+/// Run the file watcher in background using an async event-driven loop.
+///
+/// The function exits cleanly when:
+/// * The shutdown channel's only `Sender` is dropped (`recv()` returns
+///   `Err(Closed)`), or
+/// * A `()` value is sent on the shutdown channel.
+///
+/// **Bug history (issue #26):** the spawn site in `main.rs` used to drop the
+/// shutdown sender immediately after creating it, so the receiver here saw
+/// `Closed` on the first poll and the watcher exited milliseconds after
+/// startup — silently disabling `--watch`. Use `spawn_watch_mode` (below)
+/// from new call sites; it returns the sender so the caller cannot forget to
+/// keep it alive.
+pub async fn run_watch_mode(
+    engine: Arc<crate::index::CodeIntelEngine>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    info!("Starting async watch mode background task");
+
+    let (_watcher, mut rx) = match engine.create_async_file_watcher() {
+        Some((w, r)) => (w, r),
+        None => {
+            warn!("Failed to create async file watcher, watch mode disabled");
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            // Receive batched file change events
+            Some(changes) = rx.recv() => {
+                if !changes.is_empty() {
+                    info!("Detected {} file change(s)", changes.len());
+                    match engine.process_file_changes(&changes).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                info!("Re-indexed {} file(s)", count);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error processing file changes: {}", e);
+                        }
+                    }
+                }
+            }
+            // Handle shutdown signal (or all senders dropped)
+            _ = shutdown.recv() => {
+                info!("Watch mode shutting down");
+                break;
+            }
+        }
+    }
+}
+
+/// Spawn the watch-mode background task and return the shutdown `Sender`.
+///
+/// **Callers must hold the returned `Sender` for as long as the watcher
+/// should keep running.** Dropping it makes the watcher loop exit on its
+/// next poll (this is the cause of issue #26 — the original wiring dropped
+/// the sender immediately).
+///
+/// The spawned task is detached; the returned `Sender` is the only handle
+/// needed to keep the watcher alive.
+#[must_use = "the returned Sender must be held until the watcher should stop; \
+              dropping it immediately exits the watcher (issue #26)"]
+pub fn spawn_watch_mode(
+    engine: Arc<crate::index::CodeIntelEngine>,
+) -> tokio::sync::broadcast::Sender<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    tokio::spawn(async move {
+        run_watch_mode(engine, shutdown_rx).await;
+    });
+    shutdown_tx
 }
 
 #[cfg(test)]

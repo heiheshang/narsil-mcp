@@ -16,7 +16,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -25,9 +25,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: narsil-mcp-linux-x86_64
             binary: narsil-mcp
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact: narsil-mcp-linux-x86_64-musl
+          # Native ARM64 Linux build via GitHub-hosted Graviton runners.
+          # No cross-compile toolchain required — addresses issue #20
+          # for Raspberry Pi, AWS Graviton, and Apple-silicon-via-Docker
+          # users who previously had no prebuilt binary.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: narsil-mcp-linux-aarch64
             binary: narsil-mcp
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -37,22 +41,21 @@ jobs:
             target: aarch64-apple-darwin
             artifact: narsil-mcp-macos-aarch64
             binary: narsil-mcp
-          - os: windows-latest
+          # Pin Windows release builds to the stable VS2022 image. The
+          # moving windows-latest image has broken rust-cache during hosted
+          # image transitions, which can fail the binary job before compile.
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             artifact: narsil-mcp-windows-x86_64
             binary: narsil-mcp.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install musl-tools (Linux musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -60,6 +63,19 @@ jobs:
           prefix-key: "v1-rust-release"
           key: ${{ matrix.target }}
           cache-on-failure: true
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          $nasm = Get-ChildItem -Path "$env:ProgramFiles\NASM", "$env:ChocolateyInstall\lib\nasm" -Filter nasm.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $nasm) {
+            throw "nasm.exe was not found after Chocolatey installation"
+          }
+          $nasm.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $nasm.FullName -v
 
       - name: Build release binary
         run: |
