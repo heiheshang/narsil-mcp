@@ -316,23 +316,30 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Start HTTP server in background if enabled (for visualization frontend)
-    // The MCP server still runs on stdio for editor communication
+    // Build the shared MCP server. It always serves stdio, and (when --http is
+    // enabled) is additionally mounted as the streamable-http transport at
+    // POST /mcp on the HTTP server.
+    let mcp_server = Arc::new(mcp::McpServer::from_arc(
+        Arc::clone(&engine),
+        server_args.preset,
+    ));
+
+    // Start HTTP server in background if enabled (visualization frontend + MCP over HTTP)
     if server_args.http {
         info!("Starting HTTP server on port {}", server_args.http_port);
         let http_engine = Arc::clone(&engine);
+        let http_mcp = Arc::clone(&mcp_server);
         let http_port = server_args.http_port;
         tokio::spawn(async move {
-            let http_server = http_server::HttpServer::new(http_engine, http_port);
+            let http_server = http_server::HttpServer::new(http_engine, http_mcp, http_port);
             if let Err(e) = http_server.run().await {
                 warn!("HTTP server error: {}", e);
             }
         });
     }
 
-    // Always start the MCP server on stdio (for editor communication)
-    let server = mcp::McpServer::from_arc(engine, server_args.preset);
-    server.run().await?;
+    // Always run the MCP server on stdio (for editor communication)
+    mcp_server.run().await?;
 
     Ok(())
 }
