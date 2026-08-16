@@ -48,6 +48,7 @@ pub mod lsp;
 pub mod mcp;
 #[cfg(feature = "native")]
 pub mod neural;
+pub mod neural_cache;
 #[cfg(feature = "native")]
 pub mod persist;
 #[cfg(feature = "native")]
