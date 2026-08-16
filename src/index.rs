@@ -717,10 +717,15 @@ impl CodeIntelEngine {
                 );
                 let items: Vec<(crate::neural::NeuralDocument,)> =
                     neural_docs.into_iter().map(|d| (d,)).collect();
-                if let Err(e) = neural.index_batch(&items) {
-                    warn!("Failed to batch index neural embeddings: {}", e);
-                } else {
-                    info!("Neural embeddings indexed successfully");
+                // `index_batch` drives a blocking reqwest client. Calling it directly
+                // from this async fn runs it on a tokio worker thread, which stalls
+                // the runtime after ~128 requests: the server answers, the client
+                // never picks the response up, and every later request times out.
+                let neural = Arc::clone(neural);
+                match tokio::task::spawn_blocking(move || neural.index_batch(&items)).await {
+                    Ok(Ok(())) => info!("Neural embeddings indexed successfully"),
+                    Ok(Err(e)) => warn!("Failed to batch index neural embeddings: {}", e),
+                    Err(e) => warn!("Neural embedding task panicked: {}", e),
                 }
             }
         }
@@ -6403,7 +6408,11 @@ impl CodeIntelEngine {
             )
         })?;
 
-        let results = neural.search(query, max_results)?;
+        // Blocking client — keep it off the tokio worker (see index_repo).
+        let neural = Arc::clone(neural);
+        let query_owned = query.to_string();
+        let results =
+            tokio::task::spawn_blocking(move || neural.search(&query_owned, max_results)).await??;
 
         let mut output = String::new();
         output.push_str(&format!("# Neural Search Results for: `{}`\n\n", query));
@@ -6493,7 +6502,9 @@ impl CodeIntelEngine {
         let symbol_code = lines[start..end].join("\n");
 
         // Search for similar code
-        let results = neural.search(&symbol_code, 20)?;
+        let neural = Arc::clone(neural);
+        let code_owned = symbol_code.clone();
+        let results = tokio::task::spawn_blocking(move || neural.search(&code_owned, 20)).await??;
 
         let mut output = String::new();
         output.push_str(&format!("# Semantic Clones of `{}`\n\n", function));
