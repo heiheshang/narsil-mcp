@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-05-12
+
+### Fixed
+
+- **`tools/list` now exposes the full 90-tool catalog** (issue #23). Four
+  compounding bugs hid 87 of 90 tools from MCP clients:
+  - `NARSIL_ENABLED_CATEGORIES=""` no longer disables every category — empty
+    and whitespace-only env values are treated as unset, and empty segments
+    inside comma lists are filtered out. The same guard now applies to
+    `NARSIL_PRESET` and `NARSIL_DISABLED_TOOLS`.
+  - Tool category lookup uses `Display`, not `Debug`, so `ToolCategory::Lsp`
+    correctly matches the `LSP` YAML key. Previously LSP-category overrides
+    were silently ignored.
+  - `EngineOptions` gained `remote_enabled` so `--remote` actually surfaces
+    Remote-category tools; `convert_engine_options` now also propagates
+    `FeatureFlag::Graph` (under `--features graph`).
+  - `max_tool_count` raised from 76 to 128 (with headroom for new tools).
+    The Full preset now bypasses the cap entirely — it is an explicit
+    "expose everything" directive. Non-Full presets continue to honour the
+    budget.
+- **Watch mode actually runs** (issue #26). The spawn site dropped the
+  shutdown sender immediately, so the watcher's `select!` loop saw `Closed`
+  on its first poll and exited milliseconds after startup, silently
+  disabling `--watch`. Restructured into `persist::spawn_watch_mode` which
+  returns the sender (`#[must_use]`) so the lifetime requirement is now a
+  compile-time error class, not a comment. Watch mode now uses notify's
+  polling backend for reliable behavior across Linux desktops, containers,
+  network mounts, and macOS temp directories.
+- **`cargo build --features frontend` succeeds without `frontend/dist`**
+  (issue #18b). Added `#[allow_missing = true]` to the `rust-embed` derive
+  and a `build.rs` that emits `cargo:warning` pointing the user at
+  `cd frontend && npm ci && npm run build` if the dist directory is empty.
+- **Binary installers use the correct release asset names**. The shell
+  installer now maps platforms to `macos-x86_64`, `macos-aarch64`,
+  `linux-x86_64`, and `linux-aarch64` assets instead of Rust target triples;
+  npm now downloads the Linux ARM64 binary for `linux-arm64`.
+- **Stable release automation is gated more safely**. GitHub Release, npm,
+  Homebrew, and Scoop updates now wait for successful binary builds and
+  crates.io publish (or a skipped publish for prerelease tags), reducing the
+  chance of split-channel releases.
+- **Release binaries now match the advertised asset set**. The graph-enabled
+  release matrix publishes the five supported installer/Homebrew/Scoop
+  artifacts: macOS x86_64, macOS ARM64, Linux x86_64, Linux ARM64, and
+  Windows x86_64.
+- **Release CI timeouts now reflect graph-enabled builds**. The release
+  version check, test, and binary build jobs have enough headroom for the
+  Oxigraph/RocksDB compile path on GitHub-hosted runners.
+- **Windows repository path diagnostics use normal drive-letter paths**.
+  Canonicalized paths no longer surface the internal `\\?\` verbatim prefix
+  in startup path resolution or tests.
+
+### Added
+
+- **Every CLI flag accepts a `NARSIL_*` env var** (issue #21). Enabled
+  clap's `env` feature and annotated every flag in `ServerArgs`. Notably:
+  `NARSIL_NEURAL_MODEL`, `NARSIL_NEURAL_BACKEND`, `NARSIL_NEURAL_DIMENSION`,
+  `NARSIL_REPOS` (comma-separated), `NARSIL_GIT`, `NARSIL_REMOTE`,
+  `NARSIL_GRAPH`, `NARSIL_HTTP`, `NARSIL_PRESET`, `NARSIL_INDEX_PATH`, etc.
+- **Bare `narsil-mcp` defaults to the current working directory** (issue
+  #22 partial). No more empty-repo errors when invoked inside a project
+  with no `--repos`. Missing repository paths are filtered out at startup
+  with a WARN log naming each one, and existing paths are canonicalized for
+  better relative-path and symlink behavior.
+- **Named repository profiles** (issue #22). Add profiles to `config.yaml`
+  or `.narsil.yaml` and start them with `--profile NAME` or
+  `NARSIL_PROFILE=NAME`. Profiles can provide repos, discovery paths,
+  presets, and common feature flags such as `git`, `call_graph`, `persist`,
+  and `watch`.
+- **Native Linux ARM64 release binary** (issue #20). Built on GitHub's
+  `ubuntu-24.04-arm` Graviton runner; published as
+  `narsil-mcp-vX.Y.Z-linux-aarch64.tar.gz`. The Homebrew tap formula now
+  selects this artifact via `Hardware::CPU.arm?` so `brew install` works
+  on Raspberry Pi, AWS Graviton, Asahi Linux, and Apple-silicon-via-Docker.
+
+### Tests
+
+- Added 20+ new tests across config filter (Lsp Display lookup, Remote/Graph
+  propagation, Full-preset bypass, Remote tool visibility, env-var empty
+  handling), CLI parsing (every NARSIL_* env var, cwd fallback,
+  missing-path filter, named profiles), watch mode (end-to-end file change
+  → reindex), installer metadata, and Java parsing (parser unit +
+  Maven-layout integration test).
+- Added a process-wide `ENV_LOCK` mutex in env-var test sites and updated
+  six pre-existing `priority_tests` that were race-vulnerable.
+
 ## [1.6.1] - 2026-02-24
 
 ### Fixed

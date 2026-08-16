@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -25,6 +25,9 @@ use crate::index::CodeIntelEngine;
 use crate::tool_metadata::TOOL_METADATA;
 use crate::tool_handlers::ToolRegistry;
 
+/// Maximum HTTP request body size (2 MB).
+const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
+
 // Embedded frontend assets (only when frontend feature is enabled)
 #[cfg(feature = "frontend")]
 use axum::{
@@ -35,9 +38,15 @@ use axum::{
 #[cfg(feature = "frontend")]
 use rust_embed::Embed;
 
+// `allow_missing` lets `cargo build --features frontend` succeed even when
+// `frontend/dist/` has not been built yet (typical on a fresh clone where
+// the user has not run `cd frontend && npm ci && npm run build`). The
+// build.rs at the crate root prints a `cargo:warning` so the user knows
+// the served UI will return 404 until the dist directory is populated.
 #[cfg(feature = "frontend")]
 #[derive(Embed)]
 #[folder = "frontend/dist"]
+#[allow_missing = true]
 struct FrontendAssets;
 
 /// HTTP Server for the visualization frontend
@@ -142,7 +151,10 @@ impl HttpServer {
             info!("Run frontend separately: cd frontend && npm run dev");
         }
 
-        let app = app.layer(cors).with_state(state);
+        let app = app
+            .layer(cors)
+            .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE))
+            .with_state(state);
 
         let addr = format!("0.0.0.0:{}", self.port);
         info!("HTTP server starting on http://{}", addr);
@@ -355,18 +367,22 @@ async fn get_graph(
     State(state): State<AppState>,
     Query(query): Query<GraphQuery>,
 ) -> impl IntoResponse {
+    // Clamp bounds to prevent excessive resource usage
+    let depth = query.depth.min(20);
+    let max_nodes = query.max_nodes.map(|n| n.min(5000));
+
     let mut args = json!({
         "repo": query.repo,
         "view": query.view,
         "root": query.root,
-        "depth": query.depth,
+        "depth": depth,
         "direction": query.direction,
         "include_metrics": query.include_metrics,
         "include_security": query.include_security,
         "include_excerpts": query.include_excerpts,
         "cluster_by": query.cluster_by,
     });
-    if let Some(max_nodes) = query.max_nodes {
+    if let Some(max_nodes) = max_nodes {
         args["max_nodes"] = json!(max_nodes);
     }
 
@@ -512,5 +528,19 @@ mod tests {
         let query: GraphQuery =
             serde_json::from_str(r#"{"repo": "test", "max_nodes": 50}"#).unwrap();
         assert_eq!(query.max_nodes, Some(50));
+    }
+
+    #[test]
+    fn test_max_http_body_size_is_reasonable() {
+        assert_eq!(MAX_HTTP_BODY_SIZE, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_graph_query_bounds_clamped() {
+        // Verify excessive depth is clamped to 20
+        let query: GraphQuery =
+            serde_json::from_str(r#"{"repo": "test", "depth": 1000, "max_nodes": 99999}"#).unwrap();
+        assert_eq!(query.depth.min(20), 20);
+        assert_eq!(query.max_nodes.map(|n| n.min(5000)), Some(5000));
     }
 }

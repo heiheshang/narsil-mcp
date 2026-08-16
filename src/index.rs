@@ -2,9 +2,6 @@
 //!
 //! This is the core engine that powers all MCP tool operations.
 
-// Allow dead code for Phase 2/3 features not yet wired up
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rayon::prelude::*;
@@ -94,6 +91,11 @@ pub struct EngineOptions {
     pub persist_enabled: bool,
     /// Enable file watching for incremental updates
     pub watch_enabled: bool,
+    /// Enable remote GitHub repository support (gates Remote-category tools).
+    /// Mirrors `--remote` so `ToolFilter::convert_engine_options` can surface
+    /// `FeatureFlag::Remote` and the Remote tools become visible in
+    /// `tools/list`.
+    pub remote_enabled: bool,
     /// Streaming configuration
     pub streaming_config: StreamingConfig,
     /// LSP configuration
@@ -119,6 +121,7 @@ impl Default for EngineOptions {
             call_graph_enabled: false,
             persist_enabled: false,
             watch_enabled: false,
+            remote_enabled: false,
             streaming_config: StreamingConfig::default(),
             lsp_config: LspConfig::default(),
             neural_config: NeuralConfig::default(),
@@ -882,10 +885,25 @@ impl CodeIntelEngine {
             ));
         }
 
-        // Check if it's already a path
-        let as_path = PathBuf::from(name);
-        if as_path.exists() {
-            return Ok(as_path);
+        // If input looks like a path, validate it against indexed repos
+        if name.contains('/') || name.contains('\\') {
+            let as_path = PathBuf::from(name);
+            for entry in self.repos.iter() {
+                let repo_path = &entry.value().path;
+                // Compare non-canonical paths first (fast path)
+                if as_path == *repo_path || as_path.starts_with(repo_path) {
+                    return Ok(as_path);
+                }
+                // Compare canonical forms (handles symlinks like /var -> /private/var on macOS)
+                if let (Ok(canonical), Ok(repo_canonical)) =
+                    (as_path.canonicalize(), repo_path.canonicalize())
+                {
+                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
+                        return Ok(canonical);
+                    }
+                }
+            }
+            // Path didn't match any indexed repo — fall through to name lookup
         }
 
         // Look up by name
@@ -1016,7 +1034,7 @@ impl CodeIntelEngine {
             output.push_str("- **Languages**:\n");
 
             let mut langs: Vec<_> = repo.languages.iter().collect();
-            langs.sort_by(|a, b| b.1.line_count.cmp(&a.1.line_count));
+            langs.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.line_count));
 
             for (lang, stats) in langs {
                 output.push_str(&format!(
@@ -1915,8 +1933,14 @@ impl CodeIntelEngine {
         let mut count = 0;
 
         for change in changes {
-            // Find which repo this file belongs to
-            let repo_path = self.repo_paths.iter().find(|p| change.path.starts_with(p));
+            // Find which repo this file belongs to. Notify may emit canonical
+            // paths even when the user supplied a symlinked path (for example
+            // `/private/var/...` vs `/var/...` on macOS), so compare both raw
+            // and canonical forms.
+            let repo_path = self
+                .repo_paths
+                .iter()
+                .find(|p| path_is_within_repo(&change.path, p));
 
             let repo_path = match repo_path {
                 Some(p) => p,
@@ -4255,7 +4279,7 @@ impl CodeIntelEngine {
         output.push_str("|------|-------|------------|\n");
 
         let mut types: Vec<_> = stats.by_type.into_iter().collect();
-        types.sort_by(|a, b| b.1.cmp(&a.1));
+        types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
         for (chunk_type, count) in types {
             let pct = if stats.total_chunks > 0 {
@@ -4326,7 +4350,9 @@ impl CodeIntelEngine {
         exclude_tests: Option<bool>,
         vuln_types: &[String],
     ) -> Result<String> {
-        use crate::security_rules::{is_security_exemplar_file, is_test_file};
+        use crate::security_rules::{
+            is_security_exemplar_file, is_test_file, strip_inline_test_code,
+        };
 
         let repo_path = self.get_repo_path(repo_name)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
@@ -4374,7 +4400,12 @@ impl CodeIntelEngine {
             if let Some(content_entry) = self.file_cache.get(file_path) {
                 let content = content_entry.value();
                 let file_str = file_path.to_string_lossy();
-                let result = crate::taint::analyze_code(content, &file_str);
+                let scan_content = if exclude_tests {
+                    strip_inline_test_code(&file_str, content)
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
+                let result = crate::taint::analyze_code(scan_content.as_ref(), &file_str);
                 all_results.push(result);
             }
         }
@@ -4566,7 +4597,9 @@ impl CodeIntelEngine {
         exclude_tests: Option<bool>,
         source_types: &[String],
     ) -> Result<String> {
-        use crate::security_rules::{is_security_exemplar_file, is_test_file};
+        use crate::security_rules::{
+            is_security_exemplar_file, is_test_file, strip_inline_test_code,
+        };
 
         let repo_path = self.get_repo_path(repo_name)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
@@ -4614,7 +4647,12 @@ impl CodeIntelEngine {
             if let Some(content_entry) = self.file_cache.get(file_path) {
                 let content = content_entry.value();
                 let file_str = file_path.to_string_lossy();
-                let result = crate::taint::analyze_code(content, &file_str);
+                let scan_content = if exclude_tests {
+                    strip_inline_test_code(&file_str, content)
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
+                let result = crate::taint::analyze_code(scan_content.as_ref(), &file_str);
 
                 for source in result.sources {
                     // Filter by type
@@ -4690,7 +4728,9 @@ impl CodeIntelEngine {
         repo_name: &str,
         exclude_tests: Option<bool>,
     ) -> Result<String> {
-        use crate::security_rules::{is_security_exemplar_file, is_test_file};
+        use crate::security_rules::{
+            is_security_exemplar_file, is_test_file, strip_inline_test_code,
+        };
 
         let repo_path = self.get_repo_path(repo_name)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
@@ -4749,7 +4789,12 @@ impl CodeIntelEngine {
         for (file_path, content) in &files {
             total_files += 1;
             let file_str = file_path.to_string_lossy();
-            let result = crate::taint::analyze_code(content, &file_str);
+            let scan_content = if exclude_tests {
+                strip_inline_test_code(&file_str, content)
+            } else {
+                std::borrow::Cow::Borrowed(content.as_str())
+            };
+            let result = crate::taint::analyze_code(scan_content.as_ref(), &file_str);
 
             total_sources += result.sources.len();
             total_sinks += result.sinks.len();
@@ -4884,7 +4929,9 @@ impl CodeIntelEngine {
         repo_name: &str,
         opts: SecurityScanOptions<'_>,
     ) -> Result<String> {
-        use crate::security_rules::{is_security_exemplar_file, is_test_file, SecurityRulesEngine};
+        use crate::security_rules::{
+            is_security_exemplar_file, is_test_file, strip_inline_test_code, SecurityRulesEngine,
+        };
 
         let path = opts.path;
         let severity_threshold = opts.severity_threshold;
@@ -4952,15 +4999,22 @@ impl CodeIntelEngine {
             .flat_map(|(file_path, content)| {
                 let file_str = file_path.to_string_lossy();
                 let lang = detect_language_from_path(&file_str);
+                let scan_content = if exclude_tests {
+                    strip_inline_test_code(&file_str, content)
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
                 match &ruleset_tags {
-                    Some(tags) => engine.scan_with_tags(content, &file_str, &lang, tags),
-                    None => engine.scan(content, &file_str, &lang),
+                    Some(tags) => {
+                        engine.scan_with_tags(scan_content.as_ref(), &file_str, &lang, tags)
+                    }
+                    None => engine.scan(scan_content.as_ref(), &file_str, &lang),
                 }
             })
             .filter(|f| f.severity >= min_severity)
             .collect();
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         // Phase C2: Apply pagination (offset and limit)
         let total_findings = findings.len();
@@ -5042,7 +5096,9 @@ impl CodeIntelEngine {
         path: Option<&str>,
         exclude_tests: Option<bool>,
     ) -> Result<String> {
-        use crate::security_rules::{is_security_exemplar_file, is_test_file, SecurityRulesEngine};
+        use crate::security_rules::{
+            is_security_exemplar_file, is_test_file, strip_inline_test_code, SecurityRulesEngine,
+        };
 
         let repo_path = self.get_repo_path(repo_name)?;
         let engine = SecurityRulesEngine::new();
@@ -5064,11 +5120,20 @@ impl CodeIntelEngine {
             .iter()
             .flat_map(|(file_path, content)| {
                 let file_str = file_path.to_string_lossy();
-                engine.scan_owasp_top10(content, &file_str, &detect_language_from_path(&file_str))
+                let scan_content = if exclude_tests {
+                    strip_inline_test_code(&file_str, content)
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
+                engine.scan_owasp_top10(
+                    scan_content.as_ref(),
+                    &file_str,
+                    &detect_language_from_path(&file_str),
+                )
             })
             .collect();
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         let mut output = format!("# OWASP Top 10 2021 Scan: {}\n\n", repo_name);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
@@ -5094,7 +5159,9 @@ impl CodeIntelEngine {
         path: Option<&str>,
         exclude_tests: Option<bool>,
     ) -> Result<String> {
-        use crate::security_rules::{is_security_exemplar_file, is_test_file, SecurityRulesEngine};
+        use crate::security_rules::{
+            is_security_exemplar_file, is_test_file, strip_inline_test_code, SecurityRulesEngine,
+        };
 
         let repo_path = self.get_repo_path(repo_name)?;
         let engine = SecurityRulesEngine::new();
@@ -5116,11 +5183,20 @@ impl CodeIntelEngine {
             .iter()
             .flat_map(|(file_path, content)| {
                 let file_str = file_path.to_string_lossy();
-                engine.scan_cwe_top25(content, &file_str, &detect_language_from_path(&file_str))
+                let scan_content = if exclude_tests {
+                    strip_inline_test_code(&file_str, content)
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
+                engine.scan_cwe_top25(
+                    scan_content.as_ref(),
+                    &file_str,
+                    &detect_language_from_path(&file_str),
+                )
             })
             .collect();
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         let mut output = format!("# CWE Top 25 Scan: {}\n\n", repo_name);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
@@ -5550,7 +5626,7 @@ impl CodeIntelEngine {
         output.push_str("|---------|-------|-------------|\n");
 
         let mut sorted_licenses: Vec<_> = report.dependencies_by_license.iter().collect();
-        sorted_licenses.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        sorted_licenses.sort_by_key(|(_, dep_list)| std::cmp::Reverse(dep_list.len()));
 
         for (license, dep_list) in sorted_licenses.iter().take(15) {
             let deps_preview: String = dep_list
@@ -5894,7 +5970,7 @@ impl CodeIntelEngine {
                 })
                 .collect();
 
-            file_stats.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+            file_stats.sort_by_key(|(_, deps, dependents)| std::cmp::Reverse(deps + dependents));
             file_stats.truncate(20);
 
             for (file, deps, dependents) in file_stats {
@@ -6213,7 +6289,7 @@ impl CodeIntelEngine {
             }
 
             let mut counts: Vec<_> = by_kind.into_iter().collect();
-            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
             for (kind, count) in counts {
                 output.push_str(&format!("- {:?}: {}\n", kind, count));
@@ -6348,7 +6424,7 @@ impl CodeIntelEngine {
         } else {
             // Get all symbols - we can't determine visibility without AST info
             let mut public_symbols: Vec<_> = file_symbols.iter().collect();
-            public_symbols.sort_by(|a, b| a.start_line.cmp(&b.start_line));
+            public_symbols.sort_by_key(|symbol| symbol.start_line);
 
             output.push_str("## Exported Symbols\n\n");
             output.push_str("| Name | Kind | Line | Signature |\n");
@@ -6647,46 +6723,95 @@ impl CodeIntelEngine {
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
+
+        if full_path.is_dir() {
+            let mut files: Vec<(PathBuf, String, String, Arc<String>)> = self
+                .file_cache
+                .iter()
+                .filter(|entry| path_is_within_repo(entry.key(), &full_path))
+                .filter_map(|entry| {
+                    let display_path = entry
+                        .key()
+                        .strip_prefix(&repo_meta.path)
+                        .unwrap_or(entry.key())
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if exclude_tests && is_test_file(&display_path) {
+                        return None;
+                    }
+
+                    let language = detect_language_from_path(&display_path);
+                    if !is_type_checkable_language(&language) {
+                        return None;
+                    }
+
+                    Some((
+                        entry.key().clone(),
+                        display_path,
+                        language,
+                        entry.value().clone(),
+                    ))
+                })
+                .collect();
+            files.sort_by(|left, right| left.1.cmp(&right.1));
+
+            let mut function_count = 0usize;
+            let mut all_errors: Vec<(String, String, TypeError)> = Vec::new();
+
+            for (file_path, display_path, language, content) in &files {
+                let (file_function_count, errors) =
+                    self.collect_type_errors_for_file(file_path, display_path, content, language)?;
+                function_count += file_function_count;
+
+                for (function_name, error) in errors {
+                    all_errors.push((display_path.clone(), function_name, error));
+                }
+            }
+
+            let mut output = String::new();
+            output.push_str(&format!("# Type Check Results: `{}`\n\n", path));
+            output.push_str(&format!("**Files analyzed**: {}\n", files.len()));
+            output.push_str(&format!("**Functions analyzed**: {}\n\n", function_count));
+
+            if files.is_empty() {
+                output.push_str("No supported Python or JavaScript/TypeScript files found.\n");
+            } else if all_errors.is_empty() {
+                output.push_str("✅ No type errors found!\n");
+            } else {
+                output.push_str(&format!(
+                    "⚠️ **{} potential issues found**\n\n",
+                    all_errors.len()
+                ));
+
+                for (file_path, func_name, error) in &all_errors {
+                    output.push_str(&format!(
+                        "- **{}::{}** (line {}:{}): {:?} - {}\n",
+                        file_path, func_name, error.line, error.column, error.kind, error.message
+                    ));
+                }
+            }
+
+            return Ok(output);
+        }
+
         let content = std::fs::read_to_string(&full_path).context("Failed to read file")?;
         let language = detect_language_from_path(path);
 
         // Check if it's a dynamic language
-        if !matches!(language.as_str(), "python" | "javascript" | "typescript") {
+        if !is_type_checkable_language(&language) {
             return Err(anyhow!(
                 "Type checking is only available for Python and JavaScript/TypeScript. Found: {}",
                 language
             ));
         }
 
-        // Parse and analyze
-        let parsed = self.parser.parse_file(&full_path, &content)?;
-        let tree = parsed
-            .tree
-            .as_ref()
-            .ok_or_else(|| anyhow!("Failed to parse file"))?;
-        let cfgs = cfg::analyze_function(tree, &content, path)?;
-
-        let mut all_errors: Vec<(String, TypeError)> = Vec::new();
-
-        for cfg_item in &cfgs {
-            let mut inferencer = TypeInferencer::new(&content, Some(cfg_item), &language);
-            let result = inferencer.infer_from_cfg(&[]);
-
-            for error in result.errors {
-                all_errors.push((cfg_item.function_name.clone(), error));
-            }
-
-            // Also run type checking
-            let check_errors = inferencer.check_type_errors();
-            for error in check_errors {
-                all_errors.push((cfg_item.function_name.clone(), error));
-            }
-        }
+        let (function_count, all_errors) =
+            self.collect_type_errors_for_file(&full_path, path, &content, &language)?;
 
         // Format output
         let mut output = String::new();
         output.push_str(&format!("# Type Check Results: `{}`\n\n", path));
-        output.push_str(&format!("**Functions analyzed**: {}\n\n", cfgs.len()));
+        output.push_str(&format!("**Functions analyzed**: {}\n\n", function_count));
 
         if all_errors.is_empty() {
             output.push_str("✅ No type errors found!\n");
@@ -6705,6 +6830,39 @@ impl CodeIntelEngine {
         }
 
         Ok(output)
+    }
+
+    fn collect_type_errors_for_file(
+        &self,
+        full_path: &Path,
+        display_path: &str,
+        content: &str,
+        language: &str,
+    ) -> Result<(usize, Vec<(String, TypeError)>)> {
+        let parsed = self.parser.parse_file(full_path, content)?;
+        let tree = parsed
+            .tree
+            .as_ref()
+            .ok_or_else(|| anyhow!("Failed to parse file"))?;
+        let cfgs = cfg::analyze_function(tree, content, display_path)?;
+
+        let mut all_errors: Vec<(String, TypeError)> = Vec::new();
+
+        for cfg_item in &cfgs {
+            let mut inferencer = TypeInferencer::new(content, Some(cfg_item), language);
+            let result = inferencer.infer_from_cfg(&[]);
+
+            for error in result.errors {
+                all_errors.push((cfg_item.function_name.clone(), error));
+            }
+
+            let check_errors = inferencer.check_type_errors();
+            for error in check_errors {
+                all_errors.push((cfg_item.function_name.clone(), error));
+            }
+        }
+
+        Ok((cfgs.len(), all_errors))
     }
 
     /// Enhanced taint analysis with type information
@@ -8235,6 +8393,10 @@ fn render_normalized_search_content(document: &NormalizedDocument) -> String {
     lines.join("\n")
 }
 
+fn is_type_checkable_language(language: &str) -> bool {
+    matches!(language, "python" | "javascript" | "typescript")
+}
+
 // Helper functions
 
 fn expand_path(path: &Path) -> Result<PathBuf> {
@@ -8245,6 +8407,29 @@ fn expand_path(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+fn path_is_within_repo(path: &Path, repo: &Path) -> bool {
+    if path.starts_with(repo) {
+        return true;
+    }
+
+    let Ok(repo_canonical) = repo.canonicalize() else {
+        return false;
+    };
+
+    if let Ok(path_canonical) = path.canonicalize() {
+        return path_canonical.starts_with(&repo_canonical);
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent_canonical) = parent.canonicalize() else {
+        return false;
+    };
+
+    parent_canonical.starts_with(repo_canonical)
 }
 
 /// Validate that a requested path is within the repository root to prevent path traversal attacks

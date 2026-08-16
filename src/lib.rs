@@ -25,6 +25,7 @@ pub mod symbols;
 pub mod taint;
 pub mod tool_metadata;
 pub mod type_inference;
+pub mod validation;
 
 // Knowledge graph persistence (requires oxigraph)
 #[cfg(feature = "graph")]
@@ -37,6 +38,8 @@ pub mod ccg;
 // Native-only modules (require tokio, octocrab, lsp, etc.)
 #[cfg(feature = "native")]
 pub mod git;
+#[cfg(feature = "native")]
+pub mod http_server;
 #[cfg(feature = "native")]
 pub mod index;
 #[cfg(feature = "native")]

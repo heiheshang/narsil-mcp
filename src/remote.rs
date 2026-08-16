@@ -10,9 +10,6 @@
 //!
 //! This is a Phase 3 feature - remote repository support.
 
-// Allow dead code for Phase 3 remote repo features
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Context, Result};
 use octocrab::Octocrab;
 use serde::{Deserialize, Serialize};
@@ -21,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing::{info, warn};
+
+use crate::validation;
 
 /// Represents a remote GitHub repository
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,9 +64,19 @@ impl RemoteRepo {
         let owner = parts[0].to_string();
         let repo = parts[1].to_string();
 
+        // Validate owner and repo names to prevent command injection
+        validation::validate_github_component(&owner)
+            .map_err(|e| anyhow!("Invalid GitHub owner '{}': {}", owner, e))?;
+        validation::validate_github_component(&repo)
+            .map_err(|e| anyhow!("Invalid GitHub repo '{}': {}", repo, e))?;
+
         // Check for branch specification (tree/branch or refs/heads/branch)
         let branch = if parts.len() >= 4 && parts[2] == "tree" {
-            Some(parts[3].to_string())
+            let branch_name = parts[3].to_string();
+            // Validate branch name to prevent command injection in git operations
+            validation::validate_git_ref(&branch_name)
+                .map_err(|e| anyhow!("Invalid branch name '{}': {}", branch_name, e))?;
+            Some(branch_name)
         } else {
             None
         };
@@ -495,5 +504,33 @@ mod tests {
     fn test_clone_url() {
         let remote = RemoteRepo::from_url("github.com/owner/repo").unwrap();
         assert_eq!(remote.clone_url(), "https://github.com/owner/repo.git");
+    }
+
+    #[test]
+    fn test_rejects_malicious_branch() {
+        assert!(RemoteRepo::from_url("github.com/owner/repo/tree/;whoami").is_err());
+        assert!(RemoteRepo::from_url("github.com/owner/repo/tree/--exec=evil").is_err());
+        assert!(RemoteRepo::from_url("github.com/owner/repo/tree/`id`").is_err());
+        assert!(RemoteRepo::from_url("github.com/owner/repo/tree/$(cat /etc/passwd)").is_err());
+    }
+
+    #[test]
+    fn test_rejects_malicious_owner_repo() {
+        assert!(RemoteRepo::from_url("github.com/;whoami/repo").is_err());
+        assert!(RemoteRepo::from_url("github.com/owner/;whoami").is_err());
+        assert!(RemoteRepo::from_url("github.com/../../etc").is_err());
+    }
+
+    #[test]
+    fn test_accepts_valid_branches() {
+        let remote = RemoteRepo::from_url("github.com/owner/repo/tree/feature-branch").unwrap();
+        assert_eq!(remote.branch, Some("feature-branch".to_string()));
+    }
+
+    #[test]
+    fn test_accepts_valid_owner_repo_names() {
+        let remote = RemoteRepo::from_url("github.com/my-org/my-project.v2").unwrap();
+        assert_eq!(remote.owner, "my-org");
+        assert_eq!(remote.repo, "my-project.v2");
     }
 }
