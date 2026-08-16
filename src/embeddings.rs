@@ -57,16 +57,38 @@ impl TfIdfEmbedding {
         self.rebuild_vocabulary();
     }
 
-    /// Rebuild vocabulary from most frequent terms
+    /// Rebuild vocabulary from most frequent terms, and bound `document_freq`.
     fn rebuild_vocabulary(&mut self) {
-        // Sort terms by document frequency (descending)
-        let mut terms: Vec<_> = self.document_freq.iter().collect();
-        terms.sort_by(|a, b| b.1.cmp(a.1));
+        // Rank terms by document frequency (descending). Materialize into an
+        // owned vec so we can mutate `document_freq` below without holding a
+        // borrow across the mutation.
+        let mut ranked: Vec<(String, usize)> = self
+            .document_freq
+            .iter()
+            .map(|(term, &df)| (term.clone(), df))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Take top N terms for vocabulary
+        // Vocabulary = top `max_vocab_size` terms.
         self.vocabulary.clear();
-        for (idx, (term, _)) in terms.iter().take(self.max_vocab_size).enumerate() {
-            self.vocabulary.insert((*term).clone(), idx);
+        for (idx, (term, _)) in ranked.iter().take(self.max_vocab_size).enumerate() {
+            self.vocabulary.insert(term.clone(), idx);
+        }
+
+        // Bound `document_freq`: IDF is only ever computed for terms that made
+        // it into the vocabulary (`embed()` checks the vocabulary first), so
+        // counts for the long tail are never read. Pruning them keeps memory
+        // O(max_vocab_size) instead of growing with every unique token, and
+        // keeps this per-add sort cheap. Keep 2x headroom so near-miss terms
+        // retain their counts and can still climb into the top-N later.
+        let limit = self.max_vocab_size * 2;
+        if self.document_freq.len() > limit {
+            let keep: std::collections::HashSet<&String> = ranked
+                .iter()
+                .take(limit)
+                .map(|(term, _)| term)
+                .collect();
+            self.document_freq.retain(|term, _| keep.contains(term));
         }
     }
 
@@ -410,6 +432,30 @@ mod tests {
         // Check normalization (L2 norm should be ~1.0)
         let magnitude: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((magnitude - 1.0).abs() < 0.001 || magnitude == 0.0);
+    }
+
+    #[test]
+    fn test_document_freq_is_bounded() {
+        let mut tfidf = TfIdfEmbedding::new(5);
+
+        // Many documents, each with a distinct token, so the corpus has far
+        // more unique terms than the vocabulary.
+        for i in 0..100 {
+            tfidf.add_document(&format!("unique_token_{i} fn_{i}"));
+        }
+
+        let limit = tfidf.max_vocab_size * 2;
+        assert!(
+            tfidf.document_freq.len() <= limit,
+            "document_freq grew to {}, expected <= {}",
+            tfidf.document_freq.len(),
+            limit
+        );
+        assert!(tfidf.vocabulary.len() <= tfidf.max_vocab_size);
+
+        // Embedding dimension stays the configured size.
+        let embedding = tfidf.embed("fn_42");
+        assert_eq!(embedding.len(), tfidf.max_vocab_size);
     }
 
     #[test]
