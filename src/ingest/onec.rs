@@ -69,6 +69,18 @@ pub struct OneCDomainModel {
     pub tabular_sections: Vec<OneCTabularSection>,
     /// Register names a Document posts movements to (AccumulationRegister.X / InformationRegister.X).
     pub movements: Vec<String>,
+    /// Event subscription (source object + event -> handler procedure).
+    pub subscription: Option<OneCSubscription>,
+    /// Entry-point method this object invokes (scheduled job / HTTP service).
+    pub entry_method: Option<String>,
+}
+
+/// An event subscription: source object + event -> handler procedure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCSubscription {
+    pub source: String,
+    pub event: String,
+    pub handler: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -439,6 +451,7 @@ fn parse_domain_model(xml: &str) -> OneCDomainModel {
     let mut current_attribute: Option<OneCAttribute> = None;
     let mut current_ts: Option<OneCTabularSection> = None;
     let mut in_register_records = false;
+    let mut in_source = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -448,6 +461,7 @@ fn parse_domain_model(xml: &str) -> OneCDomainModel {
                     "Attribute" => current_attribute = Some(OneCAttribute::default()),
                     "TabularSection" => current_ts = Some(OneCTabularSection::default()),
                     "RegisterRecords" => in_register_records = true,
+                    "Source" => in_source = true,
                     _ => {}
                 }
                 stack.push(name);
@@ -476,6 +490,31 @@ fn parse_domain_model(xml: &str) -> OneCDomainModel {
                     if top == Some("Name") && ts.name.is_empty() {
                         ts.name = text;
                     }
+                } else {
+                    // Entry-point references: subscription source/event/handler,
+                    // scheduled-job method.
+                    match top {
+                        Some("Handler") => {
+                            let sub = model
+                                .subscription
+                                .get_or_insert_with(OneCSubscription::default);
+                            sub.handler = text;
+                        }
+                        Some("Event") => {
+                            let sub = model
+                                .subscription
+                                .get_or_insert_with(OneCSubscription::default);
+                            sub.event = text;
+                        }
+                        Some("MethodName") => model.entry_method = Some(text),
+                        Some("Type") if in_source => {
+                            let sub = model
+                                .subscription
+                                .get_or_insert_with(OneCSubscription::default);
+                            sub.source = text;
+                        }
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -496,6 +535,7 @@ fn parse_domain_model(xml: &str) -> OneCDomainModel {
                         }
                     }
                     "RegisterRecords" => in_register_records = false,
+                    "Source" => in_source = false,
                     _ => {}
                 }
                 stack.pop();
@@ -682,6 +722,17 @@ fn render_summary_text(summary: &OneCMetadataSummary) -> String {
         for movement in &domain.movements {
             lines.push(format!("  - {movement}"));
         }
+    }
+
+    if let Some(sub) = &domain.subscription {
+        lines.push(format!(
+            "Subscription: {} {} -> {}",
+            sub.source, sub.event, sub.handler
+        ));
+    }
+
+    if let Some(entry) = &domain.entry_method {
+        lines.push(format!("Entry method: {entry}"));
     }
 
     lines.join("\n")
@@ -938,6 +989,54 @@ mod tests {
             model.movements[1],
             "InformationRegister.ИсправленияДокументов"
         );
+    }
+
+    #[test]
+    fn parses_subscription_source_event_handler() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
+                xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <EventSubscription uuid="bdeb97e9-5f41-4896-9d7c-8d15963a63ab">
+    <Properties>
+      <Name>ВариантОтчетаПередУдалением</Name>
+      <Source>
+        <v8:Type>cfg:CatalogObject.ВариантыОтчетов</v8:Type>
+      </Source>
+      <Event>BeforeDelete</Event>
+      <Handler>CommonModule.МониторингЦелевыхПоказателей.ВариантОтчетаПередУдалением</Handler>
+    </Properties>
+  </EventSubscription>
+</MetaDataObject>"#;
+
+        let model = parse_domain_model(xml);
+        let sub = model.subscription.expect("subscription should be parsed");
+        assert_eq!(sub.source, "cfg:CatalogObject.ВариантыОтчетов");
+        assert_eq!(sub.event, "BeforeDelete");
+        assert_eq!(
+            sub.handler,
+            "CommonModule.МониторингЦелевыхПоказателей.ВариантОтчетаПередУдалением"
+        );
+        assert!(model.entry_method.is_none());
+    }
+
+    #[test]
+    fn parses_scheduled_job_entry_method() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+  <ScheduledJob uuid="dddddddd-dddd-dddd-dddd-dddddddddddd">
+    <Properties>
+      <Name>ABCКлассификацияНоменклатуры</Name>
+      <MethodName>CommonModule.Классификация.ВыполнитьABCКлассификациюНоменклатурыРегламентноеЗадание</MethodName>
+    </Properties>
+  </ScheduledJob>
+</MetaDataObject>"#;
+
+        let model = parse_domain_model(xml);
+        assert_eq!(
+            model.entry_method.as_deref(),
+            Some("CommonModule.Классификация.ВыполнитьABCКлассификациюНоменклатурыРегламентноеЗадание")
+        );
+        assert!(model.subscription.is_none());
     }
 
     #[test]
