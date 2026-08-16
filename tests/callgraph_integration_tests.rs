@@ -183,6 +183,69 @@ fn internal_worker() {
 }
 
 #[test]
+fn test_chunked_two_pass_equivalent_to_monolithic() {
+    let parser = LanguageParser::new().unwrap();
+
+    // Cross-file call: main.rs -> utils.rs::helper
+    let file1 = r#"
+mod utils;
+
+fn main() {
+    utils::helper();
+}
+"#;
+    let file2 = r#"
+pub fn helper() {
+    internal_worker();
+}
+
+fn internal_worker() {
+    println!("Working");
+}
+"#;
+
+    let tree1 = parser.parse_to_tree(Path::new("main.rs"), file1).unwrap();
+    let tree2 = parser.parse_to_tree(Path::new("utils.rs"), file2).unwrap();
+
+    // Monolithic: one two-pass build over both files.
+    let monolithic = CallGraph::new();
+    monolithic
+        .build_from_files(&[
+            ("main.rs".to_string(), file1.to_string(), tree1.clone()),
+            ("utils.rs".to_string(), file2.to_string(), tree2.clone()),
+        ])
+        .unwrap();
+
+    // Chunked streaming: functions for every chunk first, then calls for every
+    // chunk — the exact shape index_repo uses. Same trees, split into windows.
+    let chunked = CallGraph::new();
+    chunked
+        .collect_functions(&[("main.rs".to_string(), file1.to_string(), tree1.clone())])
+        .unwrap();
+    chunked
+        .collect_functions(&[("utils.rs".to_string(), file2.to_string(), tree2.clone())])
+        .unwrap();
+    chunked
+        .collect_calls(&[("main.rs".to_string(), file1.to_string(), tree1.clone())])
+        .unwrap();
+    chunked
+        .collect_calls(&[("utils.rs".to_string(), file2.to_string(), tree2.clone())])
+        .unwrap();
+
+    // Cross-file resolution must be identical between the two paths.
+    let mono_callers = monolithic.get_callers("helper");
+    let chunked_callers = chunked.get_callers("helper");
+    assert!(
+        !mono_callers.is_empty(),
+        "monolithic should resolve the cross-file call"
+    );
+    assert_eq!(chunked_callers.len(), mono_callers.len());
+    for (a, b) in chunked_callers.iter().zip(mono_callers.iter()) {
+        assert_eq!(a.target, b.target);
+    }
+}
+
+#[test]
 fn test_cross_file_scoped_call_resolution() {
     let parser = LanguageParser::new().unwrap();
     let call_graph = CallGraph::new();

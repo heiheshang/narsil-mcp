@@ -93,18 +93,31 @@ impl CallGraph {
         }
     }
 
-    /// Build call graph from parsed files
+    /// Build call graph from parsed files (two passes over the same slice).
     pub fn build_from_files(&self, files: &[(String, String, Tree)]) -> Result<()> {
-        // First pass: collect all function definitions
+        self.collect_functions(files)?;
+        self.collect_calls(files)
+    }
+
+    /// First pass: collect function definitions from a batch of parsed files.
+    ///
+    /// Split out of [`build_from_files`](Self::build_from_files) so the indexer
+    /// can stream files in chunks and drop each batch's parse trees, instead of
+    /// holding every tree in memory at once.
+    pub fn collect_functions(&self, files: &[(String, String, Tree)]) -> Result<()> {
         for (path, content, tree) in files {
             self.extract_functions(path, content, tree)?;
         }
+        Ok(())
+    }
 
-        // Second pass: find all call sites
+    /// Second pass: collect call sites and resolve them against the functions
+    /// gathered by [`collect_functions`](Self::collect_functions) across all
+    /// prior batches.
+    pub fn collect_calls(&self, files: &[(String, String, Tree)]) -> Result<()> {
         for (path, content, tree) in files {
             self.extract_calls(path, content, tree)?;
         }
-
         Ok(())
     }
 
