@@ -44,6 +44,31 @@ pub struct OneCMetadataSummary {
     pub forms: Vec<String>,
     pub commands: Vec<String>,
     pub properties: BTreeMap<String, String>,
+    pub domain_model: OneCDomainModel,
+}
+
+/// A single attribute (реквизит) with its type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCAttribute {
+    pub name: String,
+    pub synonym: String,
+    pub type_name: String,
+}
+
+/// A tabular section (табличная часть) with its column attributes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCTabularSection {
+    pub name: String,
+    pub columns: Vec<OneCAttribute>,
+}
+
+/// The 1C domain model extracted from a single metadata object XML.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCDomainModel {
+    pub attributes: Vec<OneCAttribute>,
+    pub tabular_sections: Vec<OneCTabularSection>,
+    /// Register names a Document posts movements to (AccumulationRegister.X / InformationRegister.X).
+    pub movements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,6 +180,7 @@ impl OneCIngestor {
             forms,
             commands,
             properties,
+            domain_model: parse_domain_model(&xml),
         }))
     }
 
@@ -335,23 +361,46 @@ fn record_text(path: &[String], text: &str, parsed: &mut ParsedMetadata) {
         return;
     };
 
-    if path.len() == 3 {
-        if last == "Name" {
+    // Object name: `<Object><Name>` (minimal fixture) or
+    // `<Object><Properties><Name>` (real config dump).
+    if last == "Name" && parsed.name.is_none() {
+        let direct = path.len() == 3;
+        let under_properties = path.len() == 4 && path[2] == "Properties";
+        if direct || under_properties {
             parsed.name = Some(text.to_string());
             return;
         }
+    }
 
-        if should_record_property(last) {
-            parsed
-                .properties
-                .entry(last.clone())
-                .or_insert_with(|| text.to_string());
-        }
+    // Synonym: `<Object><Synonym><item>` (minimal) or
+    // `<Object><Properties><Synonym><item><content>` (real dump).
+    let synonym_item = (path.len() == 4 && path[2] == "Synonym" && last == "item")
+        || (path.len() == 6
+            && path[2] == "Properties"
+            && path[3] == "Synonym"
+            && path[4] == "item"
+            && last == "content");
+    if synonym_item && parsed.synonym.is_none() {
+        parsed.synonym = Some(text.to_string());
         return;
     }
 
-    if path.len() == 4 && path[2] == "Synonym" && last == "item" && parsed.synonym.is_none() {
-        parsed.synonym = Some(text.to_string());
+    // Scalar properties (Global, Server, …) at `<Object><prop>` (minimal) or
+    // `<Object><Properties><prop>` (real dump).
+    let prop_name = if path.len() == 3 {
+        Some(last)
+    } else if path.len() == 4 && path[2] == "Properties" {
+        Some(last)
+    } else {
+        None
+    };
+    if let Some(prop_name) = prop_name {
+        if should_record_property(prop_name) {
+            parsed
+                .properties
+                .entry(prop_name.clone())
+                .or_insert_with(|| text.to_string());
+        }
     }
 }
 
@@ -373,6 +422,95 @@ fn should_record_property(tag: &str) -> bool {
 fn local_name(name: &[u8]) -> String {
     let full = String::from_utf8_lossy(name);
     full.rsplit(':').next().unwrap_or(full.as_ref()).to_string()
+}
+
+/// Parse the 1C domain model (attributes, tabular sections, register records)
+/// from a metadata object XML. Best-effort: a second streaming pass keyed off
+/// element nesting, not namespaces. `<xr:Item>` inside `<RegisterRecords>` are
+/// the movement targets; `<Attribute>` directly under the object `<ChildObjects>`
+/// are requisites, and under a `<TabularSection>` they are columns.
+fn parse_domain_model(xml: &str) -> OneCDomainModel {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut model = OneCDomainModel::default();
+    let mut buf = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut current_attribute: Option<OneCAttribute> = None;
+    let mut current_ts: Option<OneCTabularSection> = None;
+    let mut in_register_records = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = local_name(e.name().as_ref());
+                match name.as_str() {
+                    "Attribute" => current_attribute = Some(OneCAttribute::default()),
+                    "TabularSection" => current_ts = Some(OneCTabularSection::default()),
+                    "RegisterRecords" => in_register_records = true,
+                    _ => {}
+                }
+                stack.push(name);
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.decode().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let top = stack.last().map(String::as_str);
+                if in_register_records && top == Some("Item") {
+                    model.movements.push(text);
+                } else if let Some(attr) = current_attribute.as_mut() {
+                    match top {
+                        Some("Name") if attr.name.is_empty() => attr.name = text,
+                        Some("Type") => {
+                            if !attr.type_name.is_empty() {
+                                attr.type_name.push_str(", ");
+                            }
+                            attr.type_name.push_str(&text);
+                        }
+                        Some("content") if attr.synonym.is_empty() => attr.synonym = text,
+                        _ => {}
+                    }
+                } else if let Some(ts) = current_ts.as_mut() {
+                    if top == Some("Name") && ts.name.is_empty() {
+                        ts.name = text;
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = local_name(e.name().as_ref());
+                match name.as_str() {
+                    "Attribute" => {
+                        if let Some(attr) = current_attribute.take() {
+                            if let Some(ts) = current_ts.as_mut() {
+                                ts.columns.push(attr);
+                            } else {
+                                model.attributes.push(attr);
+                            }
+                        }
+                    }
+                    "TabularSection" => {
+                        if let Some(ts) = current_ts.take() {
+                            model.tabular_sections.push(ts);
+                        }
+                    }
+                    "RegisterRecords" => in_register_records = false,
+                    _ => {}
+                }
+                stack.pop();
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                tracing::debug!("1C domain-model parse stopped early: {error}");
+                break;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    model
 }
 
 fn discover_module_links(repo_root: &Path, metadata_path: &Path) -> Vec<(String, PathBuf)> {
@@ -505,6 +643,45 @@ fn render_summary_text(summary: &OneCMetadataSummary) -> String {
 
     for (key, value) in &summary.properties {
         lines.push(format!("{key}: {value}"));
+    }
+
+    let domain = &summary.domain_model;
+    if !domain.attributes.is_empty() {
+        lines.push(format!("Attributes ({})", domain.attributes.len()));
+        for attr in &domain.attributes {
+            if attr.type_name.is_empty() {
+                lines.push(format!("  - {}", attr.name));
+            } else {
+                lines.push(format!("  - {}: {}", attr.name, attr.type_name));
+            }
+        }
+    }
+
+    if !domain.tabular_sections.is_empty() {
+        lines.push(format!(
+            "Tabular sections ({})",
+            domain.tabular_sections.len()
+        ));
+        for ts in &domain.tabular_sections {
+            lines.push(format!("  - {} ({} columns)", ts.name, ts.columns.len()));
+            for col in &ts.columns {
+                if col.type_name.is_empty() {
+                    lines.push(format!("      - {}", col.name));
+                } else {
+                    lines.push(format!("      - {}: {}", col.name, col.type_name));
+                }
+            }
+        }
+    }
+
+    if !domain.movements.is_empty() {
+        lines.push(format!(
+            "Register records ({})",
+            domain.movements.len()
+        ));
+        for movement in &domain.movements {
+            lines.push(format!("  - {movement}"));
+        }
     }
 
     lines.join("\n")
@@ -690,6 +867,76 @@ mod tests {
         assert_eq!(
             document.metadata.get("object_name"),
             Some(&"Products".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_domain_model_from_object_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
+                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Document uuid="d2275b5d-ab87-483e-b252-2de5d94fc643">
+    <Properties>
+      <Name>АктВыполненныхРабот</Name>
+      <RegisterRecords>
+        <xr:Item xsi:type="xr:MDObjectRef">AccumulationRegister.ДвиженияПоНДС</xr:Item>
+        <xr:Item xsi:type="xr:MDObjectRef">InformationRegister.ИсправленияДокументов</xr:Item>
+      </RegisterRecords>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="960094b3-ab3d-413a-a293-72fdfdeac074">
+        <Properties>
+          <Name>АктПоЗаказам</Name>
+          <Type><v8:Type xmlns:v8="http://v8.1c.ru/8.1/data/core">xs:boolean</v8:Type></Type>
+        </Properties>
+      </Attribute>
+      <Attribute uuid="1241ab57-8140-4e24-85fc-ef74add7361a">
+        <Properties>
+          <Name>БанковскийСчетКонтрагента</Name>
+          <Type><v8:Type xmlns:v8="http://v8.1c.ru/8.1/data/core">cfg:CatalogRef.БанковскиеСчетаКонтрагентов</v8:Type></Type>
+        </Properties>
+      </Attribute>
+      <TabularSection uuid="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">
+        <Properties><Name>Товары</Name></Properties>
+        <ChildObjects>
+          <Attribute uuid="cccccccc-cccc-cccc-cccc-cccccccccccc">
+            <Properties>
+              <Name>Номенклатура</Name>
+              <Type><v8:Type xmlns:v8="http://v8.1c.ru/8.1/data/core">cfg:CatalogRef.Номенклатура</v8:Type></Type>
+            </Properties>
+          </Attribute>
+        </ChildObjects>
+      </TabularSection>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+
+        let model = parse_domain_model(xml);
+
+        assert_eq!(model.attributes.len(), 2);
+        assert_eq!(model.attributes[0].name, "АктПоЗаказам");
+        assert_eq!(model.attributes[0].type_name, "xs:boolean");
+        assert_eq!(model.attributes[1].name, "БанковскийСчетКонтрагента");
+        assert_eq!(
+            model.attributes[1].type_name,
+            "cfg:CatalogRef.БанковскиеСчетаКонтрагентов"
+        );
+
+        assert_eq!(model.tabular_sections.len(), 1);
+        assert_eq!(model.tabular_sections[0].name, "Товары");
+        assert_eq!(model.tabular_sections[0].columns.len(), 1);
+        assert_eq!(model.tabular_sections[0].columns[0].name, "Номенклатура");
+        assert_eq!(
+            model.tabular_sections[0].columns[0].type_name,
+            "cfg:CatalogRef.Номенклатура"
+        );
+
+        assert_eq!(model.movements.len(), 2);
+        assert_eq!(model.movements[0], "AccumulationRegister.ДвиженияПоНДС");
+        assert_eq!(
+            model.movements[1],
+            "InformationRegister.ИсправленияДокументов"
         );
     }
 
