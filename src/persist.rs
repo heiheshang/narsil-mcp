@@ -2,7 +2,7 @@
 //!
 //! Saves index to disk and watches for file changes to update incrementally.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 #[cfg(feature = "native")]
 use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::store::{FileRow, SqliteStore};
 use crate::symbols::Symbol;
 
 /// File metadata for change detection
@@ -53,34 +54,6 @@ impl PersistedIndex {
             repo_root,
             files: HashMap::new(),
         }
-    }
-
-    /// Load index from disk
-    pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path).context("Failed to read index file")?;
-        let index: Self = postcard::from_bytes(&data).context("Failed to deserialize index")?;
-
-        if index.version != Self::CURRENT_VERSION {
-            return Err(anyhow::anyhow!(
-                "Index version mismatch: {} != {}",
-                index.version,
-                Self::CURRENT_VERSION
-            ));
-        }
-
-        Ok(index)
-    }
-
-    /// Save index to disk
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let data = postcard::to_stdvec(self).context("Failed to serialize index")?;
-
-        // Write to temp file then rename for atomicity
-        let temp_path = path.with_extension("tmp");
-        std::fs::write(&temp_path, &data).context("Failed to write temp index")?;
-        std::fs::rename(&temp_path, path).context("Failed to rename index file")?;
-
-        Ok(())
     }
 
     /// Check if a file needs re-indexing
@@ -172,24 +145,29 @@ impl IndexStore {
         Ok(Self { index_dir })
     }
 
-    /// Get the index file path for a repository
-    pub fn index_path(&self, repo_root: &Path) -> PathBuf {
+    /// SQLite database path for a repository.
+    pub fn db_path(&self, repo_root: &Path) -> PathBuf {
         let hash = {
             let mut hasher = Sha256::new();
             hasher.update(repo_root.to_string_lossy().as_bytes());
             format!("{:x}", hasher.finalize())
         };
-        self.index_dir.join(format!("{}.idx", &hash[..16]))
+        self.index_dir.join(format!("{}.db", &hash[..16]))
+    }
+
+    /// The `repo` key used for rows belonging to `repo_root`.
+    fn repo_key(repo_root: &Path) -> String {
+        repo_root.to_string_lossy().to_string()
     }
 
     /// Load or create index for a repository
     pub fn load_or_create(&self, repo_root: &Path) -> Result<PersistedIndex> {
-        let index_path = self.index_path(repo_root);
+        let db_path = self.db_path(repo_root);
 
-        if index_path.exists() {
-            match PersistedIndex::load(&index_path) {
+        if db_path.exists() {
+            match self.load_from_db(repo_root) {
                 Ok(index) => {
-                    info!("Loaded existing index from {:?}", index_path);
+                    info!("Loaded existing index from {:?}", db_path);
                     return Ok(index);
                 }
                 Err(e) => {
@@ -202,11 +180,85 @@ impl IndexStore {
         Ok(PersistedIndex::new(repo_root.to_path_buf()))
     }
 
+    /// Rebuild an in-memory `PersistedIndex` from the SQLite store.
+    ///
+    /// File metadata rows are read first (keyed by absolute path), then symbols
+    /// are streamed and attached to their file by `repo_root.join(file_path)`.
+    fn load_from_db(&self, repo_root: &Path) -> Result<PersistedIndex> {
+        let store = SqliteStore::open(&self.db_path(repo_root))?;
+        let repo = Self::repo_key(repo_root);
+
+        let created_at = store
+            .get_meta("created_at")?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let updated_at = store
+            .get_meta("updated_at")?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let mut files: HashMap<PathBuf, FileMetadata> = HashMap::new();
+        store.for_each_file(&repo, |f| {
+            let abs = PathBuf::from(f.path);
+            files.insert(
+                abs.clone(),
+                FileMetadata {
+                    path: abs,
+                    content_hash: f.content_hash,
+                    modified_time: f.modified_time,
+                    size: f.size,
+                    symbols: Vec::new(),
+                },
+            );
+        })?;
+
+        let mut dropped = 0usize;
+        store.for_each_symbol(&repo, |sym| {
+            let abs = repo_root.join(&sym.file_path);
+            match files.get_mut(&abs) {
+                Some(meta) => meta.symbols.push(sym),
+                None => dropped += 1,
+            }
+        })?;
+        if dropped > 0 {
+            warn!(
+                "Dropped {} symbol(s) with no matching file row for repo {}",
+                dropped, repo
+            );
+        }
+
+        Ok(PersistedIndex {
+            version: PersistedIndex::CURRENT_VERSION,
+            created_at,
+            updated_at,
+            repo_root: repo_root.to_path_buf(),
+            files,
+        })
+    }
+
     /// Save index for a repository
     pub fn save(&self, index: &PersistedIndex) -> Result<()> {
-        let index_path = self.index_path(&index.repo_root);
-        index.save(&index_path)?;
-        info!("Saved index to {:?}", index_path);
+        let db_path = self.db_path(&index.repo_root);
+        let store = SqliteStore::open(&db_path)?;
+        let repo = Self::repo_key(&index.repo_root);
+
+        let mut files = Vec::with_capacity(index.files.len());
+        let mut symbols = Vec::new();
+        for meta in index.files.values() {
+            files.push(FileRow {
+                path: meta.path.to_string_lossy().to_string(),
+                content_hash: meta.content_hash.clone(),
+                modified_time: meta.modified_time,
+                size: meta.size,
+            });
+            symbols.extend(meta.symbols.iter().cloned());
+        }
+
+        store.replace_repo(&repo, &files, &symbols)?;
+        store.set_meta("repo_root", &repo)?;
+        store.set_meta("created_at", &index.created_at.to_string())?;
+        store.set_meta("updated_at", &index.updated_at.to_string())?;
+        info!("Saved index to {:?}", db_path);
         Ok(())
     }
 
@@ -218,9 +270,11 @@ impl IndexStore {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map(|e| e == "idx").unwrap_or(false) {
-                if let Ok(index) = PersistedIndex::load(&path) {
-                    repos.push(index.repo_root);
+            if path.extension().map(|e| e == "db").unwrap_or(false) {
+                if let Ok(store) = SqliteStore::open(&path) {
+                    if let Ok(Some(root)) = store.get_meta("repo_root") {
+                        repos.push(PathBuf::from(root));
+                    }
                 }
             }
         }
@@ -700,5 +754,59 @@ mod tests {
 
         let loaded = store.load_or_create(repo.path()).unwrap();
         assert_eq!(loaded.version, PersistedIndex::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_index_store_roundtrip_symbols() {
+        use crate::symbols::{Symbol, SymbolKind};
+
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+
+        let repo = tempdir().unwrap();
+        let file = repo.path().join("a.rs");
+        std::fs::write(&file, "fn foo() {}").unwrap();
+
+        let mut index = PersistedIndex::new(repo.path().to_path_buf());
+        let symbols = vec![Symbol {
+            name: "foo".into(),
+            kind: SymbolKind::Function,
+            file_path: "a.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            signature: Some("fn foo()".into()),
+            qualified_name: Some("foo".into()),
+            doc_comment: None,
+        }];
+        index.files.insert(
+            file.clone(),
+            FileMetadata {
+                path: file,
+                content_hash: "abc".into(),
+                modified_time: 123,
+                size: 11,
+                symbols,
+            },
+        );
+
+        store.save(&index).unwrap();
+
+        let loaded = store.load_or_create(repo.path()).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        let meta = loaded.files.values().next().unwrap();
+        assert_eq!(meta.symbols.len(), 1);
+        assert_eq!(meta.symbols[0].name, "foo");
+        assert_eq!(meta.symbols[0].file_path, "a.rs");
+        assert_eq!(meta.content_hash, "abc");
+        assert_eq!(meta.modified_time, 123);
+        assert_eq!(loaded.repo_root, repo.path().to_path_buf());
+
+        // Timestamps must survive the round-trip (they feed `last_indexed`).
+        assert_eq!(loaded.created_at, index.created_at);
+        assert_eq!(loaded.updated_at, index.updated_at);
+
+        // list_cached must discover the repo via the meta table.
+        let cached = store.list_cached().unwrap();
+        assert_eq!(cached, vec![repo.path().to_path_buf()]);
     }
 }

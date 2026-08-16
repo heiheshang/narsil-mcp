@@ -469,6 +469,7 @@ impl CodeIntelEngine {
         info!("Starting background initialization");
 
         // Index repos that weren't loaded from persistence
+        let mut indexed_any = false;
         for repo_path in &self.repo_paths {
             let repo_name = repo_path
                 .file_name()
@@ -476,8 +477,10 @@ impl CodeIntelEngine {
                 .unwrap_or("unknown")
                 .to_string();
 
+            let was_cached = self.repos.contains_key(&repo_name);
+
             // Check if already loaded from persistence
-            if self.repos.contains_key(&repo_name) {
+            if was_cached {
                 // Neural vectors live outside the persisted index, and they are
                 // only built while walking a repository. Skipping that walk left
                 // `neural_search` silently empty whenever --persist had a warm
@@ -501,6 +504,12 @@ impl CodeIntelEngine {
                 if let Err(e) = self.index_repo(repo_path).await {
                     warn!("Failed to index {:?}: {}", repo_path, e);
                 } else {
+                    // Only persist a genuinely-new index. A neural re-walk over
+                    // a warm cache rebuilds identical symbols and must not
+                    // trigger a full re-hash of every file on each startup.
+                    if !was_cached {
+                        indexed_any = true;
+                    }
                     self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 }
             } else {
@@ -528,6 +537,16 @@ impl CodeIntelEngine {
                         }
                     }
                 }
+            }
+        }
+
+        // Persist the freshly built index. `save_index` no-ops without
+        // --persist; skip on a fully warm cache (a cache-only load needs no
+        // rewrite, and re-hashing every file is not free).
+        if indexed_any {
+            match self.save_index().await {
+                Ok(msg) => info!("{}", msg),
+                Err(e) => warn!("Failed to save index after initialization: {}", e),
             }
         }
 
@@ -865,7 +884,9 @@ impl CodeIntelEngine {
         // Clear all caches on full reindex
         self.analysis_cache.clear();
         self.query_cache.clear();
-        self.index_repos().await
+        self.index_repos().await?;
+        let _ = self.save_index().await;
+        Ok(())
     }
 
     pub async fn reindex(&self, repo: Option<&str>) -> Result<String> {
@@ -878,6 +899,7 @@ impl CodeIntelEngine {
                 // Invalidate caches for this repo only
                 self.query_cache.invalidate_for_repo(name);
                 self.index_repo(&path).await?;
+                let _ = self.save_index().await;
                 Ok(format!("Re-indexed repository: {}", name))
             }
             None => {
@@ -6279,7 +6301,7 @@ impl CodeIntelEngine {
 
         // Check for persisted index
         if let Some(ref store) = self.index_store {
-            let index_file = store.index_path(&repo_path);
+            let index_file = store.db_path(&repo_path);
             if index_file.exists() {
                 if let Ok(metadata) = std::fs::metadata(&index_file) {
                     output.push_str(&format!(
