@@ -41,6 +41,11 @@ pub struct CallEdge {
     /// Scope qualifier from the call site (e.g. "App" from `App::run()`)
     #[serde(default)]
     pub scope_hint: Option<String>,
+    /// Whether the target was resolved to a known function in the graph.
+    /// False when the callee name had no matching node — `get_callers` must
+    /// surface this instead of silently pretending the edge is complete.
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -181,6 +186,7 @@ impl CallGraph {
             kind,
             "function_item"
                 | "function_definition"
+                | "procedure_definition"
                 | "function_declaration"
                 | "method_definition"
                 | "method_declaration"
@@ -213,7 +219,7 @@ impl CallGraph {
 
         // Track current function scope
         let mut current_function: Option<String> = None;
-        self.walk_for_calls(&mut cursor, source, path, &mut current_function);
+        self.walk_for_calls(&mut cursor, source, path, &mut current_function, "");
 
         Ok(())
     }
@@ -224,6 +230,7 @@ impl CallGraph {
         source: &[u8],
         path: &str,
         current_function: &mut Option<String>,
+        parent_kind: &str,
     ) {
         loop {
             let node = cursor.node();
@@ -234,6 +241,7 @@ impl CallGraph {
                 kind,
                 "function_item"
                     | "function_definition"
+                    | "procedure_definition"
                     | "function_declaration"
                     | "method_definition"
                     | "method_declaration"
@@ -243,11 +251,14 @@ impl CallGraph {
                 }
             }
 
-            // Check for call expressions
-            if matches!(
+            // Check for call expressions. BSL `method_call` is a simple call
+            // (`Func()`); the one nested inside a `call_expression` (qualified
+            // `Module.Func()`) is handled by the parent, so skip it here.
+            let is_call = matches!(
                 kind,
                 "call_expression" | "call" | "method_call_expression" | "invocation_expression"
-            ) {
+            ) || (kind == "method_call" && parent_kind != "call_expression");
+            if is_call {
                 if let Some(ref caller_key) = current_function {
                     if let Some(edge) = self.extract_call_edge(node, source, path) {
                         // Resolve callee with scope hint for disambiguation
@@ -258,6 +269,7 @@ impl CallGraph {
                         if let Some(mut caller_node) = self.nodes.get_mut(caller_key.as_str()) {
                             let mut resolved_edge = edge.clone();
                             resolved_edge.target = callee_key.clone();
+                            resolved_edge.resolved = self.nodes.contains_key(&callee_key);
                             caller_node.calls.push(resolved_edge);
                         }
 
@@ -270,6 +282,7 @@ impl CallGraph {
                                 column: edge.column,
                                 call_type: edge.call_type,
                                 scope_hint: None,
+                                resolved: true,
                             });
                         }
                     }
@@ -291,7 +304,7 @@ impl CallGraph {
 
             // Recurse
             if cursor.goto_first_child() {
-                self.walk_for_calls(cursor, source, path, current_function);
+                self.walk_for_calls(cursor, source, path, current_function, node.kind());
                 cursor.goto_parent();
             }
 
@@ -376,6 +389,7 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
+                            resolved: self.nodes.contains_key(&callee_key),
                         });
                     }
                 }
@@ -394,6 +408,7 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
+                            resolved: true,
                         });
                     }
                 }
@@ -522,6 +537,18 @@ impl CallGraph {
                         call_type = CallType::StaticMethod;
                     }
                 }
+                "access" => {
+                    // BSL qualified call `Module.Func()`: `access` holds the
+                    // module name, used as the scope hint for resolution.
+                    scope_hint = self.get_last_identifier(child, source);
+                }
+                "method_call" => {
+                    // BSL `name: (identifier)` inside a `call_expression`.
+                    if let Some(method) = self.get_last_identifier(child, source) {
+                        target = Some(method);
+                        call_type = CallType::Method;
+                    }
+                }
                 _ => {}
             }
 
@@ -537,6 +564,7 @@ impl CallGraph {
             column: node.start_position().column + 1,
             call_type,
             scope_hint,
+            resolved: false,
         })
     }
 
@@ -1329,6 +1357,7 @@ mod tests {
             column: 5,
             call_type: CallType::Direct,
             scope_hint: None,
+            resolved: false,
         };
 
         graph
@@ -1345,6 +1374,7 @@ mod tests {
             column: edge.column,
             call_type: edge.call_type.clone(),
             scope_hint: None,
+            resolved: false,
         };
 
         graph
@@ -1382,6 +1412,7 @@ mod tests {
                     column: 5,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
                 CallEdge {
                     target: "caller2".to_string(),
@@ -1390,6 +1421,7 @@ mod tests {
                     column: 8,
                     call_type: CallType::Method,
                     scope_hint: None,
+                    resolved: false,
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -1449,6 +1481,7 @@ mod tests {
                     column: 5,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
                 CallEdge {
                     target: "callee2".to_string(),
@@ -1457,6 +1490,7 @@ mod tests {
                     column: 10,
                     call_type: CallType::StaticMethod,
                     scope_hint: None,
+                    resolved: false,
                 },
             ],
             called_by: Vec::new(),
@@ -1559,6 +1593,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1575,6 +1610,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1583,6 +1619,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1598,6 +1635,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: vec![CallEdge {
                 target: "b".to_string(),
@@ -1606,6 +1644,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1622,6 +1661,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1662,6 +1702,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1670,6 +1711,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1686,6 +1728,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1718,6 +1761,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1734,6 +1778,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1742,6 +1787,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1757,6 +1803,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: vec![CallEdge {
                 target: "b".to_string(),
@@ -1765,6 +1812,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1781,6 +1829,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1821,6 +1870,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1837,6 +1887,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1908,6 +1959,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
                 CallEdge {
                     target: "f2".to_string(),
@@ -1916,6 +1968,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
             ],
             called_by: vec![
@@ -1926,6 +1979,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
                 CallEdge {
                     target: "caller2".to_string(),
@@ -1934,6 +1988,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
                 CallEdge {
                     target: "caller3".to_string(),
@@ -1942,6 +1997,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    resolved: false,
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -1959,6 +2015,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -2018,6 +2075,7 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: vec![CallEdge {
                 target: "main".to_string(),
@@ -2026,6 +2084,7 @@ mod tests {
                 column: 3,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             metrics: FunctionMetrics {
                 loc: 10,
@@ -2103,6 +2162,7 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: false,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics {
@@ -2135,6 +2195,7 @@ mod tests {
             column: 10,
             call_type: CallType::Method,
             scope_hint: None,
+            resolved: false,
         };
 
         assert_eq!(edge.target, "target_func");
