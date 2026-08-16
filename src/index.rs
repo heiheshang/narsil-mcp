@@ -32,6 +32,17 @@ use crate::streaming::StreamingConfig;
 use crate::symbols::{Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
 
+/// Map a `SymbolKind` to a search `DocType` for per-symbol search documents.
+fn symbol_kind_to_doc_type(kind: &SymbolKind) -> DocType {
+    match kind {
+        SymbolKind::Function | SymbolKind::Constructor => DocType::Function,
+        SymbolKind::Method => DocType::Method,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait => DocType::Class,
+        SymbolKind::Struct => DocType::Struct,
+        _ => DocType::Other,
+    }
+}
+
 /// Metadata about an indexed repository
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoMetadata {
@@ -697,11 +708,33 @@ impl CodeIntelEngine {
                         .to_string_lossy()
                         .to_string();
 
+                    let has_parser_support = parsed.is_some();
                     if let Some(parsed) = parsed {
                         let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
 
                         for mut symbol in symbols {
                             symbol.file_path = relative_path.clone();
+
+                            // Index the symbol "card" (name + signature + doc) as
+                            // the search document — search returns the procedure,
+                            // not the whole module (Phase 4: document = function).
+                            let mut card = symbol.name.clone();
+                            if let Some(ref sig) = symbol.signature {
+                                card.push(' ');
+                                card.push_str(sig);
+                            }
+                            if let Some(ref doc) = symbol.doc_comment {
+                                card.push('\n');
+                                card.push_str(doc);
+                            }
+                            self.search_index.index_symbol(
+                                &relative_path,
+                                &symbol.name,
+                                &card,
+                                symbol_kind_to_doc_type(&symbol.kind),
+                                symbol.start_line,
+                                symbol.end_line,
+                            );
 
                             // Index symbol into embedding engine for similarity search
                             if let Some(ref sig) = symbol.signature {
@@ -738,10 +771,16 @@ impl CodeIntelEngine {
                         }
                     }
 
-                    // Cache and index all textual files, even without parser support.
+                    // Cache content for all textual files.
                     self.file_cache
                         .insert(file_path.clone(), Arc::new(content.clone()));
-                    self.search_index.index_file(&relative_path, &content);
+
+                    // Index the whole file into search only when the parser
+                    // extracted no symbols (text-only / unsupported languages).
+                    // Parsed files index per-symbol cards above instead.
+                    if !has_parser_support {
+                        self.search_index.index_file(&relative_path, &content);
+                    }
 
                     for document in collect_onec_normalized_documents(path, file_path.as_path()) {
                         self.index_normalized_document(&document);

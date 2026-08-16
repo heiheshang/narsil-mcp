@@ -552,6 +552,20 @@ impl ConcurrentSearchIndex {
         self.inner.write().index_file(file_path, content);
     }
 
+    pub fn index_symbol(
+        &self,
+        file_path: &str,
+        name: &str,
+        content: &str,
+        doc_type: DocType,
+        start_line: usize,
+        end_line: usize,
+    ) {
+        self.inner
+            .write()
+            .index_symbol(file_path, name, content, doc_type, start_line, end_line);
+    }
+
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
         self.inner.read().search(query, max_results)
     }

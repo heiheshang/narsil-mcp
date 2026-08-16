@@ -637,6 +637,51 @@ fn test_search_code() -> Result<()> {
 }
 
 #[test]
+fn test_semantic_search_returns_function_not_file() -> Result<()> {
+    // Phase 4: the search index holds per-symbol cards, so semantic search
+    // returns a procedure with a function-scoped line range, not a whole file.
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn calculate_total(items: &[i32]) -> i32 {
+            items.iter().sum()
+        }
+
+        pub fn unrelated_helper() -> String {
+            String::from("nothing to do with totals")
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "semantic_search",
+        json!({
+            "query": "calculate_total",
+            "max_results": 5
+        }),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    // The top hit is the function card, not the whole 8-line file.
+    assert!(content.contains("calculate_total"), "got:\n{content}");
+    assert!(
+        content.contains("Lines 2-4"),
+        "expected a function-scoped line range (2-4), got:\n{content}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_unsupported_text_files_are_indexed_for_search_and_chunks() -> Result<()> {
     let repo = TestRepo::new()?;
     let xml_path = repo.path().join("onec/Configuration.xml");
