@@ -420,3 +420,62 @@ pub fn start() {
         path
     );
 }
+
+#[test]
+fn test_bsl_common_module_call_resolution() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    // Common module exports a function.
+    let module_code = r#"
+Функция Метод(Параметр) Экспорт
+    Возврат Параметр;
+КонецФункции
+"#;
+    // A document module calls it via the qualified `ОбщийМодуль.Метод()` form.
+    let doc_code = r#"
+Процедура ОбработкаПроведения(Отказ) Экспорт
+    Результат = ОбщийМодуль.Метод(1);
+КонецПроцедуры
+"#;
+
+    let module_tree = parser
+        .parse_to_tree(
+            Path::new("CommonModules/ОбщийМодуль/Ext/Module.bsl"),
+            module_code,
+        )
+        .unwrap();
+    let doc_tree = parser
+        .parse_to_tree(
+            Path::new("Documents/Заказ/Ext/ObjectModule.bsl"),
+            doc_code,
+        )
+        .unwrap();
+
+    let files = vec![
+        (
+            "CommonModules/ОбщийМодуль/Ext/Module.bsl".to_string(),
+            module_code.to_string(),
+            module_tree,
+        ),
+        (
+            "Documents/Заказ/Ext/ObjectModule.bsl".to_string(),
+            doc_code.to_string(),
+            doc_tree,
+        ),
+    ];
+
+    call_graph.build_from_files(&files).unwrap();
+
+    // The exported procedure resolves its cross-module caller.
+    let callers = call_graph.get_callers("Метод");
+    assert!(!callers.is_empty(), "Метод should have callers");
+    assert!(
+        callers
+            .iter()
+            .any(|e| e.target.ends_with("::ОбработкаПроведения")),
+        "caller should be ОбработкаПроведения, got: {:?}",
+        callers.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+    assert!(callers.iter().all(|e| e.resolved), "cross-module call should resolve");
+}
