@@ -180,6 +180,33 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// Pack a dense vector into sparse `(index, value)` pairs, dropping zeros.
+pub fn to_sparse(v: &[f32]) -> Vec<(u32, f32)> {
+    v.iter()
+        .enumerate()
+        .filter(|(_, &x)| x != 0.0)
+        .map(|(i, &x)| (i as u32, x))
+        .collect()
+}
+
+/// Unpack a sparse vector back into a dense one of the given dimension.
+pub fn to_dense(sparse: &[(u32, f32)], dim: usize) -> Vec<f32> {
+    let mut v = vec![0.0; dim];
+    for &(i, x) in sparse {
+        v[i as usize] = x;
+    }
+    v
+}
+
+/// Cosine similarity between a dense (normalized) query and a sparse
+/// (normalized) document — dot product over the document's non-zero entries.
+pub fn sparse_cosine(query: &[f32], sparse: &[(u32, f32)]) -> f32 {
+    sparse
+        .iter()
+        .map(|&(i, x)| query.get(i as usize).copied().unwrap_or(0.0) * x)
+        .sum()
+}
+
 /// Statistics about the embedding model
 #[derive(Debug, Clone)]
 pub struct EmbeddingStats {
@@ -196,7 +223,11 @@ pub struct EmbeddedDocument {
     pub content: String,
     pub start_line: usize,
     pub end_line: usize,
-    pub embedding: Vec<f32>,
+    /// Sparse embedding: `(dimension_index, value)` for non-zero entries. TF-IDF
+    /// vectors are ~99% zeros (a snippet hits few vocabulary terms), so storing
+    /// them sparse cuts the per-symbol cost from ~4 KB (dense 1000-dim) to a
+    /// few dozen bytes.
+    pub embedding: Vec<(u32, f32)>,
 }
 
 /// A similarity search result
@@ -239,7 +270,7 @@ impl VectorStore {
             .documents
             .iter()
             .map(|doc| {
-                let similarity = cosine_similarity(query_embedding, &doc.embedding);
+                let similarity = sparse_cosine(query_embedding, &doc.embedding);
                 SimilarityResult {
                     document: doc.clone(),
                     similarity,
@@ -363,8 +394,8 @@ impl EmbeddingEngine {
         // Update IDF statistics
         self.provider.write().add_document(&content);
 
-        // Generate embedding
-        let embedding = self.provider.read().embed(&content);
+        // Generate embedding (dense), then pack it sparse before storing.
+        let embedding = to_sparse(&self.provider.read().embed(&content));
 
         // Store the embedded document
         self.store.add(EmbeddedDocument {
@@ -386,7 +417,8 @@ impl EmbeddingEngine {
     /// Find code similar to a specific document
     pub fn find_similar_to_doc(&self, doc_id: &str, max_results: usize) -> Vec<SimilarityResult> {
         if let Some(doc) = self.store.get(doc_id) {
-            self.store.find_similar(&doc.embedding, max_results)
+            let query = to_dense(&doc.embedding, self.provider.read().dimension());
+            self.store.find_similar(&query, max_results)
         } else {
             Vec::new()
         }
@@ -490,7 +522,7 @@ mod tests {
             content: "fn hello()".to_string(),
             start_line: 1,
             end_line: 5,
-            embedding: vec![1.0, 0.0, 0.0],
+            embedding: vec![(0, 1.0)],
         };
 
         let doc2 = EmbeddedDocument {
@@ -499,7 +531,7 @@ mod tests {
             content: "fn goodbye()".to_string(),
             start_line: 10,
             end_line: 15,
-            embedding: vec![0.9, 0.1, 0.0],
+            embedding: vec![(0, 0.9), (1, 0.1)],
         };
 
         store.add(doc1);
@@ -646,7 +678,7 @@ mod tests {
             content: "fn a()".to_string(),
             start_line: 1,
             end_line: 1,
-            embedding: vec![1.0],
+            embedding: vec![(0, 1.0)],
         });
         store.add(EmbeddedDocument {
             id: "c".to_string(),
@@ -654,7 +686,7 @@ mod tests {
             content: "fn c()".to_string(),
             start_line: 1,
             end_line: 1,
-            embedding: vec![1.0],
+            embedding: vec![(0, 1.0)],
         });
 
         // Test that find_similar doesn't panic (uses the fixed sort internally)
@@ -671,7 +703,7 @@ mod tests {
                 content: format!("fn {}()", id),
                 start_line: 1,
                 end_line: 1,
-                embedding: vec![1.0],
+                embedding: vec![(0, 1.0)],
             },
             similarity: sim,
         };
