@@ -10,6 +10,16 @@
 
 A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 90 specialized tools.
 
+## Fork features
+
+This is a fork of [postrv/narsil-mcp](https://github.com/postrv/narsil-mcp). On top of upstream it adds:
+
+- **MCP over HTTP** — a `streamable-http` transport (`POST /mcp`) alongside stdio, so one server process can serve many clients.
+- **SQLite-backed index store** — a real on-disk store (WAL, one `.db` per repo) replacing the whole-index postcard snapshot; the index is auto-saved after indexing.
+- **Streaming indexing** — files are processed in windows and the call graph is built in two streamed passes, so peak memory no longer scales with the whole corpus.
+- **1C:Enterprise (BSL) support** — parses 1С/BSL modules (`.bsl`) via tree-sitter-bsl and normalizes 1С XML metadata into searchable documents.
+- **Leaner search** — the full-text index and TF-IDF embeddings store only what's needed, keeping memory bounded on large repositories.
+
 ## Why narsil-mcp?
 
 | Feature | narsil-mcp | XRAY | Serena | GitHub MCP |
