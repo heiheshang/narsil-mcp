@@ -156,8 +156,10 @@ pub struct CodeIntelEngine {
     repos: DashMap<String, RepoMetadata>,
     /// Symbol index: repo -> symbols
     symbols: DashMap<String, Vec<Symbol>>,
-    /// File content cache (path -> content)
-    file_cache: DashMap<PathBuf, Arc<String>>,
+    /// Set of indexed file paths (absolute). Raw content is NOT cached here —
+    /// it is read from disk on demand via `content_for`. Holds ~96k paths
+    /// (~10 MB) instead of ~2.8 GB of whole-file text (lever 2).
+    file_cache: DashMap<PathBuf, ()>,
     /// Synthetic normalized documents indexed separately from raw files
     normalized_docs: DashMap<String, Vec<NormalizedDocument>>,
     /// Language parser
@@ -771,9 +773,9 @@ impl CodeIntelEngine {
                         }
                     }
 
-                    // Cache content for all textual files.
-                    self.file_cache
-                        .insert(file_path.clone(), Arc::new(content.clone()));
+                    // Record the file as indexed (content is read from disk on
+                    // demand via `content_for`, not cached here).
+                    self.file_cache.insert(file_path.clone(), ());
 
                     // Index the whole file into search only when the parser
                     // extracted no symbols (text-only / unsupported languages).
@@ -1485,7 +1487,9 @@ impl CodeIntelEngine {
                     }
                 }
 
-                let content = entry.value();
+                let Some(content) = self.content_for(entry.key()) else {
+                    continue;
+                };
                 let lines: Vec<&str> = content.lines().collect();
 
                 // Simple text search with scoring
@@ -1719,7 +1723,9 @@ impl CodeIntelEngine {
                 .to_string_lossy()
                 .to_string();
 
-            let content = entry.value();
+            let Some(content) = self.content_for(entry.key()) else {
+                continue;
+            };
             for (line_num, line) in content.lines().enumerate() {
                 if line.contains(symbol) {
                     references.push((rel_path.clone(), line_num + 1, line.trim().to_string()));
@@ -1853,7 +1859,9 @@ impl CodeIntelEngine {
                     continue;
                 }
 
-                let content = entry.value();
+                let Some(content) = self.content_for(entry.key()) else {
+                    continue;
+                };
                 if content.contains(module_name) {
                     let rel_path = fp.strip_prefix(&repo_path).unwrap_or(fp).to_string_lossy();
                     output.push_str(&format!("- `{}`\n", rel_path));
@@ -1906,12 +1914,7 @@ impl CodeIntelEngine {
             rss_kb as f64 / 1024.0
         );
 
-        let fc_bytes: usize = self.file_cache.iter().map(|e| e.value().len()).sum();
-        info!(
-            "[mem] file_cache: {} files, {:.1} MB content",
-            self.file_cache.len(),
-            fc_bytes as f64 / 1e6
-        );
+        info!("[mem] file_cache: {} files (paths only)", self.file_cache.len());
 
         let (sym_count, sym_bytes) = {
             let mut c = 0usize;
@@ -2193,9 +2196,8 @@ impl CodeIntelEngine {
                             }
                         }
 
-                        // Update file cache
-                        self.file_cache
-                            .insert(change.path.clone(), Arc::new(content.clone()));
+                        // Record the file as indexed (content read from disk).
+                        self.file_cache.insert(change.path.clone(), ());
 
                         // Update search index
                         self.search_index.index_file(&rel_path, &content);
@@ -2718,6 +2720,13 @@ impl CodeIntelEngine {
     // === Semantic Search ===
 
     /// Perform semantic code search using BM25 ranking
+    /// Read a file's content from disk. Raw content is no longer cached in
+    /// memory (lever 2); this is the on-demand reader for all former
+    /// `file_cache` content lookups.
+    fn content_for(&self, path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
     /// Regenerate a search snippet from `file_cache` (fallback: disk) for a
     /// document whose raw text is no longer stored in the persistent index.
     fn snippet_for_document(
@@ -2729,22 +2738,14 @@ impl CodeIntelEngine {
     ) -> String {
         for repo_path in &self.repo_paths {
             let abs = repo_path.join(file_path);
-            let content = self
-                .file_cache
-                .get(&abs)
-                .map(|c| c.clone())
-                .or_else(|| std::fs::read_to_string(&abs).ok().map(std::sync::Arc::new));
-            if let Some(c) = content {
-                let lines: Vec<&str> = c.lines().collect();
-                let s = start_line.saturating_sub(1).min(lines.len());
-                let e = end_line.min(lines.len()).max(s);
-                let range = lines[s..e].join("\n");
-                return crate::search::SearchIndex::generate_snippet(
-                    &range,
-                    matched_terms,
-                    start_line,
-                );
-            }
+            let Some(content) = self.content_for(&abs) else {
+                continue;
+            };
+            let lines: Vec<&str> = content.lines().collect();
+            let s = start_line.saturating_sub(1).min(lines.len());
+            let e = end_line.min(lines.len()).max(s);
+            let range = lines[s..e].join("\n");
+            return crate::search::SearchIndex::generate_snippet(&range, matched_terms, start_line);
         }
         String::new()
     }
@@ -4099,12 +4100,14 @@ impl CodeIntelEngine {
                     continue;
                 }
 
-                let content = file_entry.value();
+                let Some(content) = self.content_for(file_entry.key()) else {
+                    continue;
+                };
                 let file_path_str = file_path.to_string_lossy().to_string();
 
                 // Chunk the file (catch panics from malformed UTF-8 boundaries)
                 let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    chunker.chunk_file(content, &file_path_str)
+                    chunker.chunk_file(&content, &file_path_str)
                 })) {
                     Ok(chunks) => chunks,
                     Err(_) => {
@@ -4254,11 +4257,13 @@ impl CodeIntelEngine {
                     continue;
                 }
 
-                let content = file_entry.value();
+                let Some(content) = self.content_for(file_entry.key()) else {
+                    continue;
+                };
                 let file_path_str = file_path.to_string_lossy().to_string();
 
                 let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    chunker.chunk_file(content, &file_path_str)
+                    chunker.chunk_file(&content, &file_path_str)
                 })) {
                     Ok(chunks) => chunks,
                     Err(_) => {
@@ -4488,11 +4493,13 @@ impl CodeIntelEngine {
             }
 
             file_count += 1;
-            let content = file_entry.value();
+            let Some(content) = self.content_for(file_entry.key()) else {
+                continue;
+            };
             let file_path_str = file_path.to_string_lossy().to_string();
 
             let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                chunker.chunk_file(content, &file_path_str)
+                chunker.chunk_file(&content, &file_path_str)
             })) {
                 Ok(chunks) => chunks,
                 Err(_) => {
@@ -4642,11 +4649,10 @@ impl CodeIntelEngine {
             .collect();
 
         for file_path in &files_to_analyze {
-            if let Some(content_entry) = self.file_cache.get(file_path) {
-                let content = content_entry.value();
+            if let Some(content) = self.content_for(file_path) {
                 let file_str = file_path.to_string_lossy();
                 let scan_content = if exclude_tests {
-                    strip_inline_test_code(&file_str, content)
+                    strip_inline_test_code(&file_str, &content)
                 } else {
                     std::borrow::Cow::Borrowed(content.as_str())
                 };
@@ -4782,9 +4788,7 @@ impl CodeIntelEngine {
         let full_path = validate_path(&repo_path, path)?;
 
         let content = self
-            .file_cache
-            .get(&full_path)
-            .map(|entry| entry.value().clone())
+            .content_for(&full_path)
             .ok_or_else(|| anyhow!("File not found: {}", path))?;
 
         let result = crate::taint::analyze_code(&content, path);
@@ -4889,11 +4893,10 @@ impl CodeIntelEngine {
             .collect();
 
         for file_path in &files_to_analyze {
-            if let Some(content_entry) = self.file_cache.get(file_path) {
-                let content = content_entry.value();
+            if let Some(content) = self.content_for(file_path) {
                 let file_str = file_path.to_string_lossy();
                 let scan_content = if exclude_tests {
-                    strip_inline_test_code(&file_str, content)
+                    strip_inline_test_code(&file_str, &content)
                 } else {
                     std::borrow::Cow::Borrowed(content.as_str())
                 };
@@ -5013,7 +5016,7 @@ impl CodeIntelEngine {
 
         // Analyze all supported files
         // Always exclude security exemplar files (rule definitions) to avoid false positives
-        let files: Vec<(std::path::PathBuf, Arc<String>)> = self
+        let files: Vec<(std::path::PathBuf, String)> = self
             .file_cache
             .iter()
             .filter(|entry| entry.key().starts_with(&repo_path))
@@ -5028,7 +5031,11 @@ impl CodeIntelEngine {
                     || path_str.ends_with(".go")
                     || path_str.ends_with(".rs")
             })
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| {
+                self.content_for(entry.key())
+                    .map(|c| (entry.key().clone(), c))
+            })
+            .flatten()
             .collect();
 
         for (file_path, content) in &files {
@@ -5231,7 +5238,8 @@ impl CodeIntelEngine {
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
-            .map(|e| (e.key().clone(), e.value().clone()))
+            .map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
+            .flatten()
             .collect();
 
         // Parse ruleset tags
@@ -5358,7 +5366,8 @@ impl CodeIntelEngine {
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
-            .map(|e| (e.key().clone(), e.value().clone()))
+            .map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
+            .flatten()
             .collect();
 
         let mut findings: Vec<_> = files
@@ -5421,7 +5430,8 @@ impl CodeIntelEngine {
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
-            .map(|e| (e.key().clone(), e.value().clone()))
+            .map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
+            .flatten()
             .collect();
 
         let mut findings: Vec<_> = files
@@ -5582,9 +5592,7 @@ impl CodeIntelEngine {
 
         // Get file content
         let content = self
-            .file_cache
-            .get(&full_path)
-            .map(|entry| entry.value().clone())
+            .content_for(&full_path)
             .ok_or_else(|| anyhow!("File not found: {}", path))?;
 
         let file_str = full_path.to_string_lossy();
@@ -6582,11 +6590,13 @@ impl CodeIntelEngine {
         // Search for usages in files
         for entry in self.file_cache.iter() {
             let path = entry.key();
-            let content = entry.value();
 
             if !path.starts_with(&repo_path) {
                 continue;
             }
+            let Some(content) = self.content_for(path) else {
+                continue;
+            };
 
             let rel_path = path
                 .strip_prefix(&repo_path)
@@ -6970,7 +6980,7 @@ impl CodeIntelEngine {
         let full_path = validate_path(&repo_meta.path, path)?;
 
         if full_path.is_dir() {
-            let mut files: Vec<(PathBuf, String, String, Arc<String>)> = self
+            let mut files: Vec<(PathBuf, String, String, String)> = self
                 .file_cache
                 .iter()
                 .filter(|entry| path_is_within_repo(entry.key(), &full_path))
@@ -6990,11 +7000,12 @@ impl CodeIntelEngine {
                         return None;
                     }
 
+                    let content = self.content_for(entry.key())?;
                     Some((
                         entry.key().clone(),
                         display_path,
                         language,
-                        entry.value().clone(),
+                        content,
                     ))
                 })
                 .collect();
@@ -7377,13 +7388,8 @@ impl CodeIntelEngine {
                 break;
             }
 
-            // Try the file_cache first, fall back to disk read
             let abs_path = repo_path.join(&rel_path);
-            let content = if let Some(cached) = self.file_cache.get(&abs_path) {
-                cached.clone()
-            } else if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                std::sync::Arc::new(content)
-            } else {
+            let Some(content) = self.content_for(&abs_path) else {
                 continue;
             };
 
@@ -7460,7 +7466,9 @@ impl CodeIntelEngine {
                 .to_string_lossy()
                 .to_string();
 
-            let content = entry.value();
+            let Some(content) = self.content_for(entry.key()) else {
+                continue;
+            };
             for (line_num, line) in content.lines().enumerate() {
                 if references.len() >= max_refs {
                     break;
