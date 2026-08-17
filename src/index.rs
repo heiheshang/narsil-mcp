@@ -1812,7 +1812,7 @@ impl CodeIntelEngine {
                 path,
                 line,
                 if content.len() > 80 {
-                    &content[..80]
+                    &content[..content.floor_char_boundary(80)]
                 } else {
                     content
                 }
@@ -6748,7 +6748,11 @@ impl CodeIntelEngine {
                     symbol.name,
                     symbol.kind,
                     symbol.start_line,
-                    if sig.len() > 50 { &sig[..50] } else { sig }
+                    if sig.len() > 50 {
+                        &sig[..sig.floor_char_boundary(50)]
+                    } else {
+                        sig
+                    }
                 ));
             }
 
@@ -6849,7 +6853,7 @@ impl CodeIntelEngine {
                         )
                     });
                 let snippet = if content.len() > 500 {
-                    format!("{}...", &content[..500])
+                    format!("{}...", &content[..content.floor_char_boundary(500)])
                 } else {
                     content
                 };
@@ -6943,7 +6947,7 @@ impl CodeIntelEngine {
                         )
                     });
                 let snippet = if content.len() > 300 {
-                    format!("{}...", &content[..300])
+                    format!("{}...", &content[..content.floor_char_boundary(300)])
                 } else {
                     content
                 };

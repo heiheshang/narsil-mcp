@@ -381,7 +381,7 @@ impl ToolHandler for ImportCcgHandler {
                 "size_bytes": imported.size_bytes,
                 "was_compressed": imported.was_compressed,
                 "preview": if imported.content.len() > 500 {
-                    format!("{}...", &imported.content[..500])
+                    format!("{}...", &imported.content[..imported.content.floor_char_boundary(500)])
                 } else {
                     imported.content.clone()
                 }
@@ -417,7 +417,7 @@ impl ToolHandler for ImportCcgHandler {
                 "size_bytes": imported.size_bytes,
                 "was_compressed": imported.was_compressed,
                 "preview": if imported.content.len() > 500 {
-                    format!("{}...", &imported.content[..500])
+                    format!("{}...", &imported.content[..imported.content.floor_char_boundary(500)])
                 } else {
                     imported.content.clone()
                 }

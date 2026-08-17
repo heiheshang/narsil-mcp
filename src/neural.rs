@@ -494,7 +494,7 @@ impl EmbeddingBackend for ApiEmbedder {
         if !status.is_success() {
             // Redact potential sensitive info from error messages
             let safe_text = if text.len() > 500 {
-                format!("{}... (truncated)", &text[..500])
+                format!("{}... (truncated)", &text[..text.floor_char_boundary(500)])
             } else {
                 text.clone()
             };
