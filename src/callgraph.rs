@@ -1242,6 +1242,36 @@ impl CallGraph {
         self.nodes.len()
     }
 
+    /// Approximate memory footprint (diagnostics): (nodes, edges, approx_bytes).
+    pub fn memory_stats(&self) -> (usize, usize, usize) {
+        let mut edges = 0usize;
+        let mut bytes = 0usize;
+        for node in self.nodes.iter() {
+            bytes += node.name.len() + node.file_path.len();
+            for e in node.calls.iter() {
+                edges += 1;
+                bytes += e.target.len()
+                    + e.file_path.len()
+                    + e.scope_hint.as_deref().map_or(0, str::len)
+                    + 24;
+            }
+            for e in node.called_by.iter() {
+                edges += 1;
+                bytes += e.target.len()
+                    + e.file_path.len()
+                    + e.scope_hint.as_deref().map_or(0, str::len)
+                    + 24;
+            }
+        }
+        for e in self.name_index.iter() {
+            bytes += e.key().len() + e.value().iter().map(|s| s.len() + 24).sum::<usize>();
+        }
+        for e in self.file_functions.iter() {
+            bytes += e.key().len() + e.value().iter().map(|s| s.len() + 24).sum::<usize>();
+        }
+        (self.nodes.len(), edges, bytes)
+    }
+
     /// Get all nodes (for iteration)
     pub fn iter_nodes(
         &self,
