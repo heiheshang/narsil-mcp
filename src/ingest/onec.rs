@@ -21,6 +21,7 @@ pub enum DocumentKind {
     OneCObjectBundle,
     OneCFormModuleBundle,
     OneCFormComposition,
+    OneCDataComposition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +104,22 @@ pub struct OneCFormComposition {
     pub elements: Vec<OneCFormElement>,
 }
 
+/// A data-composition (СКД) data set: name, kind, fields, and the query text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCDataSet {
+    pub name: String,
+    pub kind: String,
+    pub fields: Vec<String>,
+    /// The 1C query text (`ВЫБРАТЬ … ИЗ Справочник.X …`) — carries the object references.
+    pub query: Option<String>,
+}
+
+/// A data-composition schema (`Ext/Template.xml`, root `<DataCompositionSchema>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCDataComposition {
+    pub data_sets: Vec<OneCDataSet>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OneCIngestor;
 
@@ -130,7 +147,13 @@ impl OneCIngestor {
     ) -> Result<Vec<NormalizedDocument>> {
         let summary = match self.parse_metadata_summary(repo_root, metadata_path)? {
             Some(summary) => summary,
-            None => return self.ingest_form_composition(repo_root, metadata_path),
+            None => {
+                let form_docs = self.ingest_form_composition(repo_root, metadata_path)?;
+                if !form_docs.is_empty() {
+                    return Ok(form_docs);
+                }
+                return self.ingest_data_composition(repo_root, metadata_path);
+            }
         };
 
         let mut metadata = summary.properties.clone();
@@ -220,6 +243,63 @@ impl OneCIngestor {
             source_paths: vec![relative_path],
             language: "text".to_string(),
             content: render_form_composition_text(&form_name, &form),
+            metadata,
+        };
+
+        Ok(vec![document])
+    }
+
+    /// Parse a data-composition schema (`Ext/Template.xml`, root
+    /// `<DataCompositionSchema>`) into a searchable document: data-set names,
+    /// fields, and the 1C query texts that reference metadata objects.
+    fn ingest_data_composition(
+        &self,
+        repo_root: &Path,
+        metadata_path: &Path,
+    ) -> Result<Vec<NormalizedDocument>> {
+        let xml = fs::read_to_string(metadata_path).with_context(|| {
+            format!(
+                "Failed to read 1C data-composition file {}",
+                metadata_path.display()
+            )
+        })?;
+        let Some(schema) = parse_data_composition(&xml) else {
+            return Ok(Vec::new());
+        };
+
+        let relative_path = metadata_path
+            .strip_prefix(repo_root)
+            .unwrap_or(metadata_path)
+            .to_path_buf();
+
+        // .../Templates/<Name>/Ext/Template.xml -> <Name>.
+        let schema_name = metadata_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| relative_path.to_string_lossy().to_string());
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("object_type".to_string(), "DataCompositionSchema".to_string());
+        metadata.insert("object_name".to_string(), schema_name.clone());
+        metadata.insert(
+            "relative_path".to_string(),
+            relative_path.to_string_lossy().to_string(),
+        );
+        metadata.insert(
+            "data_set_count".to_string(),
+            schema.data_sets.len().to_string(),
+        );
+
+        let document = NormalizedDocument {
+            id: synthetic_summary_id(&relative_path),
+            title: format!("1C Data Composition: {schema_name}"),
+            kind: DocumentKind::OneCDataComposition,
+            origin: DocumentOrigin::File(metadata_path.to_path_buf()),
+            source_paths: vec![relative_path],
+            language: "text".to_string(),
+            content: render_data_composition_text(&schema_name, &schema),
             metadata,
         };
 
@@ -722,6 +802,94 @@ fn parse_form_composition(xml: &str) -> Option<OneCFormComposition> {
     saw_form_root.then_some(model)
 }
 
+/// Parse a data-composition schema XML (`Ext/Template.xml`, root
+/// `<DataCompositionSchema>`). Returns `None` when the XML is not a СКД schema.
+/// Extracts data-set names/kinds, field names, and the 1C query texts.
+fn parse_data_composition(xml: &str) -> Option<OneCDataComposition> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut model = OneCDataComposition::default();
+    let mut buf = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut current: Option<OneCDataSet> = None;
+    // Whether each open `<field>` is a name element (no `xsi:type`) vs a container.
+    let mut field_is_name: Vec<bool> = Vec::new();
+    let mut saw_root = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = local_name(e.name().as_ref());
+                let type_attr = e
+                    .attributes()
+                    .flatten()
+                    .find(|attr| local_name(attr.key.as_ref()) == "type")
+                    .and_then(|attr| String::from_utf8(attr.value.into_owned()).ok())
+                    .and_then(|ty| ty.rsplit(':').next().map(str::to_string));
+
+                if name == "DataCompositionSchema" && stack.is_empty() {
+                    saw_root = true;
+                } else if name == "dataSet" {
+                    current = Some(OneCDataSet {
+                        name: String::new(),
+                        kind: type_attr.unwrap_or_default(),
+                        fields: Vec::new(),
+                        query: None,
+                    });
+                } else if name == "field" {
+                    field_is_name.push(type_attr.is_none());
+                }
+                stack.push(name);
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.decode().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let top = stack.last().map(String::as_str);
+                if top == Some("query") {
+                    if let Some(data_set) = current.as_mut() {
+                        data_set.query = Some(match data_set.query.take() {
+                            None => text,
+                            Some(previous) => format!("{previous} {text}"),
+                        });
+                    }
+                } else if top == Some("field") && field_is_name.last() == Some(&true) {
+                    if let Some(data_set) = current.as_mut() {
+                        data_set.fields.push(text);
+                    }
+                } else if top == Some("name") && current.is_some() {
+                    if let Some(data_set) = current.as_mut() {
+                        data_set.name = text;
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = local_name(e.name().as_ref());
+                match name.as_str() {
+                    "dataSet" => {
+                        if let Some(data_set) = current.take() {
+                            model.data_sets.push(data_set);
+                        }
+                    }
+                    "field" => {
+                        field_is_name.pop();
+                    }
+                    _ => {}
+                }
+                stack.pop();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    saw_root.then_some(model)
+}
+
 fn discover_module_links(repo_root: &Path, metadata_path: &Path) -> Vec<(String, PathBuf)> {
     let mut links = Vec::new();
     let Some(metadata_dir) = metadata_path.parent() else {
@@ -934,6 +1102,33 @@ fn render_form_composition_text(form_name: &str, form: &OneCFormComposition) -> 
             lines.push(line);
             for (event, handler) in &element.handlers {
                 lines.push(format!("      - {event} -> {handler}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Render a data-composition schema into searchable plain text: data-set names,
+/// field names, and the 1C query texts (which carry the metadata-object references).
+fn render_data_composition_text(schema_name: &str, schema: &OneCDataComposition) -> String {
+    let mut lines = vec![format!("1C Data Composition: {schema_name}")];
+
+    for data_set in &schema.data_sets {
+        let mut header = format!("Data set: {}", data_set.name);
+        if !data_set.kind.is_empty() {
+            header.push_str(&format!(" ({})", data_set.kind));
+        }
+        lines.push(header);
+
+        if !data_set.fields.is_empty() {
+            lines.push(format!("  Fields ({}): {}", data_set.fields.len(), data_set.fields.join(", ")));
+        }
+
+        if let Some(query) = &data_set.query {
+            lines.push("  Query:".to_string());
+            for query_line in query.lines() {
+                lines.push(format!("    {query_line}"));
             }
         }
     }
@@ -1314,6 +1509,53 @@ mod tests {
                 "OnChange".to_string(),
                 "ИнформОстаткиОтправлятьВсеПриИзменении".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn parses_data_composition_schema() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema"
+      xmlns:v8="http://v8.1c.ru/8.1/data/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dataSet xsi:type="DataSetObject">
+    <name>НаборДанных1</name>
+    <field xsi:type="DataSetFieldField">
+      <dataPath>Заказ</dataPath>
+      <field>Заказ</field>
+      <title xsi:type="v8:LocalStringType">
+        <v8:item><v8:lang>ru</v8:lang><v8:content>Заказ</v8:content></v8:item>
+      </title>
+    </field>
+    <field xsi:type="DataSetFieldField">
+      <dataPath>ЗаказНомер</dataPath>
+      <field>ЗаказНомер</field>
+    </field>
+  </dataSet>
+  <dataSet xsi:type="DataSetQuery">
+    <name>Запрос</name>
+    <query>ВЫБРАТЬ Номенклатура.Наименование ИЗ Справочник.Номенклатура КАК Номенклатура</query>
+  </dataSet>
+</DataCompositionSchema>"#;
+
+        let schema = parse_data_composition(xml).expect("schema should be parsed");
+        assert_eq!(schema.data_sets.len(), 2);
+
+        let object_set = &schema.data_sets[0];
+        assert_eq!(object_set.name, "НаборДанных1");
+        assert_eq!(object_set.kind, "DataSetObject");
+        assert_eq!(
+            object_set.fields,
+            vec!["Заказ".to_string(), "ЗаказНомер".to_string()]
+        );
+        assert!(object_set.query.is_none());
+
+        let query_set = &schema.data_sets[1];
+        assert_eq!(query_set.name, "Запрос");
+        assert_eq!(query_set.kind, "DataSetQuery");
+        assert_eq!(
+            query_set.query.as_deref(),
+            Some("ВЫБРАТЬ Номенклатура.Наименование ИЗ Справочник.Номенклатура КАК Номенклатура")
         );
     }
 
