@@ -281,10 +281,15 @@ impl CallGraph {
                             self.resolve_callee(&edge.target, path, edge.scope_hint.as_deref());
 
                         // Add to caller's outgoing calls (with resolved key as target)
+                        // Compute `resolved` *before* taking the caller's write
+                        // lock: `contains_key` takes a read lock on the callee's
+                        // shard, and a self-call (caller == callee) would
+                        // otherwise deadlock (read-under-write on one shard).
+                        let resolved = self.nodes.contains_key(&callee_key);
                         if let Some(mut caller_node) = self.nodes.get_mut(caller_key.as_str()) {
                             let mut resolved_edge = edge.clone();
                             resolved_edge.target = callee_key.clone();
-                            resolved_edge.resolved = self.nodes.contains_key(&callee_key);
+                            resolved_edge.resolved = resolved;
                             caller_node.calls.push(resolved_edge);
                         }
 
@@ -394,6 +399,10 @@ impl CallGraph {
                 let callee_key = self.resolve_callee(ident, caller_file, None);
 
                 // Add to caller's outgoing calls
+                // Compute `resolved` *before* taking the caller's write lock
+                // (see walk_for_calls — read-under-write on one shard deadlocks
+                // when caller and callee hash to the same shard).
+                let resolved = self.nodes.contains_key(&callee_key);
                 if let Some(mut caller_node) = self.nodes.get_mut(caller_key) {
                     // Avoid duplicate edges
                     if !caller_node.calls.iter().any(|c| c.target == callee_key) {
@@ -404,7 +413,7 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
-                            resolved: self.nodes.contains_key(&callee_key),
+                            resolved,
                         });
                     }
                 }
