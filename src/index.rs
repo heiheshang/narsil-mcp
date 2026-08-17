@@ -741,7 +741,7 @@ impl CodeIntelEngine {
                             // Index symbol into embedding engine for similarity search
                             if let Some(ref sig) = symbol.signature {
                                 let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                                self.embedding_engine.index_snippet(
+                                self.embedding_engine.index_snippet_embed_only(
                                     symbol_id.clone(),
                                     relative_path.clone(),
                                     sig.clone(),
@@ -934,17 +934,20 @@ impl CodeIntelEngine {
         let end_line = content.lines().count();
         let term_freq = crate::search::count_terms(&crate::search::tokenize_code(&content));
 
+        // Raw text is NOT retained: display re-renders it from `normalized_docs`
+        // on demand (see `normalized_doc_content_by_id`). Storing it here and in
+        // the embedding engine doubled ~1 GB of redundant content on the 1C dump.
         self.search_index.add_document(SearchDocument {
             id: document.id.clone(),
             file_path: file_path.clone(),
-            content: content.clone(),
+            content: String::new(),
             doc_type: DocType::Other,
             start_line,
             end_line,
             term_freq,
         });
 
-        self.embedding_engine.index_snippet(
+        self.embedding_engine.index_snippet_embed_only(
             document.id.clone(),
             file_path,
             content,
@@ -2727,6 +2730,36 @@ impl CodeIntelEngine {
         std::fs::read_to_string(path).ok()
     }
 
+    /// Read the raw code for a document's line range from disk. Used to
+    /// regenerate display text for embedding/similarity results whose content
+    /// is no longer retained in memory.
+    fn raw_lines_for_document(&self, file_path: &str, start_line: usize, end_line: usize) -> String {
+        for repo_path in &self.repo_paths {
+            let abs = repo_path.join(file_path);
+            let Some(content) = self.content_for(&abs) else {
+                continue;
+            };
+            let lines: Vec<&str> = content.lines().collect();
+            let s = start_line.saturating_sub(1).min(lines.len());
+            let e = end_line.min(lines.len()).max(s);
+            return lines[s..e].join("\n");
+        }
+        String::new()
+    }
+
+    /// Re-render a normalized 1C metadata document's searchable content by id.
+    /// These docs are indexed with empty raw text; the content is re-rendered
+    /// from `normalized_docs` on demand instead of being stored (twice).
+    fn normalized_doc_content_by_id(&self, id: &str) -> Option<String> {
+        self.normalized_docs.iter().find_map(|entry| {
+            entry
+                .value()
+                .iter()
+                .find(|d| d.id == id)
+                .map(render_normalized_search_content)
+        })
+    }
+
     /// Regenerate a search snippet from `file_cache` (fallback: disk) for a
     /// document whose raw text is no longer stored in the persistent index.
     fn snippet_for_document(
@@ -2825,12 +2858,17 @@ impl CodeIntelEngine {
                 result.document.start_line, result.document.end_line
             ));
             output.push_str("```\n");
-            let snippet = self.snippet_for_document(
-                &result.document.file_path,
-                result.document.start_line,
-                result.document.end_line,
-                &result.matched_terms,
-            );
+            let snippet = match self.normalized_doc_content_by_id(&result.document.id) {
+                Some(rendered) => {
+                    crate::search::SearchIndex::generate_snippet(&rendered, &result.matched_terms, 1)
+                }
+                None => self.snippet_for_document(
+                    &result.document.file_path,
+                    result.document.start_line,
+                    result.document.end_line,
+                    &result.matched_terms,
+                ),
+            };
             output.push_str(&snippet);
             output.push_str("\n```\n\n");
         }
@@ -2905,7 +2943,16 @@ impl CodeIntelEngine {
                 result.document.start_line, result.document.end_line
             ));
             output.push_str("```\n");
-            output.push_str(&result.document.content);
+            let content = self
+                .normalized_doc_content_by_id(&result.document.id)
+                .unwrap_or_else(|| {
+                    self.raw_lines_for_document(
+                        &result.document.file_path,
+                        result.document.start_line,
+                        result.document.end_line,
+                    )
+                });
+            output.push_str(&content);
             output.push_str("\n```\n\n");
         }
 
@@ -2973,7 +3020,16 @@ impl CodeIntelEngine {
                 result.document.start_line, result.document.end_line
             ));
             output.push_str("```\n");
-            output.push_str(&result.document.content);
+            let content = self
+                .normalized_doc_content_by_id(&result.document.id)
+                .unwrap_or_else(|| {
+                    self.raw_lines_for_document(
+                        &result.document.file_path,
+                        result.document.start_line,
+                        result.document.end_line,
+                    )
+                });
+            output.push_str(&content);
             output.push_str("\n```\n\n");
         }
 
@@ -6783,11 +6839,19 @@ impl CodeIntelEngine {
                 }
 
                 // Show snippet (truncated if long)
-                let content = &result.document.content;
+                let content = self
+                    .normalized_doc_content_by_id(&result.document.id)
+                    .unwrap_or_else(|| {
+                        self.raw_lines_for_document(
+                            &result.document.file_path,
+                            result.document.start_line,
+                            result.document.end_line,
+                        )
+                    });
                 let snippet = if content.len() > 500 {
                     format!("{}...", &content[..500])
                 } else {
-                    content.clone()
+                    content
                 };
                 output.push_str("```\n");
                 output.push_str(&snippet);
@@ -6869,11 +6933,19 @@ impl CodeIntelEngine {
                     result.document.file_path, result.document.start_line, result.document.end_line
                 ));
 
-                let content = &result.document.content;
+                let content = self
+                    .normalized_doc_content_by_id(&result.document.id)
+                    .unwrap_or_else(|| {
+                        self.raw_lines_for_document(
+                            &result.document.file_path,
+                            result.document.start_line,
+                            result.document.end_line,
+                        )
+                    });
                 let snippet = if content.len() > 300 {
                     format!("{}...", &content[..300])
                 } else {
-                    content.clone()
+                    content
                 };
                 output.push_str("```\n");
                 output.push_str(&snippet);
