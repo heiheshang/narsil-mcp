@@ -303,6 +303,26 @@ impl VectorStore {
         self.documents.len()
     }
 
+    /// Approximate memory footprint (diagnostics): (docs, content_bytes, embedding_bytes, index_bytes).
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize) {
+        let content_bytes: usize = self
+            .documents
+            .iter()
+            .map(|d| d.id.len() + d.file_path.len() + d.content.len())
+            .sum();
+        let embedding_bytes: usize = self
+            .documents
+            .iter()
+            .map(|d| d.embedding.len() * std::mem::size_of::<(u32, f32)>())
+            .sum();
+        let index_bytes: usize = self
+            .id_to_idx
+            .iter()
+            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .sum();
+        (self.documents.len(), content_bytes, embedding_bytes, index_bytes)
+    }
+
     /// Check if store is empty
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
@@ -351,6 +371,11 @@ impl ConcurrentVectorStore {
 
     pub fn len(&self) -> usize {
         self.inner.read().len()
+    }
+
+    /// Approximate memory footprint (diagnostics): (docs, content_bytes, embedding_bytes, index_bytes).
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize) {
+        self.inner.read().memory_breakdown()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -429,6 +454,24 @@ impl EmbeddingEngine {
         let embedding_stats = self.provider.read().stats();
         let doc_count = self.store.len();
         (embedding_stats, doc_count)
+    }
+
+    /// Approximate memory footprint (diagnostics).
+    /// Returns (docs, content_bytes, embedding_bytes, index_bytes, vocab_bytes, doc_freq_bytes).
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let (docs, content_bytes, embedding_bytes, index_bytes) = self.store.memory_breakdown();
+        let p = self.provider.read();
+        let vocab_bytes: usize = p
+            .vocabulary
+            .iter()
+            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .sum();
+        let df_bytes: usize = p
+            .document_freq
+            .iter()
+            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .sum();
+        (docs, content_bytes, embedding_bytes, index_bytes, vocab_bytes, df_bytes)
     }
 
     /// Clear all data

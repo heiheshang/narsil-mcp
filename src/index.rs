@@ -879,6 +879,8 @@ impl CodeIntelEngine {
         self.normalized_docs
             .insert(repo_name.clone(), normalized_docs_vec);
 
+        self.log_memory_breakdown();
+
         // Transform symbols to RDF knowledge graph if enabled
         #[cfg(feature = "graph")]
         if let Some(ref graph) = self.knowledge_graph {
@@ -1894,6 +1896,103 @@ impl CodeIntelEngine {
 
     // === Persistence Methods ===
 
+    /// Log a per-accumulator memory breakdown. Temporary diagnostics for the
+    /// ≤4 GB peak-RSS work — remove once the target is met.
+    fn log_memory_breakdown(&self) {
+        let (hwm_kb, rss_kb) = read_self_vm();
+        info!(
+            "[mem] VmHWM={:.0} MB VmRSS={:.0} MB",
+            hwm_kb as f64 / 1024.0,
+            rss_kb as f64 / 1024.0
+        );
+
+        let fc_bytes: usize = self.file_cache.iter().map(|e| e.value().len()).sum();
+        info!(
+            "[mem] file_cache: {} files, {:.1} MB content",
+            self.file_cache.len(),
+            fc_bytes as f64 / 1e6
+        );
+
+        let (sym_count, sym_bytes) = {
+            let mut c = 0usize;
+            let mut b = 0usize;
+            for e in self.symbols.iter() {
+                for s in e.value().iter() {
+                    c += 1;
+                    b += s.name.len()
+                        + s.file_path.len()
+                        + s.signature.as_deref().map_or(0, str::len)
+                        + s.qualified_name.as_deref().map_or(0, str::len)
+                        + s.doc_comment.as_deref().map_or(0, str::len)
+                        + std::mem::size_of_val(s);
+                }
+            }
+            (c, b)
+        };
+        info!(
+            "[mem] symbols: {} symbols, {:.1} MB",
+            sym_count,
+            sym_bytes as f64 / 1e6
+        );
+
+        for repo in self.call_graphs.iter() {
+            let (nodes, edges, bytes) = repo.value().memory_stats();
+            info!(
+                "[mem] call_graph[{}]: {} nodes, {} edges, {:.1} MB",
+                repo.key(),
+                nodes,
+                edges,
+                bytes as f64 / 1e6
+            );
+        }
+
+        {
+            let (docs, content_b, tf_b, inv_b, df_b) =
+                self.search_index.inner.read().memory_breakdown();
+            info!(
+                "[mem] search_index: {} docs, content {:.1} MB, term_freq {:.1} MB, inverted {:.1} MB, doc_freq {:.1} MB",
+                docs, content_b as f64 / 1e6, tf_b as f64 / 1e6, inv_b as f64 / 1e6, df_b as f64 / 1e6
+            );
+        }
+
+        {
+            let (docs, content_b, emb_b, idx_b, vocab_b, df_b) =
+                self.embedding_engine.memory_breakdown();
+            info!(
+                "[mem] embedding_engine: {} docs, content {:.1} MB, embedding {:.1} MB, id_index {:.1} MB, vocab {:.1} MB, doc_freq {:.1} MB",
+                docs, content_b as f64 / 1e6, emb_b as f64 / 1e6, idx_b as f64 / 1e6, vocab_b as f64 / 1e6, df_b as f64 / 1e6
+            );
+        }
+
+        let (nd_count, nd_bytes) = {
+            let mut c = 0usize;
+            let mut b = 0usize;
+            for e in self.normalized_docs.iter() {
+                for d in e.value().iter() {
+                    c += 1;
+                    b += d.id.len()
+                        + d.title.len()
+                        + d.content.len()
+                        + d.language.len()
+                        + d.source_paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().len() + 16)
+                            .sum::<usize>()
+                        + d.metadata
+                            .iter()
+                            .map(|(k, v)| k.len() + v.len() + 16)
+                            .sum::<usize>();
+                }
+            }
+            (c, b)
+        };
+        info!(
+            "[mem] normalized_docs: {} docs, {:.1} MB",
+            nd_count,
+            nd_bytes as f64 / 1e6
+        );
+    }
+
     /// Save the current index to disk
     pub async fn save_index(&self) -> Result<String> {
         if !self.options.persist_enabled {
@@ -2619,6 +2718,37 @@ impl CodeIntelEngine {
     // === Semantic Search ===
 
     /// Perform semantic code search using BM25 ranking
+    /// Regenerate a search snippet from `file_cache` (fallback: disk) for a
+    /// document whose raw text is no longer stored in the persistent index.
+    fn snippet_for_document(
+        &self,
+        file_path: &str,
+        start_line: usize,
+        end_line: usize,
+        matched_terms: &[String],
+    ) -> String {
+        for repo_path in &self.repo_paths {
+            let abs = repo_path.join(file_path);
+            let content = self
+                .file_cache
+                .get(&abs)
+                .map(|c| c.clone())
+                .or_else(|| std::fs::read_to_string(&abs).ok().map(std::sync::Arc::new));
+            if let Some(c) = content {
+                let lines: Vec<&str> = c.lines().collect();
+                let s = start_line.saturating_sub(1).min(lines.len());
+                let e = end_line.min(lines.len()).max(s);
+                let range = lines[s..e].join("\n");
+                return crate::search::SearchIndex::generate_snippet(
+                    &range,
+                    matched_terms,
+                    start_line,
+                );
+            }
+        }
+        String::new()
+    }
+
     pub async fn semantic_search(
         &self,
         repo: Option<&str>,
@@ -2694,7 +2824,13 @@ impl CodeIntelEngine {
                 result.document.start_line, result.document.end_line
             ));
             output.push_str("```\n");
-            output.push_str(&result.snippet);
+            let snippet = self.snippet_for_document(
+                &result.document.file_path,
+                result.document.start_line,
+                result.document.end_line,
+                &result.matched_terms,
+            );
+            output.push_str(&snippet);
             output.push_str("\n```\n\n");
         }
 
@@ -8431,6 +8567,22 @@ fn read_indexable_text_file(path: &Path) -> Option<String> {
     }
 
     String::from_utf8(bytes).ok()
+}
+
+/// Read VmHWM/VmRSS (kB) from /proc/self/status. Diagnostic helper.
+fn read_self_vm() -> (u64, u64) {
+    let mut hwm = 0u64;
+    let mut rss = 0u64;
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(v) = line.strip_prefix("VmHWM:") {
+                hwm = v.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("VmRSS:") {
+                rss = v.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    (hwm, rss)
 }
 
 fn collect_onec_normalized_documents(

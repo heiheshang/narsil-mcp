@@ -29,6 +29,10 @@ fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
 pub struct SearchDocument {
     pub id: String,
     pub file_path: String,
+    /// Raw text. The PERSISTENT index stores this empty (it duplicated
+    /// `file_cache` and cost ~2.4 GB on the 1C corpus) — snippets are
+    /// regenerated from disk/`file_cache` at query time. The transient
+    /// per-query index built by `hybrid_search` still populates it.
     pub content: String,
     pub doc_type: DocType,
     pub start_line: usize,
@@ -108,6 +112,43 @@ impl SearchIndex {
             params: BM25Params::default(),
             synonyms: Self::build_code_synonyms(),
         }
+    }
+
+    /// Approximate memory footprint (diagnostics).
+    /// Returns (docs, content_bytes, term_freq_bytes, inverted_bytes, doc_freq_bytes).
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize) {
+        let content_bytes: usize = self
+            .documents
+            .iter()
+            .map(|d| d.id.len() + d.file_path.len() + d.content.len())
+            .sum();
+        let term_freq_bytes: usize = self
+            .documents
+            .iter()
+            .map(|d| {
+                d.term_freq
+                    .iter()
+                    .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+                    .sum::<usize>()
+            })
+            .sum();
+        let inverted_bytes: usize = self
+            .inverted_index
+            .iter()
+            .map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>())
+            .sum();
+        let doc_freq_bytes: usize = self
+            .doc_freq
+            .iter()
+            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .sum();
+        (
+            self.documents.len(),
+            content_bytes,
+            term_freq_bytes,
+            inverted_bytes,
+            doc_freq_bytes,
+        )
     }
 
     /// Build code-specific synonym mappings
@@ -193,7 +234,8 @@ impl SearchIndex {
         self.add_document(SearchDocument {
             id: file_path.to_string(),
             file_path: file_path.to_string(),
-            content: content.to_string(),
+            // Persistent index: keep raw text empty (regenerated on demand).
+            content: String::new(),
             doc_type: DocType::File,
             start_line: 1,
             end_line: content.lines().count(),
@@ -217,7 +259,8 @@ impl SearchIndex {
         self.add_document(SearchDocument {
             id: format!("{}::{}", file_path, name),
             file_path: file_path.to_string(),
-            content: content.to_string(),
+            // Persistent index: keep raw text empty (regenerated on demand).
+            content: String::new(),
             doc_type,
             start_line,
             end_line,
@@ -280,11 +323,10 @@ impl SearchIndex {
         results
             .into_iter()
             .map(|(doc_idx, (score, matched_terms))| {
-                let doc = self.documents[doc_idx].clone();
-                let snippet = self.generate_snippet(&doc, &matched_terms);
-
+                let doc = &self.documents[doc_idx];
+                let snippet = Self::generate_snippet(&doc.content, &matched_terms, doc.start_line);
                 SearchResult {
-                    document: doc,
+                    document: doc.clone(),
                     score,
                     matched_terms,
                     snippet,
@@ -330,9 +372,13 @@ impl SearchIndex {
         expanded
     }
 
-    /// Generate a snippet highlighting matched terms
-    fn generate_snippet(&self, doc: &SearchDocument, matched_terms: &[String]) -> String {
-        let lines: Vec<&str> = doc.content.lines().collect();
+    /// Generate a snippet highlighting matched terms from already-loaded text.
+    ///
+    /// `content` is the document's line range (caller extracts it from
+    /// disk/`file_cache`); `start_line` is its 1-indexed first line, used to
+    /// number the snippet lines correctly.
+    pub fn generate_snippet(content: &str, matched_terms: &[String], start_line: usize) -> String {
+        let lines: Vec<&str> = content.lines().collect();
         let mut best_line_idx = 0;
         let mut best_score = 0;
 
@@ -357,7 +403,7 @@ impl SearchIndex {
         lines[start..end]
             .iter()
             .enumerate()
-            .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
+            .map(|(i, line)| format!("{:4} | {}", start_line + start + i, line))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -625,6 +671,36 @@ mod tests {
         let results = index.search("user", 10);
         assert!(!results.is_empty());
         assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_persistent_index_stores_empty_content() {
+        let mut index = SearchIndex::new();
+        index.index_symbol("f.rs", "foo", "fn foo() { bar(); }", DocType::Function, 1, 1);
+        index.index_file("g.rs", "fn bar() {}");
+
+        // The persistent index must NOT retain raw text (cost ~2.4 GB on the
+        // 1C corpus) — it is regenerated from disk/file_cache at query time.
+        for doc in &index.documents {
+            assert!(
+                doc.content.is_empty(),
+                "persistent index must store empty content, got {:?}",
+                doc.content
+            );
+        }
+        // Scoring still works (term_freq drives BM25, not content).
+        assert!(!index.search("foo", 10).is_empty());
+    }
+
+    #[test]
+    fn test_generate_snippet_line_numbering() {
+        let content = "line1\nline2\nline3\nline4\nline5";
+        let terms = vec!["line3".to_string()];
+        let snippet = SearchIndex::generate_snippet(content, &terms, 10);
+        // Best line is "line3" (offset 2); context ±2 → lines 10..15 numbered
+        // from start_line=10, not from 1.
+        assert!(snippet.contains("12 | line3"), "got: {}", snippet);
+        assert!(snippet.contains("10 | line1"), "got: {}", snippet);
     }
 
     #[test]
