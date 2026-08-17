@@ -8,6 +8,12 @@ use std::sync::Arc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+// mimalloc: glibc's default allocator retains freed arenas, inflating peak RSS
+// by ~2-4 GB on the 1C reindex (469k symbols, 5M edges). mimalloc returns
+// memory to the OS more eagerly.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(ClapParser, Debug)]
 #[command(name = "narsil-mcp")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
