@@ -8472,6 +8472,7 @@ fn normalized_document_kind_label(kind: &NormalizedDocumentKind) -> &'static str
         NormalizedDocumentKind::OneCObjectBundle => "1c_object_bundle",
         NormalizedDocumentKind::OneCFormModuleBundle => "1c_form_module_bundle",
         NormalizedDocumentKind::OneCFormComposition => "1c_form_composition",
+        NormalizedDocumentKind::OneCDataComposition => "1c_data_composition",
     }
 }
 
