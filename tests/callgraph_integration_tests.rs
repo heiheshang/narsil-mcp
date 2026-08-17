@@ -60,6 +60,33 @@ fn worker() {
 }
 
 #[test]
+fn test_self_recursive_call_does_not_deadlock() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    // A function that calls itself: caller and callee resolve to the same
+    // qualified key, so both live in the same DashMap shard. The builder must
+    // not take a write lock on the caller's shard and then try to take a read
+    // lock on the same shard (a read-under-write self-deadlock).
+    let rust_code = r#"
+fn recurse(n: u32) -> u32 {
+    if n == 0 { 0 } else { recurse(n - 1) }
+}
+"#;
+
+    let tree = parser
+        .parse_to_tree(Path::new("rec.rs"), rust_code)
+        .unwrap();
+
+    let files = vec![("rec.rs".to_string(), rust_code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = call_graph.get_callees("recurse");
+    assert_eq!(callees.len(), 1);
+    assert!(callees[0].target.ends_with("::recurse"));
+}
+
+#[test]
 fn test_python_call_graph() {
     let parser = LanguageParser::new().unwrap();
     let call_graph = CallGraph::new();
