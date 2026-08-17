@@ -82,6 +82,10 @@ pub struct CallGraph {
     nodes: DashMap<String, CallNode>,
     /// File -> Functions defined in that file
     file_functions: DashMap<String, Vec<String>>,
+    /// Bare function name -> qualified keys. Lets `resolve_callee` look up
+    /// candidates in O(1) instead of scanning every node per call site
+    /// (O(N²) on a 469k-symbol corpus).
+    name_index: DashMap<String, Vec<String>>,
 }
 
 impl Default for CallGraph {
@@ -95,6 +99,7 @@ impl CallGraph {
         Self {
             nodes: DashMap::new(),
             file_functions: DashMap::new(),
+            name_index: DashMap::new(),
         }
     }
 
@@ -131,6 +136,16 @@ impl CallGraph {
         format!("{}::{}", file_path, name)
     }
 
+    /// Insert a node and maintain the bare-name index so `resolve_callee`
+    /// stays O(1). The only way a node should enter the graph.
+    fn insert_node(&self, key: String, node: CallNode) {
+        self.name_index
+            .entry(node.name.clone())
+            .or_default()
+            .push(key.clone());
+        self.nodes.insert(key, node);
+    }
+
     fn extract_functions(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
         let source = content.as_bytes();
         let mut cursor = tree.walk();
@@ -140,7 +155,7 @@ impl CallGraph {
 
         for func in &functions {
             let key = Self::qualified_key(path, &func.name);
-            self.nodes.insert(key, func.clone());
+            self.insert_node(key, func.clone());
         }
 
         let names: Vec<_> = functions
@@ -432,41 +447,33 @@ impl CallGraph {
             return same_file_key;
         }
 
-        // 2. Collect ALL candidates matching ::bare_name
-        let suffix = format!("::{}", bare_name);
-        let mut candidates: Vec<String> = self
-            .nodes
-            .iter()
-            .filter(|entry| entry.key().ends_with(&suffix))
-            .map(|entry| entry.key().clone())
-            .collect();
+        // 2. O(1) candidate lookup via the name index, borrowing the Ref — no
+        // full Vec clone per call (a name with hundreds of candidates called
+        // thousands of times would otherwise re-clone and re-sort every time).
+        let Some(candidates) = self.name_index.get(bare_name) else {
+            return bare_name.to_string();
+        };
 
         match candidates.len() {
-            0 => bare_name.to_string(),
-            1 => candidates.remove(0),
+            1 => candidates[0].clone(),
             _ => {
                 // 3. If scope_hint present, try to narrow down
                 if let Some(scope) = scope_hint {
-                    // Extract the file_path part from qualified keys (everything before ::)
-                    let scope_matches: Vec<&String> = candidates
-                        .iter()
-                        .filter(|key| {
-                            if let Some(file_part) = key.rsplit_once("::").map(|(f, _)| f) {
-                                Self::scope_matches_file_path(scope, file_part)
-                            } else {
-                                false
-                            }
-                        })
-                        .collect();
+                    let mut scope_matches = candidates.iter().filter(|key| {
+                        key.rsplit_once("::")
+                            .map(|(file_part, _)| Self::scope_matches_file_path(scope, file_part))
+                            .unwrap_or(false)
+                    });
 
-                    if scope_matches.len() == 1 {
-                        return scope_matches[0].clone();
+                    if let Some(first) = scope_matches.next() {
+                        if scope_matches.next().is_none() {
+                            return first.clone();
+                        }
                     }
                 }
 
-                // 4. Deterministic fallback: sort alphabetically, pick first
-                candidates.sort();
-                candidates.remove(0)
+                // 4. Deterministic fallback: alphabetically smallest, no sort.
+                candidates.iter().min().cloned().unwrap_or_default()
             }
         }
     }
@@ -2320,11 +2327,9 @@ mod tests {
         };
 
         graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
+            .insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
         graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
+            .insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
 
         // Without scope hint, from a third file, should get deterministic result
         // (alphabetically first: "src/agents/mod.rs::run" < "src/app/mod.rs::run")
@@ -2357,11 +2362,9 @@ mod tests {
         };
 
         graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
+            .insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
         graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
+            .insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
 
         // With scope hint "App", should pick app/mod.rs::run
         let result = graph.resolve_callee("run", "src/main.rs", Some("App"));
