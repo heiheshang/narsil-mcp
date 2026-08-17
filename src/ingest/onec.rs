@@ -20,6 +20,7 @@ pub enum DocumentKind {
     OneCMetadataSummary,
     OneCObjectBundle,
     OneCFormModuleBundle,
+    OneCFormComposition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +84,25 @@ pub struct OneCSubscription {
     pub handler: String,
 }
 
+/// A managed-form element (field, button, group, table, …) and its handlers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCFormElement {
+    pub name: String,
+    pub kind: String,
+    pub data_path: Option<String>,
+    /// (event, handler) pairs, e.g. ("OnChange", "ИнформОстаткиОтправлятьВсеПриИзменении").
+    pub handlers: Vec<(String, String)>,
+}
+
+/// The composition of a managed form (`Ext/Form.xml`): elements + handlers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OneCFormComposition {
+    pub title: String,
+    /// Form-level event handlers (event → procedure in the form module).
+    pub handlers: Vec<(String, String)>,
+    pub elements: Vec<OneCFormElement>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OneCIngestor;
 
@@ -110,7 +130,7 @@ impl OneCIngestor {
     ) -> Result<Vec<NormalizedDocument>> {
         let summary = match self.parse_metadata_summary(repo_root, metadata_path)? {
             Some(summary) => summary,
-            None => return Ok(Vec::new()),
+            None => return self.ingest_form_composition(repo_root, metadata_path),
         };
 
         let mut metadata = summary.properties.clone();
@@ -145,6 +165,65 @@ impl OneCIngestor {
         }
 
         Ok(documents)
+    }
+
+    /// Parse a managed-form composition (`Ext/Form.xml`, root `<Form>`) into a
+    /// searchable document: element names + event handlers. Non-form XML returns
+    /// an empty vec (the caller already fell through the metadata summary path).
+    fn ingest_form_composition(
+        &self,
+        repo_root: &Path,
+        metadata_path: &Path,
+    ) -> Result<Vec<NormalizedDocument>> {
+        let xml = fs::read_to_string(metadata_path)
+            .with_context(|| format!("Failed to read 1C form file {}", metadata_path.display()))?;
+        let Some(form) = parse_form_composition(&xml) else {
+            return Ok(Vec::new());
+        };
+
+        let relative_path = metadata_path
+            .strip_prefix(repo_root)
+            .unwrap_or(metadata_path)
+            .to_path_buf();
+
+        // .../Forms/<FormName>/Ext/Form.xml -> <FormName>.
+        let form_name = metadata_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| relative_path.to_string_lossy().to_string());
+
+        let title = if form.title.is_empty() {
+            format!("1C Form Composition: {form_name}")
+        } else {
+            format!("1C Form Composition: {form_name} — {}", form.title)
+        };
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("object_type".to_string(), "FormComposition".to_string());
+        metadata.insert("object_name".to_string(), form_name.clone());
+        metadata.insert(
+            "relative_path".to_string(),
+            relative_path.to_string_lossy().to_string(),
+        );
+        metadata.insert(
+            "form_element_count".to_string(),
+            form.elements.len().to_string(),
+        );
+
+        let document = NormalizedDocument {
+            id: synthetic_summary_id(&relative_path),
+            title,
+            kind: DocumentKind::OneCFormComposition,
+            origin: DocumentOrigin::File(metadata_path.to_path_buf()),
+            source_paths: vec![relative_path],
+            language: "text".to_string(),
+            content: render_form_composition_text(&form_name, &form),
+            metadata,
+        };
+
+        Ok(vec![document])
     }
 
     pub fn parse_metadata_summary(
@@ -553,6 +632,96 @@ fn parse_domain_model(xml: &str) -> OneCDomainModel {
     model
 }
 
+/// Parse a managed-form composition XML (`Ext/Form.xml`, root `<Form>`).
+/// Returns `None` when the XML is not a form composition. Best-effort: a
+/// streaming pass that tracks the `<ChildItems>` nesting and the open
+/// `<Event name="X">` to associate handlers with the enclosing element.
+fn parse_form_composition(xml: &str) -> Option<OneCFormComposition> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut model = OneCFormComposition::default();
+    let mut buf = Vec::new();
+    // Nesting path of local tag names (namespace-stripped).
+    let mut stack: Vec<String> = Vec::new();
+    // In-progress form elements (nested `<ChildItems>`).
+    let mut elements: Vec<OneCFormElement> = Vec::new();
+    // The `<Event name="X">` currently open, if any.
+    let mut current_event: Option<String> = None;
+    let mut saw_form_root = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = local_name(e.name().as_ref());
+                let parent = stack.last().map(String::as_str);
+                let name_attr = e
+                    .attributes()
+                    .flatten()
+                    .find(|attr| attr.key.as_ref() == b"name")
+                    .and_then(|attr| String::from_utf8(attr.value.into_owned()).ok());
+
+                if name == "Form" && stack.is_empty() {
+                    saw_form_root = true;
+                } else if name == "Event" {
+                    current_event = name_attr;
+                } else if let Some(elem_name) = name_attr {
+                    // A form element is a named tag whose parent is <ChildItems>.
+                    if parent == Some("ChildItems") {
+                        elements.push(OneCFormElement {
+                            name: elem_name,
+                            kind: name.clone(),
+                            data_path: None,
+                            handlers: Vec::new(),
+                        });
+                    }
+                }
+                stack.push(name);
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.decode().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let top = stack.last().map(String::as_str);
+                if let Some(event) = current_event.take() {
+                    match elements.last_mut() {
+                        Some(element) => element.handlers.push((event, text)),
+                        None => model.handlers.push((event, text)),
+                    }
+                } else if top == Some("DataPath") {
+                    if let Some(element) = elements.last_mut() {
+                        element.data_path = Some(text);
+                    }
+                } else if top == Some("content")
+                    && elements.is_empty()
+                    && model.title.is_empty()
+                {
+                    model.title = text;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = local_name(e.name().as_ref());
+                if name == "Event" {
+                    current_event = None;
+                }
+                if elements.last().map(|element| element.kind.as_str()) == Some(name.as_str()) {
+                    if let Some(element) = elements.pop() {
+                        model.elements.push(element);
+                    }
+                }
+                stack.pop();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    saw_form_root.then_some(model)
+}
+
 fn discover_module_links(repo_root: &Path, metadata_path: &Path) -> Vec<(String, PathBuf)> {
     let mut links = Vec::new();
     let Some(metadata_dir) = metadata_path.parent() else {
@@ -733,6 +902,40 @@ fn render_summary_text(summary: &OneCMetadataSummary) -> String {
 
     if let Some(entry) = &domain.entry_method {
         lines.push(format!("Entry method: {entry}"));
+    }
+
+    lines.join("\n")
+}
+
+/// Render a form composition into searchable plain text: the element names and
+/// their event handlers are the tokens that answer «по имени элемента формы —
+/// его обработчик».
+fn render_form_composition_text(form_name: &str, form: &OneCFormComposition) -> String {
+    let mut lines = vec![format!("1C Form Composition: {form_name}")];
+
+    if !form.title.is_empty() {
+        lines.push(format!("Title: {}", form.title));
+    }
+
+    if !form.handlers.is_empty() {
+        lines.push(format!("Form handlers ({})", form.handlers.len()));
+        for (event, handler) in &form.handlers {
+            lines.push(format!("  - {event} -> {handler}"));
+        }
+    }
+
+    if !form.elements.is_empty() {
+        lines.push(format!("Form elements ({})", form.elements.len()));
+        for element in &form.elements {
+            let mut line = format!("  - {} ({})", element.name, element.kind);
+            if let Some(data_path) = &element.data_path {
+                line.push_str(&format!(" [{data_path}]"));
+            }
+            lines.push(line);
+            for (event, handler) in &element.handlers {
+                lines.push(format!("      - {event} -> {handler}"));
+            }
+        }
     }
 
     lines.join("\n")
@@ -1037,6 +1240,81 @@ mod tests {
             Some("CommonModule.Классификация.ВыполнитьABCКлассификациюНоменклатурыРегламентноеЗадание")
         );
         assert!(model.subscription.is_none());
+    }
+
+    #[test]
+    fn parses_form_composition_elements_and_handlers() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"
+      xmlns:v8="http://v8.1c.ru/8.1/data/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Title>
+    <v8:item>
+      <v8:lang>ru</v8:lang>
+      <v8:content>Настройка узла</v8:content>
+    </v8:item>
+  </Title>
+  <Events>
+    <Event name="OnCreateAtServer">ПриСозданииНаСервере</Event>
+  </Events>
+  <ChildItems>
+    <InputField name="Наименование" id="3">
+      <DataPath>Объект.Description</DataPath>
+    </InputField>
+    <UsualGroup name="ГруппаШапка" id="40">
+      <ChildItems>
+        <RadioButtonField name="ИнформОстаткиОтправлятьВсе" id="216">
+          <DataPath>РежимОтправкиСкладов</DataPath>
+          <Events>
+            <Event name="OnChange">ИнформОстаткиОтправлятьВсеПриИзменении</Event>
+          </Events>
+        </RadioButtonField>
+      </ChildItems>
+    </UsualGroup>
+  </ChildItems>
+</Form>"#;
+
+        let form = parse_form_composition(xml).expect("form composition should be parsed");
+        assert_eq!(form.title, "Настройка узла");
+
+        assert_eq!(form.handlers.len(), 1);
+        assert_eq!(
+            form.handlers[0],
+            ("OnCreateAtServer".to_string(), "ПриСозданииНаСервере".to_string())
+        );
+
+        assert_eq!(form.elements.len(), 3);
+
+        let field = form
+            .elements
+            .iter()
+            .find(|element| element.name == "Наименование")
+            .expect("input field should be extracted");
+        assert_eq!(field.kind, "InputField");
+        assert_eq!(field.data_path.as_deref(), Some("Объект.Description"));
+
+        let group = form
+            .elements
+            .iter()
+            .find(|element| element.name == "ГруппаШапка")
+            .expect("group should be extracted");
+        assert_eq!(group.kind, "UsualGroup");
+
+        let radio = form
+            .elements
+            .iter()
+            .find(|element| element.name == "ИнформОстаткиОтправлятьВсе")
+            .expect("radio button should be extracted");
+        assert_eq!(radio.kind, "RadioButtonField");
+        assert_eq!(radio.data_path.as_deref(), Some("РежимОтправкиСкладов"));
+        assert_eq!(radio.handlers.len(), 1);
+        assert_eq!(
+            radio.handlers[0],
+            (
+                "OnChange".to_string(),
+                "ИнформОстаткиОтправлятьВсеПриИзменении".to_string()
+            )
+        );
     }
 
     #[test]
