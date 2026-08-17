@@ -416,17 +416,46 @@ impl EmbeddingEngine {
         start_line: usize,
         end_line: usize,
     ) {
+        self.index_snippet_inner(id, file_path, content, start_line, end_line, true);
+    }
+
+    /// Index a snippet but do NOT retain its raw text (persistent-index path).
+    /// The embedding is still computed and stored; the display text is dropped
+    /// and regenerated from disk at query time (saves ~0.65 GB on the 1C
+    /// corpus). The transient per-query engines keep using [`index_snippet`].
+    pub fn index_snippet_embed_only(
+        &self,
+        id: String,
+        file_path: String,
+        content: String,
+        start_line: usize,
+        end_line: usize,
+    ) {
+        self.index_snippet_inner(id, file_path, content, start_line, end_line, false);
+    }
+
+    fn index_snippet_inner(
+        &self,
+        id: String,
+        file_path: String,
+        content: String,
+        start_line: usize,
+        end_line: usize,
+        keep_text: bool,
+    ) {
         // Update IDF statistics
         self.provider.write().add_document(&content);
 
         // Generate embedding (dense), then pack it sparse before storing.
         let embedding = to_sparse(&self.provider.read().embed(&content));
 
+        let stored_text = if keep_text { content } else { String::new() };
+
         // Store the embedded document
         self.store.add(EmbeddedDocument {
             id,
             file_path,
-            content,
+            content: stored_text,
             start_line,
             end_line,
             embedding,
