@@ -19,8 +19,6 @@ pub struct CallNode {
     pub line: usize,
     /// Functions this calls (outgoing edges)
     pub calls: Vec<CallEdge>,
-    /// Functions that call this (incoming edges)
-    pub called_by: Vec<CallEdge>,
     /// Complexity metrics
     pub metrics: FunctionMetrics,
 }
@@ -223,7 +221,6 @@ impl CallGraph {
             file_path: path.to_string(),
             line: node.start_position().row + 1,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics,
         })
     }
@@ -291,19 +288,6 @@ impl CallGraph {
                             resolved_edge.target = callee_key.clone();
                             resolved_edge.resolved = resolved;
                             caller_node.calls.push(resolved_edge);
-                        }
-
-                        // Add to callee's incoming calls
-                        if let Some(mut callee_node) = self.nodes.get_mut(callee_key.as_str()) {
-                            callee_node.called_by.push(CallEdge {
-                                target: caller_key.clone(),
-                                file_path: edge.file_path,
-                                line: edge.line,
-                                column: edge.column,
-                                call_type: edge.call_type,
-                                scope_hint: None,
-                                resolved: true,
-                            });
                         }
                     }
                 }
@@ -414,25 +398,6 @@ impl CallGraph {
                             call_type: CallType::Direct,
                             scope_hint: None,
                             resolved,
-                        });
-                    }
-                }
-
-                // Add to callee's incoming calls
-                if let Some(mut callee_node) = self.nodes.get_mut(callee_key.as_str()) {
-                    if !callee_node
-                        .called_by
-                        .iter()
-                        .any(|c| c.target == *caller_key)
-                    {
-                        callee_node.called_by.push(CallEdge {
-                            target: caller_key.to_string(),
-                            file_path: caller_file.to_string(),
-                            line,
-                            column: 0,
-                            call_type: CallType::Direct,
-                            scope_hint: None,
-                            resolved: true,
                         });
                     }
                 }
@@ -873,14 +838,44 @@ impl CallGraph {
     }
 
     /// Get direct callers of a function (with fuzzy matching)
+    /// Build the reverse adjacency (callee key -> caller edges) on demand.
+    /// `called_by` is no longer stored (halves edge memory); reverse queries
+    /// scan the forward `calls` once. O(E), transient.
+    pub fn reverse_edges(&self) -> HashMap<String, Vec<CallEdge>> {
+        let mut rev: HashMap<String, Vec<CallEdge>> = HashMap::new();
+        for entry in self.nodes.iter() {
+            let caller = entry.key();
+            for e in &entry.value().calls {
+                rev.entry(e.target.clone()).or_default().push(CallEdge {
+                    target: caller.clone(),
+                    file_path: e.file_path.clone(),
+                    line: e.line,
+                    column: e.column,
+                    call_type: e.call_type.clone(),
+                    scope_hint: None,
+                    resolved: true,
+                });
+            }
+        }
+        rev
+    }
+
+    /// Build incoming call counts (callee key -> number of callers) on demand.
+    fn incoming_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for entry in self.nodes.iter() {
+            for e in &entry.value().calls {
+                *counts.entry(e.target.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     pub fn get_callers(&self, function: &str) -> Vec<CallEdge> {
         let actual_name = self
             .find_function(function)
             .unwrap_or_else(|| function.to_string());
-        self.nodes
-            .get(&actual_name)
-            .map(|n| n.called_by.clone())
-            .unwrap_or_default()
+        self.reverse_edges().remove(&actual_name).unwrap_or_default()
     }
 
     /// Get functions called by a function (with fuzzy matching)
@@ -899,6 +894,8 @@ impl CallGraph {
         let actual_name = self
             .find_function(function)
             .unwrap_or_else(|| function.to_string());
+        let rev = self.reverse_edges();
+
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
@@ -912,8 +909,8 @@ impl CallGraph {
             }
 
             if depth < max_depth {
-                if let Some(node) = self.nodes.get(&func) {
-                    for caller in &node.called_by {
+                if let Some(callers) = rev.get(&func) {
+                    for caller in callers {
                         if !visited.contains(&caller.target) {
                             visited.insert(caller.target.clone());
                             queue.push_back((caller.target.clone(), depth + 1));
@@ -1041,6 +1038,7 @@ impl CallGraph {
     /// Filters out generic trait methods and limits output.
     pub fn get_hotspots(&self, min_connections: usize) -> Vec<(String, usize, usize)> {
         let mut hotspots = Vec::new();
+        let counts = self.incoming_counts();
 
         for entry in self.nodes.iter() {
             let key = entry.key();
@@ -1050,7 +1048,7 @@ impl CallGraph {
                 continue;
             }
 
-            let incoming = entry.called_by.len();
+            let incoming = counts.get(key).copied().unwrap_or(0);
             let outgoing = entry.calls.len();
             let total = incoming + outgoing;
 
@@ -1153,10 +1151,11 @@ impl CallGraph {
                     }
 
                     md.push_str("## Called By (incoming)\n\n");
-                    if node.called_by.is_empty() {
+                    let callers = self.reverse_edges().remove(display_name).unwrap_or_default();
+                    if callers.is_empty() {
                         md.push_str("*No incoming calls (entry point or unused)*\n\n");
                     } else {
-                        for caller in &node.called_by {
+                        for caller in &callers {
                             md.push_str(&format!(
                                 "- `{}` at `{}:{}`\n",
                                 caller.target, caller.file_path, caller.line
@@ -1173,10 +1172,11 @@ impl CallGraph {
 
                 // Top callers
                 md.push_str("## Most Called Functions\n\n");
+                let counts = self.incoming_counts();
                 let mut by_callers: Vec<_> = self
                     .nodes
                     .iter()
-                    .map(|e| (e.key().clone(), e.called_by.len()))
+                    .map(|e| (e.key().clone(), counts.get(e.key()).copied().unwrap_or(0)))
                     .collect();
                 by_callers.sort_by_key(|caller| std::cmp::Reverse(caller.1));
 
@@ -1216,8 +1216,9 @@ impl CallGraph {
         let mut entry_points: Vec<String> = Vec::new();
         let mut others: Vec<String> = Vec::new();
 
+        let counts = self.incoming_counts();
         for entry in self.nodes.iter() {
-            if entry.value().called_by.is_empty() {
+            if counts.get(entry.key()).copied().unwrap_or(0) == 0 {
                 entry_points.push(entry.key().clone());
             } else {
                 others.push(entry.key().clone());
@@ -1249,13 +1250,6 @@ impl CallGraph {
         for node in self.nodes.iter() {
             bytes += node.name.len() + node.file_path.len();
             for e in node.calls.iter() {
-                edges += 1;
-                bytes += e.target.len()
-                    + e.file_path.len()
-                    + e.scope_hint.as_deref().map_or(0, str::len)
-                    + 24;
-            }
-            for e in node.called_by.iter() {
                 edges += 1;
                 bytes += e.target.len()
                     + e.file_path.len()
@@ -1346,7 +1340,6 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 42,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics {
                 loc: 10,
                 cyclomatic: 2,
@@ -1379,7 +1372,6 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1388,7 +1380,6 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 20,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1413,74 +1404,61 @@ mod tests {
             .calls
             .push(edge.clone());
 
-        let reverse_edge = CallEdge {
-            target: "caller".to_string(),
-            file_path: edge.file_path.clone(),
-            line: edge.line,
-            column: edge.column,
-            call_type: edge.call_type.clone(),
-            scope_hint: None,
-            resolved: false,
-        };
-
-        graph
-            .nodes
-            .get_mut("callee")
-            .unwrap()
-            .called_by
-            .push(reverse_edge);
-
         // Verify the edge was added
         let caller_node = graph.nodes.get("caller").unwrap();
         assert_eq!(caller_node.calls.len(), 1);
         assert_eq!(caller_node.calls[0].target, "callee");
 
-        let callee_node = graph.nodes.get("callee").unwrap();
-        assert_eq!(callee_node.called_by.len(), 1);
-        assert_eq!(callee_node.called_by[0].target, "caller");
+        // Reverse edges are computed on demand from `calls`.
+        let callers = graph.get_callers("callee");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].target, "caller");
     }
 
     #[test]
     fn test_get_callers() {
         let graph = CallGraph::new();
 
-        // Create a function that is called by multiple functions
-        let target = CallNode {
-            name: "target".to_string(),
-            file_path: "/path/to/file.rs".to_string(),
-            line: 30,
-            calls: Vec::new(),
-            called_by: vec![
-                CallEdge {
-                    target: "caller1".to_string(),
+        // Two callers both call "target" (forward edges only).
+        for (name, line, call_type) in [
+            ("caller1", 10, CallType::Direct),
+            ("caller2", 20, CallType::Method),
+        ] {
+            graph.nodes.insert(
+                name.to_string(),
+                CallNode {
+                    name: name.to_string(),
                     file_path: "/path/to/file.rs".to_string(),
-                    line: 10,
-                    column: 5,
-                    call_type: CallType::Direct,
-                    scope_hint: None,
-                    resolved: false,
+                    line,
+                    calls: vec![CallEdge {
+                        target: "target".to_string(),
+                        file_path: "/path/to/file.rs".to_string(),
+                        line,
+                        column: 5,
+                        call_type,
+                        scope_hint: None,
+                        resolved: false,
+                    }],
+                    metrics: FunctionMetrics::default(),
                 },
-                CallEdge {
-                    target: "caller2".to_string(),
-                    file_path: "/path/to/file.rs".to_string(),
-                    line: 20,
-                    column: 8,
-                    call_type: CallType::Method,
-                    scope_hint: None,
-                    resolved: false,
-                },
-            ],
-            metrics: FunctionMetrics::default(),
-        };
-
-        graph.nodes.insert("target".to_string(), target);
+            );
+        }
+        graph.nodes.insert(
+            "target".to_string(),
+            CallNode {
+                name: "target".to_string(),
+                file_path: "/path/to/file.rs".to_string(),
+                line: 30,
+                calls: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
 
         let callers = graph.get_callers("target");
         assert_eq!(callers.len(), 2);
-        assert_eq!(callers[0].target, "caller1");
-        assert_eq!(callers[1].target, "caller2");
-        assert_eq!(callers[0].call_type, CallType::Direct);
-        assert_eq!(callers[1].call_type, CallType::Method);
+        let mut names: Vec<_> = callers.iter().map(|c| c.target.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["caller1".to_string(), "caller2".to_string()]);
     }
 
     #[test]
@@ -1492,7 +1470,6 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1539,7 +1516,6 @@ mod tests {
                     resolved: false,
                 },
             ],
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1562,7 +1538,6 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1598,7 +1573,6 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 100,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: metrics.clone(),
         };
 
@@ -1641,7 +1615,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1653,15 +1626,6 @@ mod tests {
                 target: "c".to_string(),
                 file_path: "/file.rs".to_string(),
                 line: 12,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
-            called_by: vec![CallEdge {
-                target: "a".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 2,
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
@@ -1683,15 +1647,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 12,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics::default(),
         };
 
@@ -1700,15 +1655,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 30,
             calls: Vec::new(),
-            called_by: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 22,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics::default(),
         };
 
@@ -1750,15 +1696,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: vec![CallEdge {
-                target: "a".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 2,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics::default(),
         };
 
@@ -1767,15 +1704,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 20,
             calls: Vec::new(),
-            called_by: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 12,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics::default(),
         };
 
@@ -1809,7 +1737,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1821,15 +1748,6 @@ mod tests {
                 target: "c".to_string(),
                 file_path: "/file.rs".to_string(),
                 line: 12,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
-            called_by: vec![CallEdge {
-                target: "a".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 2,
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
@@ -1851,15 +1769,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 12,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics::default(),
         };
 
@@ -1868,15 +1777,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 30,
             calls: Vec::new(),
-            called_by: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
-                line: 22,
-                column: 1,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics::default(),
         };
 
@@ -1918,7 +1818,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1935,7 +1834,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1944,7 +1842,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 20,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1968,7 +1865,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -1977,7 +1873,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -2017,35 +1912,6 @@ mod tests {
                     resolved: false,
                 },
             ],
-            called_by: vec![
-                CallEdge {
-                    target: "caller1".to_string(),
-                    file_path: "/file.rs".to_string(),
-                    line: 20,
-                    column: 1,
-                    call_type: CallType::Direct,
-                    scope_hint: None,
-                    resolved: false,
-                },
-                CallEdge {
-                    target: "caller2".to_string(),
-                    file_path: "/file.rs".to_string(),
-                    line: 30,
-                    column: 1,
-                    call_type: CallType::Direct,
-                    scope_hint: None,
-                    resolved: false,
-                },
-                CallEdge {
-                    target: "caller3".to_string(),
-                    file_path: "/file.rs".to_string(),
-                    line: 40,
-                    column: 1,
-                    call_type: CallType::Direct,
-                    scope_hint: None,
-                    resolved: false,
-                },
-            ],
             metrics: FunctionMetrics::default(),
         };
 
@@ -2063,9 +1929,30 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
+
+        // Three callers point at "hotspot" (forward edges).
+        for name in ["caller1", "caller2", "caller3"] {
+            graph.nodes.insert(
+                name.to_string(),
+                CallNode {
+                    name: name.to_string(),
+                    file_path: "/file.rs".to_string(),
+                    line: 20,
+                    calls: vec![CallEdge {
+                        target: "hotspot".to_string(),
+                        file_path: "/file.rs".to_string(),
+                        line: 20,
+                        column: 1,
+                        call_type: CallType::Direct,
+                        scope_hint: None,
+                        resolved: false,
+                    }],
+                    metrics: FunctionMetrics::default(),
+                },
+            );
+        }
 
         graph.nodes.insert("hotspot".to_string(), hotspot);
         graph.nodes.insert("normal".to_string(), normal);
@@ -2123,15 +2010,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: vec![CallEdge {
-                target: "main".to_string(),
-                file_path: "/path/to/main.rs".to_string(),
-                line: 10,
-                column: 3,
-                call_type: CallType::Direct,
-                scope_hint: None,
-                resolved: false,
-            }],
             metrics: FunctionMetrics {
                 loc: 10,
                 cyclomatic: 3,
@@ -2143,6 +2021,25 @@ mod tests {
         };
 
         graph.nodes.insert("test_func".to_string(), node);
+        // A caller ("main") so the "Called By" section is exercised.
+        graph.nodes.insert(
+            "main".to_string(),
+            CallNode {
+                name: "main".to_string(),
+                file_path: "/path/to/main.rs".to_string(),
+                line: 10,
+                calls: vec![CallEdge {
+                    target: "test_func".to_string(),
+                    file_path: "/path/to/main.rs".to_string(),
+                    line: 10,
+                    column: 3,
+                    call_type: CallType::Direct,
+                    scope_hint: None,
+                    resolved: false,
+                }],
+                metrics: FunctionMetrics::default(),
+            },
+        );
 
         let markdown = graph.to_markdown(Some("test_func"));
 
@@ -2172,7 +2069,6 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics {
                 loc: 10,
                 cyclomatic: 2,
@@ -2210,7 +2106,6 @@ mod tests {
                 scope_hint: None,
                 resolved: false,
             }],
-            called_by: Vec::new(),
             metrics: FunctionMetrics {
                 loc: 5,
                 cyclomatic: 2,
@@ -2292,7 +2187,6 @@ mod tests {
                 file_path: format!("/file{}.rs", i),
                 line: (i + 1) * 10,
                 calls: Vec::new(),
-                called_by: Vec::new(),
                 metrics: FunctionMetrics::default(),
             };
             graph.nodes.insert(name.to_string(), node);
@@ -2353,7 +2247,6 @@ mod tests {
             file_path: "src/agents/mod.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
         let node_b = CallNode {
@@ -2361,7 +2254,6 @@ mod tests {
             file_path: "src/app/mod.rs".to_string(),
             line: 20,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -2388,7 +2280,6 @@ mod tests {
             file_path: "src/agents/mod.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
         let node_b = CallNode {
@@ -2396,7 +2287,6 @@ mod tests {
             file_path: "src/app/mod.rs".to_string(),
             line: 20,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -2429,7 +2319,6 @@ mod tests {
             file_path: "src/main.rs".to_string(),
             line: 5,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
         let node_b = CallNode {
@@ -2437,7 +2326,6 @@ mod tests {
             file_path: "src/utils.rs".to_string(),
             line: 10,
             calls: Vec::new(),
-            called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
         };
 
@@ -2464,7 +2352,6 @@ mod tests {
                 file_path: file.to_string(),
                 line: 1,
                 calls: Vec::new(),
-                called_by: Vec::new(),
                 metrics: FunctionMetrics::default(),
             };
             graph

@@ -294,6 +294,9 @@ impl GetCodeGraphHandler {
 
         // BFS traversal
         let mut queue: Vec<(String, usize)> = starting_nodes.into_iter().map(|n| (n, 0)).collect();
+        // Reverse edges computed once from the forward `calls` (called_by is
+        // no longer stored in the graph).
+        let reverse = call_graph_data.reverse_edges();
 
         while let Some((func_name, current_depth)) = queue.pop() {
             if visited.contains(&func_name) || current_depth > options.depth {
@@ -326,7 +329,7 @@ impl GetCodeGraphHandler {
                             cyclomatic: node.metrics.cyclomatic,
                             cognitive: node.metrics.cognitive,
                             call_count: node.calls.len(),
-                            caller_count: node.called_by.len(),
+                            caller_count: reverse.get(&func_name).map(Vec::len).unwrap_or(0),
                         })
                     } else {
                         None
@@ -365,7 +368,7 @@ impl GetCodeGraphHandler {
                 }
 
                 if matches!(options.direction, "both" | "callers") {
-                    for caller in &node.called_by {
+                    for caller in reverse.get(&func_name).map(Vec::as_slice).unwrap_or(&[]) {
                         edges.push(GraphEdge {
                             id: format!("e{}", edge_id),
                             source: caller.target.clone(),
