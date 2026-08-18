@@ -99,6 +99,26 @@ neural_search("error handling with retry logic")
 find_semantic_clones("my_function")  # Find Type-3/4 clones
 ```
 
+## Scoping a Search to One Repository
+
+With several repositories indexed, pass `repo` (a name from `list_repos`) to
+restrict the search to that repository:
+
+```
+neural_search(query="retry with backoff", repo="my-service")
+```
+
+Every indexed vector carries its repository name, so the filter is applied
+while ranking: `max_results` is filled from the requested repository instead of
+being spent on a global top-k that other repositories dominate. An unknown
+`repo` name is an error, not an empty result set. Omitting `repo` searches all
+indexed repositories, as before. The same `repo` parameter works for
+`semantic_search`, `hybrid_search`, `search_chunks` and `find_similar_code`.
+
+`find_semantic_clones` and `find_similar_to_symbol` take a required `repo` and
+now search inside it only: a clone of a function belongs to the same codebase,
+so matches from an unrelated repository were noise.
+
 ## Troubleshooting
 
 ### API Errors

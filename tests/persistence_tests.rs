@@ -723,3 +723,100 @@ async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
 
     Ok(())
 }
+
+/// A warm `--persist` start must leave the search stack usable.
+///
+/// Persistence restores symbols only; the BM25 index, TF-IDF embeddings and
+/// `file_cache` are built during the repository walk. Skipping that walk on a
+/// warm cache left `semantic_search` / `search_code` / `find_similar_code`
+/// answering "no results" while `find_symbols` still worked.
+#[tokio::test]
+async fn test_warm_start_keeps_search_working() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn calculate_invoice_total(items: &[i32]) -> i32 {
+            items.iter().sum()
+        }
+    "#,
+    )?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: true,
+        watch_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+    let repo_name = repo
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+
+    // Cold start: builds and persists the index.
+    {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            options.clone(),
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        let cold = engine
+            .semantic_search(Some(&repo_name), "calculate invoice total", 5, None, None)
+            .await?;
+        assert!(cold.contains("calculate_invoice_total"), "cold:\n{cold}");
+    }
+
+    // Warm start: the same query must still find the symbol.
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let symbols = engine
+        .find_symbols(&repo_name, None, Some("calculate"), None, None)
+        .await?;
+    assert!(
+        symbols.contains("calculate_invoice_total"),
+        "symbols after warm start:\n{symbols}"
+    );
+
+    let warm = engine
+        .semantic_search(Some(&repo_name), "calculate invoice total", 5, None, None)
+        .await?;
+    assert!(
+        warm.contains("calculate_invoice_total"),
+        "semantic_search after a warm --persist start returned nothing:\n{warm}"
+    );
+
+    let by_text = engine
+        .search_code(Some(&repo_name), "calculate_invoice_total", None, 5, None)
+        .await?;
+    assert!(
+        by_text.contains("calculate_invoice_total"),
+        "search_code after a warm --persist start returned nothing:\n{by_text}"
+    );
+
+    let similar = engine
+        .find_similar_code(Some(&repo_name), "fn total(items: &[i32]) -> i32", 5, None)
+        .await?;
+    assert!(
+        similar.contains("src/lib.rs"),
+        "find_similar_code after a warm --persist start returned nothing:\n{similar}"
+    );
+
+    Ok(())
+}

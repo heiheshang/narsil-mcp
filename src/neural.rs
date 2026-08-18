@@ -681,9 +681,18 @@ impl SimpleVectorStore {
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+        self.search_filtered(query, k, |_| true)
+    }
+
+    /// Rank only the vectors whose document id passes `allow`.
+    pub fn search_filtered<F>(&self, query: &[f32], k: usize, allow: F) -> Vec<(String, f32)>
+    where
+        F: Fn(&str) -> bool,
+    {
         let embeddings = self.embeddings.read();
         let mut results: Vec<(String, f32)> = embeddings
             .iter()
+            .filter(|(id, _)| allow(id))
             .map(|(id, emb)| (id.clone(), cosine_similarity(query, emb)))
             .collect();
 
@@ -730,10 +739,18 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Neural Engine
 // ============================================================================
 
+/// Repository tag for documents indexed without repository context.
+fn unknown_repo() -> Arc<str> {
+    Arc::from("")
+}
+
 /// A document indexed for neural search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeuralDocument {
     pub id: String,
+    /// Repository this document belongs to (interned; empty when unknown).
+    #[serde(default = "unknown_repo")]
+    pub repo: Arc<str>,
     pub file_path: String,
     pub content: String,
     pub start_line: usize,
@@ -936,9 +953,11 @@ impl NeuralEngine {
     }
 
     /// Index a code snippet
+    #[allow(clippy::too_many_arguments)]
     pub fn index_snippet(
         &self,
         id: String,
+        repo: Arc<str>,
         file_path: String,
         content: String,
         start_line: usize,
@@ -946,17 +965,19 @@ impl NeuralEngine {
         symbol_name: Option<String>,
     ) -> Result<()> {
         let embedding = self.backend.embed(&content)?;
-        self.store.add(&id, &embedding);
+        let key = crate::search::scoped_doc_id(&repo, &id);
+        self.store.add(&key, &embedding);
 
         let doc = NeuralDocument {
-            id: id.clone(),
+            id,
+            repo,
             file_path,
             content,
             start_line,
             end_line,
             symbol_name,
         };
-        self.documents.write().insert(id, doc);
+        self.documents.write().insert(key, doc);
 
         Ok(())
     }
@@ -975,19 +996,42 @@ impl NeuralEngine {
             let embeddings = self.backend.embed_batch(&contents)?;
 
             for ((doc,), embedding) in chunk.iter().zip(embeddings.iter()) {
-                self.store.add(&doc.id, embedding);
-                self.documents.write().insert(doc.id.clone(), doc.clone());
+                // Repository-scoped key: ids are repo-relative and collide
+                // across repositories (every repo has a `src/lib.rs::main`).
+                let key = crate::search::scoped_doc_id(&doc.repo, &doc.id);
+                self.store.add(&key, embedding);
+                self.documents.write().insert(key, doc.clone());
             }
             Ok(())
         })
     }
 
-    /// Search for similar code
+    /// Search for similar code across every indexed repository
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<NeuralSearchResult>> {
+        self.search_in(query, k, None)
+    }
+
+    /// Search for similar code, optionally restricted to one repository.
+    ///
+    /// The filter is applied while ranking vectors, not after: asking for `k`
+    /// hits in a repository returns `k` hits from that repository instead of
+    /// whatever survives a global top-`k`.
+    pub fn search_in(
+        &self,
+        query: &str,
+        k: usize,
+        repo: Option<&str>,
+    ) -> Result<Vec<NeuralSearchResult>> {
         let query_embedding = self.backend.embed(query)?;
-        let results = self.store.search(&query_embedding, k);
 
         let documents = self.documents.read();
+        let results = match repo {
+            None => self.store.search(&query_embedding, k),
+            Some(repo) => self.store.search_filtered(&query_embedding, k, |id| {
+                documents.get(id).is_some_and(|doc| &*doc.repo == repo)
+            }),
+        };
+
         Ok(results
             .into_iter()
             .filter_map(|(id, similarity)| {
@@ -999,20 +1043,46 @@ impl NeuralEngine {
             .collect())
     }
 
-    /// Find code similar to a specific document
-    pub fn find_similar(&self, doc_id: &str, k: usize) -> Result<Vec<NeuralSearchResult>> {
+    /// Repositories that currently have indexed vectors.
+    pub fn indexed_repos(&self) -> Vec<String> {
+        let mut repos: Vec<String> = self
+            .documents
+            .read()
+            .values()
+            .map(|doc| doc.repo.to_string())
+            .filter(|repo| !repo.is_empty())
+            .collect();
+        repos.sort();
+        repos.dedup();
+        repos
+    }
+
+    /// Find code similar to a specific document of a repository. Matches are
+    /// restricted to that repository: "what else looks like this" is about the
+    /// codebase the document lives in.
+    pub fn find_similar(
+        &self,
+        repo: &str,
+        doc_id: &str,
+        k: usize,
+    ) -> Result<Vec<NeuralSearchResult>> {
+        let key = crate::search::scoped_doc_id(repo, doc_id);
+
         let documents = self.documents.read();
-        let doc = documents.get(doc_id).context("Document not found")?.clone();
+        let doc = documents.get(&key).context("Document not found")?.clone();
         drop(documents);
 
         // Re-embed the document content to get its embedding
         let embedding = self.backend.embed(&doc.content)?;
-        let results = self.store.search(&embedding, k + 1);
 
         let documents = self.documents.read();
+        let results = self.store.search_filtered(&embedding, k + 1, |id| {
+            documents.get(id).is_some_and(|doc| &*doc.repo == repo)
+        });
+
         Ok(results
             .into_iter()
-            .filter(|(id, _)| id != doc_id) // Exclude self
+            .filter(|(id, _)| id != &key) // Exclude self
             .take(k)
             .filter_map(|(id, similarity)| {
                 documents.get(&id).map(|doc| NeuralSearchResult {
@@ -1777,6 +1847,28 @@ mod tests {
         // Voyage should NOT get dimensions field
         let voyage = ApiEmbedder::voyage("key");
         assert!(!voyage.model.starts_with("text-embedding-3-"));
+    }
+
+    /// `search_filtered` backs repo-scoped `neural_search`: the filter is
+    /// applied before the top-k cut, so a repository's own best hits are not
+    /// crowded out by higher-scoring documents from other repositories.
+    #[test]
+    fn test_vector_store_search_filtered_applies_before_top_k() {
+        let store = SimpleVectorStore::new(2);
+        store.add("alpha::wanted", &[1.0, 0.0]);
+        store.add("beta::noise_a", &[1.0, 0.0]);
+        store.add("beta::noise_b", &[1.0, 0.0]);
+
+        let unfiltered = store.search(&[1.0, 0.0], 2);
+        assert_eq!(unfiltered.len(), 2);
+
+        let scoped = store.search_filtered(&[1.0, 0.0], 2, |id| id.starts_with("alpha::"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].0, "alpha::wanted");
+
+        assert!(store
+            .search_filtered(&[1.0, 0.0], 2, |id| id.starts_with("gamma::"))
+            .is_empty());
     }
 
     #[test]

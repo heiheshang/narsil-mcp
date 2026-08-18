@@ -121,6 +121,8 @@ impl WasmCodeIntel {
                 // Index file content for search
                 let doc = SearchDocument {
                     id: path.to_string(),
+                    // Single-workspace WASM build: no repository dimension.
+                    repo: std::sync::Arc::from(""),
                     file_path: path.to_string(),
                     content: content.to_string(),
                     doc_type: DocType::File,

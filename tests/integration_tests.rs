@@ -44,6 +44,37 @@ impl TestMcpServer {
         })
     }
 
+    /// Start a new MCP server instance indexing several test repositories
+    fn start_with_repos(repo_paths: &[&Path]) -> Result<Self> {
+        let temp_dir = TempDir::new()?;
+        let binary_path = if cfg!(debug_assertions) {
+            "target/debug/narsil-mcp"
+        } else {
+            "target/release/narsil-mcp"
+        };
+
+        let mut command = Command::new(binary_path);
+        for repo_path in repo_paths {
+            command.arg("--repos").arg(repo_path.to_str().unwrap());
+        }
+
+        let mut process = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let stdin = process.stdin.take().expect("Failed to open stdin");
+        let stdout = BufReader::new(process.stdout.take().expect("Failed to open stdout"));
+
+        Ok(Self {
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(stdout),
+            _process: process,
+            _temp_dir: temp_dir,
+        })
+    }
+
     /// Send a JSON-RPC request and receive a response
     fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         let request = json!({
@@ -676,6 +707,113 @@ fn test_semantic_search_returns_function_not_file() -> Result<()> {
     assert!(
         content.contains("Lines 2-4"),
         "expected a function-scoped line range (2-4), got:\n{content}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_semantic_search_is_scoped_to_requested_repo() -> Result<()> {
+    // With several repositories indexed, `repo` must restrict the hits to that
+    // repository instead of ranking the whole corpus.
+    let alpha = TestRepo::new()?;
+    alpha.add_rust_file(
+        "src/alpha.rs",
+        r#"
+        pub fn compute_alpha_total(items: &[i32]) -> i32 {
+            items.iter().sum()
+        }
+    "#,
+    )?;
+
+    let beta = TestRepo::new()?;
+    beta.add_rust_file(
+        "src/beta.rs",
+        r#"
+        pub fn compute_beta_total(items: &[i32]) -> i32 {
+            items.iter().sum()
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repos(&[alpha.path(), beta.path()])?;
+    let alpha_name = alpha.path().file_name().unwrap().to_str().unwrap();
+    let beta_name = beta.path().file_name().unwrap().to_str().unwrap();
+    server.wait_for_repo(alpha_name, Duration::from_secs(30))?;
+    server.wait_for_repo(beta_name, Duration::from_secs(30))?;
+
+    // Without a repo filter both repositories are searched.
+    let all = server.call_tool(
+        "semantic_search",
+        json!({"query": "compute total", "max_results": 10}),
+    )?;
+    let all_content = all["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(all_content.contains("alpha.rs"), "got:\n{all_content}");
+    assert!(all_content.contains("beta.rs"), "got:\n{all_content}");
+
+    // Scoped to alpha: beta's hits must not leak in.
+    let scoped = server.call_tool(
+        "semantic_search",
+        json!({"query": "compute total", "repo": alpha_name, "max_results": 10}),
+    )?;
+    assert!(scoped["error"].is_null());
+    let scoped_content = scoped["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(
+        scoped_content.contains("alpha.rs"),
+        "expected the alpha hit, got:\n{scoped_content}"
+    );
+    assert!(
+        !scoped_content.contains("beta.rs"),
+        "beta results leaked into a search scoped to alpha:\n{scoped_content}"
+    );
+
+    // A filesystem path is accepted too, like elsewhere in the tool surface.
+    let by_path = server.call_tool(
+        "semantic_search",
+        json!({
+            "query": "compute total",
+            "repo": beta.path().to_str().unwrap(),
+            "max_results": 10
+        }),
+    )?;
+    let by_path_content = by_path["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(
+        by_path_content.contains("beta.rs") && !by_path_content.contains("alpha.rs"),
+        "path-form repo argument did not scope the search:\n{by_path_content}"
+    );
+
+    // The same scoping applies to the similarity search.
+    let similar = server.call_tool(
+        "find_similar_code",
+        json!({
+            "query": "fn compute_total(items: &[i32]) -> i32 { items.iter().sum() }",
+            "repo": alpha_name,
+            "max_results": 10
+        }),
+    )?;
+    let similar_content = similar["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(
+        !similar_content.contains("beta.rs"),
+        "find_similar_code ignored the repo filter:\n{similar_content}"
+    );
+
+    // An unknown repository is an error, not an empty result set.
+    let unknown = server.call_tool(
+        "semantic_search",
+        json!({"query": "compute total", "repo": "no-such-repo"}),
+    )?;
+    let unknown_text = format!("{unknown}");
+    assert!(
+        unknown_text.contains("not found") || unknown_text.contains("not an indexed repository"),
+        "expected a repo-not-found error, got:\n{unknown_text}"
     );
 
     Ok(())
