@@ -201,6 +201,30 @@ pub struct CodeIntelEngine {
     knowledge_graph: Option<Arc<crate::persistence::KnowledgeGraph>>,
 }
 
+/// What a repository walk did, so the caller can tell a cache-confirming pass
+/// from one that actually found new or changed code.
+#[derive(Debug, Clone, Copy, Default)]
+struct WalkOutcome {
+    /// Files that contributed at least one symbol (what the persisted index holds).
+    symbol_files: usize,
+    /// Files that had to be parsed because the persisted index had no usable
+    /// entry for them — missing, or stale against the file on disk.
+    reparsed_files: usize,
+}
+
+/// Symbols for `file_path` from a persisted index, if that entry can still be
+/// trusted. `needs_reindex` compares size + mtime first and falls back to a
+/// content hash, so a file edited since the index was written is re-parsed
+/// rather than resurrected from the cache.
+fn reusable_symbols(persisted: Option<&PersistedIndex>, file_path: &Path) -> Option<Vec<Symbol>> {
+    let persisted = persisted?;
+    let metadata = persisted.files.get(file_path)?;
+    if persisted.needs_reindex(file_path).unwrap_or(true) {
+        return None;
+    }
+    Some(metadata.symbols.clone())
+}
+
 impl CodeIntelEngine {
     /// Create a new engine with default options (no git, no call graphs, no persistence)
     ///
@@ -492,41 +516,58 @@ impl CodeIntelEngine {
 
             let was_cached = self.repos.contains_key(&repo_name);
 
-            // Check if already loaded from persistence
-            if was_cached {
-                // Neural vectors live outside the persisted index, and they are
-                // only built while walking a repository. Skipping that walk left
-                // `neural_search` silently empty whenever --persist had a warm
-                // cache, so re-walk when neural is on. The embeddings themselves
-                // come from the on-disk cache, so this costs a parse, not an API
-                // round trip per symbol.
-                if self.neural_engine.is_some() {
-                    info!(
-                        "Repository {} loaded from cache; re-walking to build neural vectors",
-                        repo_name
-                    );
-                } else {
-                    info!("Repository {} already loaded from cache", repo_name);
-                    self.indexed_repos_count.fetch_add(1, Ordering::Release);
-                    continue;
-                }
+            if !repo_path.exists() {
+                warn!("Repository path does not exist: {:?}", repo_path);
+                continue;
             }
 
-            if repo_path.exists() {
-                info!("Indexing repository: {:?}", repo_path);
-                if let Err(e) = self.index_repo(repo_path).await {
-                    warn!("Failed to index {:?}: {}", repo_path, e);
-                } else {
-                    // Only persist a genuinely-new index. A neural re-walk over
-                    // a warm cache rebuilds identical symbols and must not
-                    // trigger a full re-hash of every file on each startup.
-                    if !was_cached {
+            // A warm cache still needs the walk: persistence restores symbols
+            // and repo metadata, while `file_cache`, the BM25 index, the TF-IDF
+            // embeddings, normalized 1C documents and neural vectors are built
+            // here. Skipping it left `semantic_search`, `search_code`,
+            // `find_similar_code` and friends answering from empty indexes.
+            // The cached symbols keep tree-sitter off unchanged files.
+            let persisted = if was_cached {
+                self.index_store
+                    .as_ref()
+                    .and_then(|store| store.load_or_create(repo_path).ok())
+            } else {
+                None
+            };
+
+            info!("Indexing repository: {:?}", repo_path);
+            let outcome = match persisted.as_ref() {
+                Some(persisted) => {
+                    info!(
+                        "Repository {} loaded from cache; re-walking with {} cached files",
+                        repo_name,
+                        persisted.files.len()
+                    );
+                    self.index_repo_warm(repo_path, persisted).await
+                }
+                None => self.index_repo_inner(repo_path, None).await,
+            };
+
+            match outcome {
+                Err(e) => warn!("Failed to index {:?}: {}", repo_path, e),
+                Ok(outcome) => {
+                    // Rewrite the persisted index only when this walk changed
+                    // it. Saving re-hashes every file, so a pass that merely
+                    // confirmed the cache must not pay for it on each startup.
+                    let changed = match persisted.as_ref() {
+                        None => true,
+                        Some(persisted) => {
+                            outcome.reparsed_files > 0
+                                || outcome.symbol_files != persisted.files.len()
+                        }
+                    };
+                    if changed {
                         indexed_any = true;
+                    } else {
+                        info!("Persisted index for {} is up to date", repo_name);
                     }
                     self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 }
-            } else {
-                warn!("Repository path does not exist: {:?}", repo_path);
             }
         }
 
@@ -620,12 +661,40 @@ impl CodeIntelEngine {
     }
 
     async fn index_repo(&self, path: &Path) -> Result<()> {
+        self.index_repo_inner(path, None).await.map(|_| ())
+    }
+
+    /// Walk a repository, reusing symbols from a persisted index for files that
+    /// have not changed on disk.
+    ///
+    /// Persistence restores symbols and repository metadata only: `file_cache`,
+    /// the BM25 search index, the TF-IDF embeddings, normalized 1C documents
+    /// and neural vectors are all built during the walk. Skipping the walk on a
+    /// warm cache therefore left every search tool answering from an empty
+    /// index. Re-walking restores them; reusing the cached symbols keeps the
+    /// expensive part — tree-sitter parsing — off unchanged files.
+    async fn index_repo_warm(
+        &self,
+        path: &Path,
+        persisted: &PersistedIndex,
+    ) -> Result<WalkOutcome> {
+        self.index_repo_inner(path, Some(persisted)).await
+    }
+
+    async fn index_repo_inner(
+        &self,
+        path: &Path,
+        reuse: Option<&PersistedIndex>,
+    ) -> Result<WalkOutcome> {
         let start_time = std::time::Instant::now();
         let repo_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+        // Interned once per repository: every search/neural document carries a
+        // cheap clone of this tag so searches can be scoped to one repo.
+        let repo_tag: Arc<str> = Arc::from(repo_name.as_str());
 
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
@@ -633,6 +702,12 @@ impl CodeIntelEngine {
         let mut normalized_docs_vec: Vec<NormalizedDocument> = Vec::new();
         let mut file_count = 0;
         let mut total_lines = 0;
+        let mut symbol_files = 0usize;
+        let mut reparsed_files = 0usize;
+
+        // Symbols are only reusable when the walk does not also need parse
+        // trees: the call graph is built from them, and they are not persisted.
+        let reuse = reuse.filter(|_| !self.options.call_graph_enabled);
 
         // Use ignore crate to respect .gitignore
         let walker = ignore::WalkBuilder::new(path)
@@ -673,16 +748,38 @@ impl CodeIntelEngine {
                     .filter_map(|file_path| {
                         let parse_start = std::time::Instant::now();
                         let content = read_indexable_text_file(file_path)?;
-                        let parsed = self.parser.parse_file(file_path, &content).ok();
+                        let (parsed, reused) = match reusable_symbols(reuse, file_path) {
+                            Some(symbols) => (
+                                Some(crate::parser::ParsedFile {
+                                    path: file_path.to_string_lossy().to_string(),
+                                    language: file_path
+                                        .extension()
+                                        .and_then(|ext| ext.to_str())
+                                        .map(ext_to_language)
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    symbols,
+                                    tree: None,
+                                }),
+                                true,
+                            ),
+                            None => (self.parser.parse_file(file_path, &content).ok(), false),
+                        };
                         metrics.record_file_parse(parse_start.elapsed());
-                        Some((file_path.clone(), content, parsed))
+                        Some((file_path.clone(), content, parsed, reused))
                     })
                     .collect();
 
                 let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-                for (file_path, content, parsed) in parsed_chunk {
+                for (file_path, content, parsed, reused) in parsed_chunk {
                     file_count += 1;
+                    if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty()) {
+                        symbol_files += 1;
+                        if reuse.is_some() && !reused {
+                            // Missing from the cache or changed on disk.
+                            reparsed_files += 1;
+                        }
+                    }
                     let lines = content.lines().count();
                     total_lines += lines;
 
@@ -730,6 +827,7 @@ impl CodeIntelEngine {
                                 card.push_str(doc);
                             }
                             self.search_index.index_symbol(
+                                Arc::clone(&repo_tag),
                                 &relative_path,
                                 &symbol.name,
                                 &card,
@@ -743,6 +841,7 @@ impl CodeIntelEngine {
                                 let symbol_id = format!("{}::{}", relative_path, symbol.name);
                                 self.embedding_engine.index_snippet_embed_only(
                                     symbol_id.clone(),
+                                    Arc::clone(&repo_tag),
                                     relative_path.clone(),
                                     sig.clone(),
                                     symbol.start_line,
@@ -753,6 +852,7 @@ impl CodeIntelEngine {
                                 if self.neural_engine.is_some() {
                                     neural_docs.push(crate::neural::NeuralDocument {
                                         id: symbol_id,
+                                        repo: Arc::clone(&repo_tag),
                                         file_path: relative_path.clone(),
                                         content: sig.clone(),
                                         start_line: symbol.start_line,
@@ -781,11 +881,15 @@ impl CodeIntelEngine {
                     // extracted no symbols (text-only / unsupported languages).
                     // Parsed files index per-symbol cards above instead.
                     if !has_parser_support {
-                        self.search_index.index_file(&relative_path, &content);
+                        self.search_index.index_file(
+                            Arc::clone(&repo_tag),
+                            &relative_path,
+                            &content,
+                        );
                     }
 
                     for document in collect_onec_normalized_documents(path, file_path.as_path()) {
-                        self.index_normalized_document(&document);
+                        self.index_normalized_document(Arc::clone(&repo_tag), &document);
                         normalized_docs_vec.push(document);
                     }
                 }
@@ -924,10 +1028,13 @@ impl CodeIntelEngine {
             }
         }
 
-        Ok(())
+        Ok(WalkOutcome {
+            symbol_files,
+            reparsed_files,
+        })
     }
 
-    fn index_normalized_document(&self, document: &NormalizedDocument) {
+    fn index_normalized_document(&self, repo: Arc<str>, document: &NormalizedDocument) {
         let file_path = normalized_document_primary_source(document);
         let content = render_normalized_search_content(document);
         let start_line = 1;
@@ -939,6 +1046,7 @@ impl CodeIntelEngine {
         // the embedding engine doubled ~1 GB of redundant content on the 1C dump.
         self.search_index.add_document(SearchDocument {
             id: document.id.clone(),
+            repo: Arc::clone(&repo),
             file_path: file_path.clone(),
             content: String::new(),
             doc_type: DocType::Other,
@@ -949,6 +1057,7 @@ impl CodeIntelEngine {
 
         self.embedding_engine.index_snippet_embed_only(
             document.id.clone(),
+            Arc::clone(&repo),
             file_path,
             content,
             start_line,
@@ -1039,6 +1148,43 @@ impl CodeIntelEngine {
                 repo_names.join(", ")
             )
         })
+    }
+
+    /// Resolve a user-supplied repository argument to the indexed repository
+    /// key that tags its documents. Accepts either a repository name (as shown
+    /// by `list_repos`) or a filesystem path inside an indexed repository, so
+    /// repo-scoped searches behave like the rest of the tool surface.
+    fn resolve_repo_name(&self, name: &str) -> Result<String> {
+        if self.repos.contains_key(name) {
+            return Ok(name.to_string());
+        }
+
+        if name.contains('/') || name.contains('\\') {
+            let as_path = PathBuf::from(name);
+            for entry in self.repos.iter() {
+                let repo_path = &entry.value().path;
+                if as_path == *repo_path || as_path.starts_with(repo_path) {
+                    return Ok(entry.key().clone());
+                }
+                if let (Ok(canonical), Ok(repo_canonical)) =
+                    (as_path.canonicalize(), repo_path.canonicalize())
+                {
+                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
+                        return Ok(entry.key().clone());
+                    }
+                }
+            }
+        }
+
+        // Reuse the shared "not found / available repositories" diagnostics.
+        self.get_repo_path(name)?;
+        let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
+        Err(anyhow!(
+            "Repository '{}' is not an indexed repository. Available repositories: {}. \
+             Use list_repos to see all indexed repositories.",
+            name,
+            repo_names.join(", ")
+        ))
     }
 
     /// Get a reference to the engine options
@@ -2203,7 +2349,11 @@ impl CodeIntelEngine {
                         self.file_cache.insert(change.path.clone(), ());
 
                         // Update search index
-                        self.search_index.index_file(&rel_path, &content);
+                        self.search_index.index_file(
+                            Arc::from(repo_name.as_str()),
+                            &rel_path,
+                            &content,
+                        );
 
                         let normalized_documents =
                             collect_onec_normalized_documents(repo_path, &change.path);
@@ -2221,7 +2371,10 @@ impl CodeIntelEngine {
                                 .insert(repo_name.clone(), normalized_documents.clone());
                         }
                         for document in normalized_documents {
-                            self.index_normalized_document(&document);
+                            self.index_normalized_document(
+                                Arc::from(repo_name.as_str()),
+                                &document,
+                            );
                         }
 
                         // Smart cache invalidation - only invalidate entries that depend on this file
@@ -2733,8 +2886,14 @@ impl CodeIntelEngine {
     /// Read the raw code for a document's line range from disk. Used to
     /// regenerate display text for embedding/similarity results whose content
     /// is no longer retained in memory.
-    fn raw_lines_for_document(&self, file_path: &str, start_line: usize, end_line: usize) -> String {
-        for repo_path in &self.repo_paths {
+    fn raw_lines_for_document(
+        &self,
+        repo: &str,
+        file_path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> String {
+        for repo_path in self.document_search_paths(repo) {
             let abs = repo_path.join(file_path);
             let Some(content) = self.content_for(&abs) else {
                 continue;
@@ -2747,10 +2906,35 @@ impl CodeIntelEngine {
         String::new()
     }
 
+    /// Repository roots to resolve a document's relative path against.
+    ///
+    /// A document tagged with its repository resolves inside that repository
+    /// only — the same relative path exists in several indexed repositories, so
+    /// scanning them all could render another codebase's file. Untagged
+    /// documents (WASM, transient indexes) keep the old scan.
+    fn document_search_paths(&self, repo: &str) -> Vec<PathBuf> {
+        if !repo.is_empty() {
+            if let Ok(path) = self.get_repo_path(repo) {
+                return vec![path];
+            }
+        }
+        self.repo_paths.clone()
+    }
+
     /// Re-render a normalized 1C metadata document's searchable content by id.
     /// These docs are indexed with empty raw text; the content is re-rendered
     /// from `normalized_docs` on demand instead of being stored (twice).
-    fn normalized_doc_content_by_id(&self, id: &str) -> Option<String> {
+    fn normalized_doc_content_by_id(&self, repo: &str, id: &str) -> Option<String> {
+        // Normalized-document ids are repo-relative too, so a bare id lookup
+        // could render the same-named document of another repository.
+        if !repo.is_empty() {
+            return self.normalized_docs.get(repo).and_then(|docs| {
+                docs.iter()
+                    .find(|d| d.id == id)
+                    .map(render_normalized_search_content)
+            });
+        }
+
         self.normalized_docs.iter().find_map(|entry| {
             entry
                 .value()
@@ -2764,12 +2948,13 @@ impl CodeIntelEngine {
     /// document whose raw text is no longer stored in the persistent index.
     fn snippet_for_document(
         &self,
+        repo: &str,
         file_path: &str,
         start_line: usize,
         end_line: usize,
         matched_terms: &[String],
     ) -> String {
-        for repo_path in &self.repo_paths {
+        for repo_path in self.document_search_paths(repo) {
             let abs = repo_path.join(file_path);
             let Some(content) = self.content_for(&abs) else {
                 continue;
@@ -2812,22 +2997,18 @@ impl CodeIntelEngine {
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
 
-        // Validate repo if specified
-        let repo_name = if let Some(r) = repo {
-            if !r.is_empty() {
-                // Verify the repo exists
-                let _ = self.get_repo_path(r)?;
-                Some(r)
-            } else {
-                None
-            }
-        } else {
-            None
+        // Resolve the repo filter to the indexed name that tags documents.
+        // An unknown name is an error, not a silently corpus-wide search.
+        let repo_name = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo_name(r)?),
+            _ => None,
         };
 
         let results: Vec<_> = self
             .search_index
-            .search(query, max_results * 2) // Get more results to filter
+            // Repo filtering happens inside the index, before ranking, so the
+            // result budget is spent on the requested repository only.
+            .search_in(query, max_results * 2, repo_name.as_deref()) // Get more results to filter
             .into_iter()
             .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
             .take(max_results)
@@ -2841,7 +3022,7 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Semantic Search: `{}`\n\n", query));
-        if let Some(r) = repo_name {
+        if let Some(ref r) = repo_name {
             output.push_str(&format!("Repository: {}\n", r));
         }
         output.push_str(&format!("Found {} results\n\n", results.len()));
@@ -2858,11 +3039,16 @@ impl CodeIntelEngine {
                 result.document.start_line, result.document.end_line
             ));
             output.push_str("```\n");
-            let snippet = match self.normalized_doc_content_by_id(&result.document.id) {
-                Some(rendered) => {
-                    crate::search::SearchIndex::generate_snippet(&rendered, &result.matched_terms, 1)
-                }
+            let snippet = match self
+                .normalized_doc_content_by_id(&result.document.repo, &result.document.id)
+            {
+                Some(rendered) => crate::search::SearchIndex::generate_snippet(
+                    &rendered,
+                    &result.matched_terms,
+                    1,
+                ),
                 None => self.snippet_for_document(
+                    &result.document.repo,
                     &result.document.file_path,
                     result.document.start_line,
                     result.document.end_line,
@@ -2900,22 +3086,16 @@ impl CodeIntelEngine {
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
 
-        // Validate repo if specified
-        let repo_name = if let Some(r) = repo {
-            if !r.is_empty() {
-                // Verify the repo exists
-                let _ = self.get_repo_path(r)?;
-                Some(r)
-            } else {
-                None
-            }
-        } else {
-            None
+        // Resolve the repo filter to the indexed name that tags documents.
+        let repo_name = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo_name(r)?),
+            _ => None,
         };
 
         let results: Vec<_> = self
             .embedding_engine
-            .find_similar_code(query, max_results * 2) // Get more to filter
+            // Scoped before ranking, so `max_results` is spent on this repo.
+            .find_similar_code_in(query, max_results * 2, repo_name.as_deref()) // Get more to filter
             .into_iter()
             .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
             .take(max_results)
@@ -2923,7 +3103,7 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Similar Code Search: `{}`\n\n", query));
-        if let Some(r) = repo_name {
+        if let Some(ref r) = repo_name {
             output.push_str(&format!("Repository: {}\n", r));
         }
         output.push_str(&format!(
@@ -2944,9 +3124,10 @@ impl CodeIntelEngine {
             ));
             output.push_str("```\n");
             let content = self
-                .normalized_doc_content_by_id(&result.document.id)
+                .normalized_doc_content_by_id(&result.document.repo, &result.document.id)
                 .unwrap_or_else(|| {
                     self.raw_lines_for_document(
+                        &result.document.repo,
                         &result.document.file_path,
                         result.document.start_line,
                         result.document.end_line,
@@ -2971,6 +3152,7 @@ impl CodeIntelEngine {
         max_results: usize,
     ) -> Result<String> {
         // First find the symbol to get its ID
+        let repo = &self.resolve_repo_name(repo)?;
         let symbols = self
             .symbols
             .get(repo)
@@ -2993,7 +3175,7 @@ impl CodeIntelEngine {
         // Find similar code to this symbol
         let results = self
             .embedding_engine
-            .find_similar_to_doc(&symbol_id, max_results);
+            .find_similar_to_doc(repo, &symbol_id, max_results);
 
         let mut output = String::new();
         output.push_str(&format!("# Code Similar to Symbol: `{}`\n\n", symbol_name));
@@ -3021,9 +3203,10 @@ impl CodeIntelEngine {
             ));
             output.push_str("```\n");
             let content = self
-                .normalized_doc_content_by_id(&result.document.id)
+                .normalized_doc_content_by_id(&result.document.repo, &result.document.id)
                 .unwrap_or_else(|| {
                     self.raw_lines_for_document(
+                        &result.document.repo,
                         &result.document.file_path,
                         result.document.start_line,
                         result.document.end_line,
@@ -4125,6 +4308,10 @@ impl CodeIntelEngine {
         use std::sync::Arc;
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
+        let target_repo = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo_name(r)?),
+            _ => None,
+        };
 
         // Create search engines
         let bm25_index = Arc::new(ConcurrentSearchIndex::new());
@@ -4138,8 +4325,8 @@ impl CodeIntelEngine {
             let repo_meta = repo_entry.value();
 
             // Filter by repo if specified
-            if let Some(target_repo) = repo {
-                if repo_name != target_repo && !repo_meta.path.ends_with(target_repo) {
+            if let Some(ref target_repo) = target_repo {
+                if repo_name != target_repo {
                     continue;
                 }
             }
@@ -4191,6 +4378,7 @@ impl CodeIntelEngine {
 
                     bm25_index.add_document(SearchDocument {
                         id: document.id.clone(),
+                        repo: Arc::from(repo_name.as_str()),
                         file_path: primary_source.clone(),
                         content: content.clone(),
                         doc_type: DocType::Other,
@@ -4201,6 +4389,7 @@ impl CodeIntelEngine {
 
                     tfidf_engine.index_snippet(
                         document.id.clone(),
+                        Arc::from(repo_name.as_str()),
                         primary_source,
                         content.clone(),
                         1,
@@ -4276,6 +4465,10 @@ impl CodeIntelEngine {
         use crate::security_rules::is_test_file;
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
+        let target_repo = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo_name(r)?),
+            _ => None,
+        };
         let chunker = AstChunker::new();
         let query_tokens: std::collections::HashSet<_> = tokenize_code(query).into_iter().collect();
         let mut all_chunks = Vec::new();
@@ -4295,8 +4488,8 @@ impl CodeIntelEngine {
             let repo_meta = repo_entry.value();
 
             // Filter by repo if specified
-            if let Some(target_repo) = repo {
-                if repo_name != target_repo && !repo_meta.path.ends_with(target_repo) {
+            if let Some(ref target_repo) = target_repo {
+                if repo_name != target_repo {
                     continue;
                 }
             }
@@ -6799,24 +6992,27 @@ impl CodeIntelEngine {
             )
         })?;
 
+        // Validate the repo filter up front: an unknown name would otherwise
+        // look like "nothing matched" instead of a bad argument.
+        let repo_filter = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo_name(r)?),
+            _ => None,
+        };
+
         // Blocking client — keep it off the tokio worker (see index_repo).
         let neural = Arc::clone(neural);
         let query_owned = query.to_string();
-        let results =
-            tokio::task::spawn_blocking(move || neural.search(&query_owned, max_results)).await??;
+        let repo_owned = repo_filter.clone();
+        let filtered_results = tokio::task::spawn_blocking(move || {
+            neural.search_in(&query_owned, max_results, repo_owned.as_deref())
+        })
+        .await??;
 
         let mut output = String::new();
         output.push_str(&format!("# Neural Search Results for: `{}`\n\n", query));
-
-        // Filter by repo if specified
-        let filtered_results: Vec<_> = if let Some(repo_name) = repo {
-            results
-                .into_iter()
-                .filter(|r| r.document.file_path.contains(repo_name))
-                .collect()
-        } else {
-            results
-        };
+        if let Some(ref r) = repo_filter {
+            output.push_str(&format!("Repository: {}\n\n", r));
+        }
 
         if filtered_results.is_empty() {
             output.push_str("No results found.\n");
@@ -6844,9 +7040,10 @@ impl CodeIntelEngine {
 
                 // Show snippet (truncated if long)
                 let content = self
-                    .normalized_doc_content_by_id(&result.document.id)
+                    .normalized_doc_content_by_id(&result.document.repo, &result.document.id)
                     .unwrap_or_else(|| {
                         self.raw_lines_for_document(
+                            &result.document.repo,
                             &result.document.file_path,
                             result.document.start_line,
                             result.document.end_line,
@@ -6880,6 +7077,7 @@ impl CodeIntelEngine {
             .ok_or_else(|| anyhow!("Neural search not available. Enable with --neural flag."))?;
 
         // Get the symbol's code
+        let repo_name = self.resolve_repo_name(repo)?;
         let repo_path = self.get_repo_path(repo)?;
         let file_path = validate_path(&repo_path, path)?;
         let content = std::fs::read_to_string(&file_path)?;
@@ -6887,7 +7085,7 @@ impl CodeIntelEngine {
         // Find the symbol in our index
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_name)
             .ok_or_else(|| anyhow!("Repository not indexed"))?;
         let symbol = symbols
             .iter()
@@ -6900,10 +7098,15 @@ impl CodeIntelEngine {
         let end = symbol.end_line.min(lines.len());
         let symbol_code = lines[start..end].join("\n");
 
-        // Search for similar code
+        // Search for similar code — clones of a function belong to the same
+        // codebase, so the search stays inside this repository.
         let neural = Arc::clone(neural);
         let code_owned = symbol_code.clone();
-        let results = tokio::task::spawn_blocking(move || neural.search(&code_owned, 20)).await??;
+        let repo_owned = repo_name.clone();
+        let results = tokio::task::spawn_blocking(move || {
+            neural.search_in(&code_owned, 20, Some(&repo_owned))
+        })
+        .await??;
 
         let mut output = String::new();
         output.push_str(&format!("# Semantic Clones of `{}`\n\n", function));
@@ -6938,9 +7141,10 @@ impl CodeIntelEngine {
                 ));
 
                 let content = self
-                    .normalized_doc_content_by_id(&result.document.id)
+                    .normalized_doc_content_by_id(&result.document.repo, &result.document.id)
                     .unwrap_or_else(|| {
                         self.raw_lines_for_document(
+                            &result.document.repo,
                             &result.document.file_path,
                             result.document.start_line,
                             result.document.end_line,

@@ -21,6 +21,13 @@ Use **short parameter names**. These are the most common mistakes:
 
 The `repo` parameter expects the **repository name** from `list_repos`, not the full filesystem path.
 
+When several repositories are indexed, every search tool — `search_code`,
+`semantic_search`, `hybrid_search`, `neural_search`, `search_chunks`,
+`find_similar_code` — searches **all** of them unless you pass `repo`. Pass it whenever you mean one codebase:
+the filter is applied during ranking, so `max_results` is spent on hits from
+that repository instead of on a corpus-wide top-k. An unknown `repo` name is
+reported as an error rather than as "no results".
+
 ## Getting Started
 
 **Always start with:**
@@ -62,9 +69,10 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Find files by name | `find_symbols` with `file_pattern` | Know filename pattern |
 | Find function/class definitions | `find_symbols` | Know symbol type |
 | Search by content | `search_code` | Keyword search |
-| BM25-ranked search | `semantic_search` | Better ranking than search_code |
+| BM25-ranked search | `semantic_search` | Better ranking than search_code; `repo` scopes it to one repository |
 | Semantic code search | `hybrid_search` | Natural language queries (combines BM25 + TF-IDF) |
-| Find similar code | `find_similar_code` | Have a code snippet |
+| Neural (embedding) search | `neural_search` | Different naming, same meaning; `repo` scopes it to one repository (requires `--neural`) |
+| Find similar code | `find_similar_code` | Have a code snippet; `repo` scopes it to one repository |
 | Find code like a symbol | `find_similar_to_symbol` | Find patterns similar to existing function |
 | Find code clones | `find_semantic_clones` | Detect duplicate/similar code (Type-3/4 clones) |
 | Search AST chunks | `search_chunks` | Want function/class boundaries |
@@ -238,6 +246,8 @@ For large codebases, use pagination and filtering:
 ## Troubleshooting
 
 **"No repository found"** → Run `list_repos` and use exact repo name
+
+**Results from the wrong codebase** → You omitted `repo`; searches span every indexed repository by default
 
 **Empty results from git tools** → Check `get_index_status` shows git enabled
 

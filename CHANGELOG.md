@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`semantic_search` and `neural_search` honour the `repo` parameter.** Both
+  tools accepted `repo` but searched the whole corpus anyway: `semantic_search`
+  only validated the name and then ranked every indexed repository, and
+  `neural_search` post-filtered a global top-k with a
+  `file_path.contains(repo)` substring test — which both let other
+  repositories eat the `max_results` budget and matched any path that happened
+  to contain the repo name. Search and neural documents now carry an interned
+  repository tag (`Arc<str>`, 16 bytes per document, no per-document
+  allocation), and filtering happens during ranking via
+  `SearchIndex::search_in` / `NeuralEngine::search_in`, so `max_results` is
+  filled from the requested repository. An unknown `repo` name is now an error
+  instead of an empty result set. Omitting `repo` still searches every indexed
+  repository.
+- **The rest of the similarity surface is repo-scoped too.**
+  `find_similar_code` ignored `repo` the same way; `find_similar_to_symbol` and
+  `find_semantic_clones` take a required `repo` but answered from the whole
+  corpus, so "what else looks like this function" could come from an unrelated
+  codebase. All three now search inside the requested repository.
+  `search_chunks` and `hybrid_search` no longer match repositories by a loose
+  `path.ends_with(name)` test, and an unknown name is reported instead of
+  silently returning nothing. `repo` accepts a name from `list_repos` or a path
+  inside the repository.
+- **Documents with colliding ids across repositories no longer shadow each
+  other.** Ids are repository-relative (`src/lib.rs::main` exists in every
+  repository), and both the TF-IDF store and the neural document map keyed on
+  the bare id — so with several repositories indexed one document silently
+  replaced the other, and `find_similar_to_symbol` could answer from the wrong
+  codebase. Both stores now key on `search::scoped_doc_id(repo, id)`.
+- **`--persist` no longer leaves every search tool answering from an empty
+  index.** Persistence restores symbols and repository metadata only —
+  `file_cache`, the BM25 index, the TF-IDF embeddings, normalized 1C documents
+  and neural vectors are all built during the repository walk, and
+  `complete_initialization` skipped that walk whenever the cache was warm. The
+  effect: `find_symbols` worked while `semantic_search`, `search_code`,
+  `search_chunks`, `hybrid_search` and `find_similar_code` reported no results
+  (`get_index_status` showed `Total Documents: 0` next to 122 950 loaded
+  symbols). A warm start now walks the repository but reuses the cached symbols
+  for files that are unchanged on disk — staleness is checked by size + mtime
+  with a content-hash fallback — so tree-sitter parsing is skipped instead of
+  the whole index. The persisted index is rewritten only when the walk actually
+  found new, changed or removed files, so a cache-confirming start does not
+  re-hash every file. This also fixes stale-file detection: a file edited
+  between sessions is now re-parsed rather than served from the cache
+  (`test_persistence_stale_file_detection`, which failed before this change).
+  Symbol reuse is skipped when `--call-graph` is on, since the call graph needs
+  the parse trees.
+- **Snippet rendering no longer reads another repository's file.**
+  `raw_lines_for_document` / `snippet_for_document` resolved a document's
+  relative path against every indexed repository root and rendered the first
+  file that existed; `normalized_doc_content_by_id` scanned all repositories for
+  a matching id. Both now resolve inside the document's own repository.
+
 ## [1.7.0] - 2026-05-12
 
 ### Fixed

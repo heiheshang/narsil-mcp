@@ -503,7 +503,7 @@ lazy_static! {
 
         map.insert("semantic_search", ToolMetadata {
             name: "semantic_search",
-            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries.",
+            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries. Pass `repo` to search inside a single repository.",
             category: ToolCategory::Search,
             tags: ["search", "semantic", "bm25", "ranking"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -513,7 +513,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
+                    "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
                     "doc_type": {"type": "string", "enum": ["file", "function", "class", "struct", "method"], "description": "Filter by document type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
@@ -549,7 +549,7 @@ lazy_static! {
 
         map.insert("neural_search", ToolMetadata {
             name: "neural_search",
-            description: "Search code using neural semantic embeddings. Finds semantically similar code even with different variable names. Requires --neural flag and EMBEDDING_API_KEY.",
+            description: "Search code using neural semantic embeddings. Finds semantically similar code even with different variable names. Pass `repo` to search inside a single repository. Requires --neural flag and EMBEDDING_API_KEY.",
             category: ToolCategory::Search,
             tags: ["search", "neural", "embeddings", "semantic", "ai"].iter().copied().collect(),
             stability: StabilityLevel::Beta,
@@ -559,7 +559,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language or code query"},
-                    "repo": {"type": "string", "description": "Optional: limit to specific repository"},
+                    "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
                 },
                 "required": ["query"]
@@ -593,7 +593,7 @@ lazy_static! {
 
         map.insert("find_similar_code", ToolMetadata {
             name: "find_similar_code",
-            description: "Find code similar to a given snippet using TF-IDF embeddings. Good for finding duplicate or related code patterns.",
+            description: "Find code similar to a given snippet using TF-IDF embeddings. Good for finding duplicate or related code patterns. Pass `repo` to search inside a single repository.",
             category: ToolCategory::Search,
             tags: ["similar", "duplicate", "clone", "tfidf"].iter().copied().collect(),
             stability: StabilityLevel::Stable,

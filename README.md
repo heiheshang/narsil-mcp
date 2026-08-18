@@ -254,7 +254,7 @@ narsil-mcp \
   --repos ~/projects/my-app \
   --git \           # Enable git blame, history, contributors
   --call-graph \    # Enable function call analysis
-  --persist \       # Save index to disk for fast startup
+  --persist \       # Cache symbols on disk: a restart skips re-parsing unchanged files
   --watch \         # Auto-reindex on file changes
   --lsp \           # Enable LSP for hover, go-to-definition
   --streaming \     # Stream large result sets
@@ -563,7 +563,9 @@ claude
 
 Using `.` for `--repos` automatically indexes the current directory. Claude now has access to 90 code intelligence tools.
 
-> **Tip**: Add `--persist --index-path .claude/cache` for faster startup on subsequent runs.
+> **Tip**: Add `--persist --index-path .claude/cache` for faster startup on subsequent
+> runs — the cached symbols let a restart skip tree-sitter parsing for files that have
+> not changed. (Skipped when `--call-graph` is on: the call graph needs the parse trees.)
 
 For global configuration, edit `~/.claude/settings.json` instead. See [Claude Code Integration](docs/playbooks/integrations/claude-code.md) for advanced setups.
 
@@ -752,7 +754,7 @@ const symbols = client.findSymbols('Handler');
 | Tool | Description |
 |------|-------------|
 | `search_code` | Keyword search with relevance ranking |
-| `semantic_search` | BM25-ranked semantic search |
+| `semantic_search` | BM25-ranked semantic search (pass `repo` to scope to one repository) |
 | `hybrid_search` | Combined BM25 + TF-IDF with rank fusion |
 | `search_chunks` | Search over AST-aware code chunks |
 | `find_similar_code` | Find code similar to a snippet (TF-IDF) |
@@ -770,7 +772,7 @@ const symbols = client.findSymbols('Handler');
 
 | Tool | Description |
 |------|-------------|
-| `neural_search` | Semantic search using neural embeddings (finds similar code even with different names) |
+| `neural_search` | Semantic search using neural embeddings (finds similar code even with different names; pass `repo` to scope to one repository) |
 | `find_semantic_clones` | Find Type-3/4 semantic clones of a function |
 | `get_neural_stats` | Neural embedding index statistics |
 
