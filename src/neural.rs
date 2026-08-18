@@ -10,6 +10,7 @@
 use anyhow::{bail, Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
@@ -20,7 +21,17 @@ use std::path::Path;
 
 // Security constants for input validation
 const MAX_EMBEDDING_BATCH_SIZE: usize = 100; // Maximum texts per API request
-const MAX_TEXT_LENGTH: usize = 32_000; // Maximum characters per text (~8k tokens for most models)
+
+// Oversized inputs are truncated, not rejected: embedding servers fail the
+// *whole* request when one input exceeds their context, so a single huge symbol
+// used to cost the embeddings of every other text batched with it.
+//
+// 23_000 chars ≈ 8192 tokens, the context of bge-m3 and most current encoders,
+// at the worst-case ~2.85 chars/token measured on Cyrillic source (1C/BSL).
+// Latin-script text tokenises at ~4 chars/token, so it truncates earlier than
+// strictly necessary — deliberately, since embedding a prefix always beats
+// losing the batch.
+const MAX_TEXT_LENGTH: usize = 23_000;
 const MAX_DIMENSION: usize = 8192; // Maximum embedding dimension (larger than any known model)
 const MIN_DIMENSION: usize = 64; // Minimum reasonable embedding dimension
 const MAX_MODEL_NAME_LENGTH: usize = 256; // Maximum model name length
@@ -403,22 +414,35 @@ impl EmbeddingBackend for ApiEmbedder {
             );
         }
 
-        // Input validation - text length
-        for (i, text) in texts.iter().enumerate() {
-            if text.len() > MAX_TEXT_LENGTH {
-                bail!(
-                    "Text at index {} is {} characters, exceeds maximum of {}",
-                    i,
-                    text.len(),
-                    MAX_TEXT_LENGTH
-                );
-            }
+        // Clamp over-long inputs instead of failing the batch. Allocation is
+        // avoided in the common case: `Cow::Borrowed` unless something is
+        // actually too long.
+        let texts: Vec<Cow<'_, str>> = texts
+            .iter()
+            .map(|text| {
+                if text.len() > MAX_TEXT_LENGTH {
+                    // Byte-slicing must land on a char boundary: MAX_TEXT_LENGTH
+                    // can fall mid-codepoint in Cyrillic, which is 2 bytes per char.
+                    Cow::Borrowed(&text[..text.floor_char_boundary(MAX_TEXT_LENGTH)])
+                } else {
+                    Cow::Borrowed(text.as_str())
+                }
+            })
+            .collect();
+        let truncated = texts.iter().filter(|t| t.len() == MAX_TEXT_LENGTH).count();
+        if truncated > 0 {
+            tracing::debug!(
+                "Truncated {} of {} texts to {} chars before embedding",
+                truncated,
+                texts.len(),
+                MAX_TEXT_LENGTH
+            );
         }
 
         #[derive(Serialize)]
         struct Request<'a> {
             model: &'a str,
-            input: &'a [String],
+            input: &'a [Cow<'a, str>],
             #[serde(skip_serializing_if = "Option::is_none")]
             dimensions: Option<usize>,
         }
@@ -448,7 +472,7 @@ impl EmbeddingBackend for ApiEmbedder {
             .header("Content-Type", "application/json")
             .json(&Request {
                 model: &self.model,
-                input: texts,
+                input: &texts,
                 dimensions,
             });
 
@@ -1740,21 +1764,116 @@ mod tests {
                 768,
             );
 
-            // Text too long
+            // An over-long text must NOT be rejected: the request is attempted
+            // with the text clamped. It still fails here, but on the network
+            // (api.example.com does not resolve), never on length validation.
             let long_text = "a".repeat(40_000);
-            let result = embedder.embed_batch(&[long_text]);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+            let err = embedder
+                .embed_batch(&[long_text])
+                .expect_err("no server behind the test endpoint");
+            assert!(
+                !err.to_string().contains("exceeds maximum"),
+                "over-long text must be truncated, not rejected: {err}"
+            );
 
-            // Multiple texts, one too long
+            // One over-long text must not take its batch neighbours down with it.
             let texts = vec![
                 "normal text".to_string(),
                 "a".repeat(40_000),
                 "another normal text".to_string(),
             ];
-            let result = embedder.embed_batch(&texts);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("index 1"));
+            let err = embedder.embed_batch(&texts).expect_err("no server");
+            assert!(!err.to_string().contains("index 1"), "got: {err}");
+        }
+
+        /// The point of the fix is what actually goes on the wire, so assert on
+        /// the request body rather than on the absence of an error.
+        #[test]
+        fn test_oversized_input_is_clamped_on_the_wire() {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().unwrap().port();
+
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(&stream);
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().expect("content-length");
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).expect("body");
+
+                let mut stream = &stream;
+                let payload = br#"{"data":[{"embedding":[0.0,0.0,0.0]}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                stream.write_all(payload).unwrap();
+                stream.flush().unwrap();
+                String::from_utf8(body).expect("utf8 body")
+            });
+
+            let embedder = ApiEmbedder::custom(
+                &format!("http://127.0.0.1:{port}/v1/embeddings"),
+                "test-model",
+                None,
+                3,
+            );
+            // 40k chars of Cyrillic: over the cap, and its byte length makes a
+            // naive slice land mid-codepoint.
+            let huge = "Процедура ".repeat(4_000);
+            assert!(huge.len() > MAX_TEXT_LENGTH);
+            embedder.embed_batch(&[huge]).expect("embed");
+
+            let body = server.join().expect("server thread");
+            let sent: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let sent = sent["input"][0].as_str().expect("input[0]");
+            assert!(
+                sent.len() <= MAX_TEXT_LENGTH,
+                "sent {} bytes, cap is {MAX_TEXT_LENGTH}",
+                sent.len()
+            );
+            assert!(
+                sent.len() > MAX_TEXT_LENGTH - 4,
+                "should clamp at the cap, not far below it: {}",
+                sent.len()
+            );
+            assert!(sent.starts_with("Процедура "), "prefix must be preserved");
+        }
+
+        #[test]
+        fn test_truncation_lands_on_char_boundary() {
+            // MAX_TEXT_LENGTH bytes can fall mid-codepoint in Cyrillic (2 bytes
+            // per char), where naive byte slicing panics.
+            let cyrillic = "Процедура".repeat(10_000);
+            assert!(cyrillic.len() > MAX_TEXT_LENGTH);
+            let cut = cyrillic.floor_char_boundary(MAX_TEXT_LENGTH);
+            assert!(cyrillic.is_char_boundary(cut));
+            assert!(cut <= MAX_TEXT_LENGTH);
+            // The slice itself must not panic.
+            let _ = &cyrillic[..cut];
+
+            let embedder = ApiEmbedder::custom(
+                "https://api.example.com/embeddings",
+                "test-model",
+                Some("test-key"),
+                768,
+            );
+            let err = embedder.embed_batch(&[cyrillic]).expect_err("no server");
+            assert!(!err.to_string().contains("exceeds maximum"), "got: {err}");
         }
 
         #[test]
