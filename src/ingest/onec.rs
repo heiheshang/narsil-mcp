@@ -281,7 +281,10 @@ impl OneCIngestor {
             .unwrap_or_else(|| relative_path.to_string_lossy().to_string());
 
         let mut metadata = BTreeMap::new();
-        metadata.insert("object_type".to_string(), "DataCompositionSchema".to_string());
+        metadata.insert(
+            "object_type".to_string(),
+            "DataCompositionSchema".to_string(),
+        );
         metadata.insert("object_name".to_string(), schema_name.clone());
         metadata.insert(
             "relative_path".to_string(),
@@ -558,9 +561,7 @@ fn record_text(path: &[String], text: &str, parsed: &mut ParsedMetadata) {
 
     // Scalar properties (Global, Server, …) at `<Object><prop>` (minimal) or
     // `<Object><Properties><prop>` (real dump).
-    let prop_name = if path.len() == 3 {
-        Some(last)
-    } else if path.len() == 4 && path[2] == "Properties" {
+    let prop_name = if path.len() == 3 || (path.len() == 4 && path[2] == "Properties") {
         Some(last)
     } else {
         None
@@ -773,10 +774,7 @@ fn parse_form_composition(xml: &str) -> Option<OneCFormComposition> {
                     if let Some(element) = elements.last_mut() {
                         element.data_path = Some(text);
                     }
-                } else if top == Some("content")
-                    && elements.is_empty()
-                    && model.title.is_empty()
-                {
+                } else if top == Some("content") && elements.is_empty() && model.title.is_empty() {
                     model.title = text;
                 }
             }
@@ -1052,10 +1050,7 @@ fn render_summary_text(summary: &OneCMetadataSummary) -> String {
     }
 
     if !domain.movements.is_empty() {
-        lines.push(format!(
-            "Register records ({})",
-            domain.movements.len()
-        ));
+        lines.push(format!("Register records ({})", domain.movements.len()));
         for movement in &domain.movements {
             lines.push(format!("  - {movement}"));
         }
@@ -1122,7 +1117,11 @@ fn render_data_composition_text(schema_name: &str, schema: &OneCDataComposition)
         lines.push(header);
 
         if !data_set.fields.is_empty() {
-            lines.push(format!("  Fields ({}): {}", data_set.fields.len(), data_set.fields.join(", ")));
+            lines.push(format!(
+                "  Fields ({}): {}",
+                data_set.fields.len(),
+                data_set.fields.join(", ")
+            ));
         }
 
         if let Some(query) = &data_set.query {
@@ -1475,7 +1474,10 @@ mod tests {
         assert_eq!(form.handlers.len(), 1);
         assert_eq!(
             form.handlers[0],
-            ("OnCreateAtServer".to_string(), "ПриСозданииНаСервере".to_string())
+            (
+                "OnCreateAtServer".to_string(),
+                "ПриСозданииНаСервере".to_string()
+            )
         );
 
         assert_eq!(form.elements.len(), 3);

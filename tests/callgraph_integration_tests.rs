@@ -473,10 +473,7 @@ fn test_bsl_common_module_call_resolution() {
         )
         .unwrap();
     let doc_tree = parser
-        .parse_to_tree(
-            Path::new("Documents/Заказ/Ext/ObjectModule.bsl"),
-            doc_code,
-        )
+        .parse_to_tree(Path::new("Documents/Заказ/Ext/ObjectModule.bsl"), doc_code)
         .unwrap();
 
     let files = vec![
@@ -504,5 +501,8 @@ fn test_bsl_common_module_call_resolution() {
         "caller should be ОбработкаПроведения, got: {:?}",
         callers.iter().map(|e| &e.target).collect::<Vec<_>>()
     );
-    assert!(callers.iter().all(|e| e.resolved), "cross-module call should resolve");
+    assert!(
+        callers.iter().all(|e| e.resolved),
+        "cross-module call should resolve"
+    );
 }

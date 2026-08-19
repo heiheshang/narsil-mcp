@@ -1597,7 +1597,10 @@ mod tests {
     #[test]
     fn test_truncate_text_does_not_split_multibyte_characters() {
         let text = "xСуммаДокументаПоВсемСтрокамТабличнойЧастиТоваровИУслуг = 0;";
-        assert!(!text.is_char_boundary(60), "test string lost its odd offset");
+        assert!(
+            !text.is_char_boundary(60),
+            "test string lost its odd offset"
+        );
 
         let truncated = truncate_text(text, 60);
         assert!(truncated.ends_with("..."));
@@ -1614,8 +1617,7 @@ mod tests {
                 function_name: "ОбработкаПроведения".to_string(),
                 variable: "СуммаДокумента".to_string(),
                 line: 42,
-                text: "xСуммаДокументаПоВсемСтрокамТабличнойЧастиТоваровИУслуг = 0;"
-                    .to_string(),
+                text: "xСуммаДокументаПоВсемСтрокамТабличнойЧастиТоваровИУслуг = 0;".to_string(),
             }],
             unused_imports: Vec::new(),
         };

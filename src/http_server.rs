@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 use crate::index::CodeIntelEngine;
 use crate::mcp::McpServer;
-use crate::tool_metadata::TOOL_METADATA;
 use crate::tool_handlers::ToolRegistry;
+use crate::tool_metadata::TOOL_METADATA;
 
 /// Maximum HTTP request body size (2 MB).
 const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
@@ -516,10 +516,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
 
 /// MCP streamable-http session termination (`DELETE /mcp`).
 async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
-    if let Some(sid) = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.sessions.lock().unwrap().remove(sid) {
             info!("MCP streamable-http session terminated: {}", sid);
         }

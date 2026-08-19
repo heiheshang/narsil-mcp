@@ -2069,7 +2069,10 @@ impl CodeIntelEngine {
             rss_kb as f64 / 1024.0
         );
 
-        info!("[mem] file_cache: {} files (paths only)", self.file_cache.len());
+        info!(
+            "[mem] file_cache: {} files (paths only)",
+            self.file_cache.len()
+        );
 
         let (sym_count, sym_bytes) = {
             let mut c = 0usize;
@@ -5286,11 +5289,10 @@ impl CodeIntelEngine {
                     || path_str.ends_with(".go")
                     || path_str.ends_with(".rs")
             })
-            .map(|entry| {
+            .filter_map(|entry| {
                 self.content_for(entry.key())
                     .map(|c| (entry.key().clone(), c))
             })
-            .flatten()
             .collect();
 
         for (file_path, content) in &files {
@@ -5493,8 +5495,7 @@ impl CodeIntelEngine {
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
-            .map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
-            .flatten()
+            .filter_map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
             .collect();
 
         // Parse ruleset tags
@@ -5621,8 +5622,7 @@ impl CodeIntelEngine {
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
-            .map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
-            .flatten()
+            .filter_map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
             .collect();
 
         let mut findings: Vec<_> = files
@@ -5685,8 +5685,7 @@ impl CodeIntelEngine {
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
             .filter(|e| is_security_scannable(&e.key().to_string_lossy()))
-            .map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
-            .flatten()
+            .filter_map(|e| self.content_for(e.key()).map(|c| (e.key().clone(), c)))
             .collect();
 
         let mut findings: Vec<_> = files
@@ -7275,12 +7274,7 @@ impl CodeIntelEngine {
                     }
 
                     let content = self.content_for(entry.key())?;
-                    Some((
-                        entry.key().clone(),
-                        display_path,
-                        language,
-                        content,
-                    ))
+                    Some((entry.key().clone(), display_path, language, content))
                 })
                 .collect();
             files.sort_by(|left, right| left.1.cmp(&right.1));

@@ -449,7 +449,11 @@ mod tests {
     #[test]
     fn test_insert_and_count() {
         let (store, _d) = temp_store();
-        let symbols = vec![sym("foo", "a.rs", 1), sym("bar", "a.rs", 5), sym("baz", "b.rs", 1)];
+        let symbols = vec![
+            sym("foo", "a.rs", 1),
+            sym("bar", "a.rs", 5),
+            sym("baz", "b.rs", 1),
+        ];
         let n = store.insert_symbols("repo", &symbols).unwrap();
         assert_eq!(n, 3);
         assert_eq!(store.symbol_count(), 3);
@@ -461,7 +465,11 @@ mod tests {
         store
             .insert_symbols(
                 "repo",
-                &[sym("foo", "a.rs", 1), sym("foo", "b.rs", 2), sym("bar", "a.rs", 3)],
+                &[
+                    sym("foo", "a.rs", 1),
+                    sym("foo", "b.rs", 2),
+                    sym("bar", "a.rs", 3),
+                ],
             )
             .unwrap();
 
@@ -473,14 +481,24 @@ mod tests {
         assert_eq!(by_file.len(), 2);
         assert!(by_file.iter().all(|s| s.file_path == "a.rs"));
 
-        assert_eq!(store.symbols_by_file("repo", "missing.rs").unwrap().len(), 0);
+        assert_eq!(
+            store.symbols_by_file("repo", "missing.rs").unwrap().len(),
+            0
+        );
     }
 
     #[test]
     fn test_delete_by_file() {
         let (store, _d) = temp_store();
         store
-            .insert_symbols("repo", &[sym("foo", "a.rs", 1), sym("bar", "a.rs", 2), sym("baz", "b.rs", 1)])
+            .insert_symbols(
+                "repo",
+                &[
+                    sym("foo", "a.rs", 1),
+                    sym("bar", "a.rs", 2),
+                    sym("baz", "b.rs", 1),
+                ],
+            )
             .unwrap();
         assert_eq!(store.delete_symbols_by_file("repo", "a.rs").unwrap(), 2);
         assert_eq!(store.symbol_count(), 1);
@@ -490,7 +508,14 @@ mod tests {
     fn test_for_each_symbol_streams() {
         let (store, _d) = temp_store();
         store
-            .insert_symbols("repo", &[sym("a", "f.rs", 1), sym("b", "f.rs", 2), sym("c", "g.rs", 1)])
+            .insert_symbols(
+                "repo",
+                &[
+                    sym("a", "f.rs", 1),
+                    sym("b", "f.rs", 2),
+                    sym("c", "g.rs", 1),
+                ],
+            )
             .unwrap();
 
         let mut names = Vec::new();
@@ -505,14 +530,36 @@ mod tests {
     fn test_edges_adjacency() {
         let (store, _d) = temp_store();
         store
-            .insert_symbols("repo", &[sym("a", "f.rs", 1), sym("b", "f.rs", 2), sym("c", "f.rs", 3)])
+            .insert_symbols(
+                "repo",
+                &[
+                    sym("a", "f.rs", 1),
+                    sym("b", "f.rs", 2),
+                    sym("c", "f.rs", 3),
+                ],
+            )
             .unwrap();
 
         // ids are 1,2,3 in insertion order
         let edges = vec![
-            Edge { caller_id: 1, callee_id: 2, edge_type: "call".into(), resolved: true },
-            Edge { caller_id: 1, callee_id: 3, edge_type: "call".into(), resolved: false },
-            Edge { caller_id: 2, callee_id: 3, edge_type: "call".into(), resolved: true },
+            Edge {
+                caller_id: 1,
+                callee_id: 2,
+                edge_type: "call".into(),
+                resolved: true,
+            },
+            Edge {
+                caller_id: 1,
+                callee_id: 3,
+                edge_type: "call".into(),
+                resolved: false,
+            },
+            Edge {
+                caller_id: 2,
+                callee_id: 3,
+                edge_type: "call".into(),
+                resolved: true,
+            },
         ];
         assert_eq!(store.add_edges(&edges).unwrap(), 3);
 
@@ -528,7 +575,9 @@ mod tests {
         let path = dir.path().join("test.db");
         {
             let store = SqliteStore::open(&path).unwrap();
-            store.insert_symbols("repo", &[sym("foo", "a.rs", 1)]).unwrap();
+            store
+                .insert_symbols("repo", &[sym("foo", "a.rs", 1)])
+                .unwrap();
         }
         // Re-open: data must survive and be queryable.
         let store = SqliteStore::open(&path).unwrap();

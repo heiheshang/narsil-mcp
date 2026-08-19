@@ -875,7 +875,9 @@ impl CallGraph {
         let actual_name = self
             .find_function(function)
             .unwrap_or_else(|| function.to_string());
-        self.reverse_edges().remove(&actual_name).unwrap_or_default()
+        self.reverse_edges()
+            .remove(&actual_name)
+            .unwrap_or_default()
     }
 
     /// Get functions called by a function (with fuzzy matching)
@@ -1151,7 +1153,10 @@ impl CallGraph {
                     }
 
                     md.push_str("## Called By (incoming)\n\n");
-                    let callers = self.reverse_edges().remove(display_name).unwrap_or_default();
+                    let callers = self
+                        .reverse_edges()
+                        .remove(display_name)
+                        .unwrap_or_default();
                     if callers.is_empty() {
                         md.push_str("*No incoming calls (entry point or unused)*\n\n");
                     } else {
@@ -2257,10 +2262,8 @@ mod tests {
             metrics: FunctionMetrics::default(),
         };
 
-        graph
-            .insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
-        graph
-            .insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
+        graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
+        graph.insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
 
         // Without scope hint, from a third file, should get deterministic result
         // (alphabetically first: "src/agents/mod.rs::run" < "src/app/mod.rs::run")
@@ -2290,10 +2293,8 @@ mod tests {
             metrics: FunctionMetrics::default(),
         };
 
-        graph
-            .insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
-        graph
-            .insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
+        graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
+        graph.insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
 
         // With scope hint "App", should pick app/mod.rs::run
         let result = graph.resolve_callee("run", "src/main.rs", Some("App"));

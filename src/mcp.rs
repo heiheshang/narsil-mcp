@@ -213,11 +213,7 @@ impl McpServer {
                 if let Ok(raw_value) = serde_json::from_str::<Value>(trimmed) {
                     if let Some(id) = raw_value.get("id").cloned() {
                         if !id.is_null() {
-                            JsonRpcResponse::error(
-                                Some(id),
-                                -32700,
-                                &format!("Parse error: {}", e),
-                            )
+                            JsonRpcResponse::error(Some(id), -32700, &format!("Parse error: {}", e))
                         } else {
                             debug!("Parse error with null id, not responding: {}", e);
                             return None;

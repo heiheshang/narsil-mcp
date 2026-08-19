@@ -83,6 +83,11 @@ impl EmbeddingCache {
             .create(true)
             .read(true)
             .write(true)
+            // Never truncate on open: an existing cache is either kept (with a
+            // torn tail cut back to the last complete record) or reset with an
+            // explicit `set_len(0)` below. Truncating here would discard every
+            // cached vector on every start.
+            .truncate(false)
             .open(&path)
             .with_context(|| format!("Failed to open embedding cache {:?}", path))?;
 
@@ -103,11 +108,7 @@ impl EmbeddingCache {
             write_header(&mut file, model, dimension)?;
         }
 
-        info!(
-            "Embedding cache: {} vectors at {:?}",
-            entries.len(),
-            path
-        );
+        info!("Embedding cache: {} vectors at {:?}", entries.len(), path);
 
         Ok(Self {
             path,
@@ -416,7 +417,8 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("narsil-emb-cache-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("narsil-emb-cache-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -433,7 +435,11 @@ mod tests {
         let second = backend.embed_batch(&texts).unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(*inner.calls.lock().unwrap(), 1, "second batch must be served from cache");
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            1,
+            "second batch must be served from cache"
+        );
     }
 
     #[test]
@@ -484,7 +490,11 @@ mod tests {
         let inner = Arc::new(CountingBackend::new(4));
         let backend = CachedBackend::new(inner.clone(), cache);
         backend.embed_batch(&["alpha".to_string()]).unwrap();
-        assert_eq!(*inner.calls.lock().unwrap(), 0, "reopened cache must serve the hit");
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            0,
+            "reopened cache must serve the hit"
+        );
     }
 
     #[test]
