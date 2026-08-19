@@ -639,7 +639,7 @@ fn url_encode(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::{CallType, FunctionMetrics};
+    use crate::callgraph::{CallResolution, CallType, FunctionMetrics};
     use std::collections::HashMap;
 
     // ========================================================================
@@ -862,6 +862,7 @@ mod tests {
                 scope_hint: None,
                 // The test never creates a `callee` node.
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -895,6 +896,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: true,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -912,6 +914,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: true,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,

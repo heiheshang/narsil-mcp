@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to whichever `new` sorted first, and `get_callers` reports which type each
   candidate belongs to.
 
+- **Call edges say what they were matched on.** A call like `x.run()` cannot
+  be tied to the type of `x` without type inference, so its target is one
+  namesake out of several — but the listing showed it exactly like an edge the
+  graph had identified, and third-party calls like `map` or `to_string` looked
+  like project functions. Every edge now carries a `CallResolution` (unique
+  name, receiver type, module scope, same file, name only, or not in the
+  graph), and `get_callers` / `get_callees` mark the weak entries and count
+  them below the list.
+
 - **`get_callers` / `get_callees` accept qualified method names.** Graph nodes
   were keyed `file::name`, so `Server.Handle` or `A::run` — how a method is
   normally spelled — resolved to nothing. Such queries now fall back to the

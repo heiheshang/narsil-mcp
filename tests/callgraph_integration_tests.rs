@@ -1,4 +1,4 @@
-use narsil_mcp::callgraph::CallGraph;
+use narsil_mcp::callgraph::{CallGraph, CallResolution};
 use narsil_mcp::parser::LanguageParser;
 use std::path::Path;
 
@@ -856,4 +856,131 @@ fn test_static_call_resolves_by_receiver_across_files() {
         .map(|edge| edge.target.clone())
         .collect();
     assert_eq!(callees, vec!["z_store.rs::Store::new"]);
+}
+
+#[test]
+fn test_edges_record_what_they_were_matched_on() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "a_store.rs",
+            "pub struct Store;\nimpl Store { pub fn new() -> Self { Store } pub fn only_here(&self) {} }\n",
+        ),
+        (
+            "z_other.rs",
+            "pub struct Other;\nimpl Other { pub fn new() -> Self { Other } }\n",
+        ),
+        (
+            "main.rs",
+            r#"
+fn main() {
+    let s = Store::new();
+    s.only_here();
+    helper();
+    third_party::missing();
+}
+
+fn helper() {}
+"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let by_target: Vec<(String, CallResolution)> = call_graph
+        .get_callees("main.rs::main")
+        .iter()
+        .map(|edge| (edge.target.clone(), edge.resolution))
+        .collect();
+
+    let resolution_of = |name: &str| {
+        by_target
+            .iter()
+            .find(|(target, _)| target.ends_with(name))
+            .map(|(_, resolution)| *resolution)
+    };
+
+    assert_eq!(
+        resolution_of("Store::new"),
+        Some(CallResolution::Receiver),
+        "the qualifier named the receiver type: {by_target:?}"
+    );
+    assert_eq!(
+        resolution_of("Store::only_here"),
+        Some(CallResolution::Unique),
+        "only one function carries this name: {by_target:?}"
+    );
+    assert_eq!(
+        resolution_of("::helper"),
+        Some(CallResolution::Unique),
+        "{by_target:?}"
+    );
+    assert_eq!(
+        resolution_of("missing"),
+        Some(CallResolution::Unresolved),
+        "a call outside the graph is not a match: {by_target:?}"
+    );
+
+    assert!(
+        CallResolution::Receiver.is_certain() && CallResolution::Unique.is_certain(),
+        "receiver and unique matches need no caveat"
+    );
+    assert_eq!(
+        CallResolution::NameOnly.caveat(),
+        Some("name match only"),
+        "a name match must be labelled in reports"
+    );
+}
+
+#[test]
+fn test_name_only_match_is_flagged() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    // Two unrelated types with a `run` method, and a caller whose receiver
+    // type is unknowable without type inference.
+    let files = vec![
+        (
+            "a_first.rs",
+            "pub struct First;\nimpl First { pub fn run(&self) {} }\n",
+        ),
+        (
+            "b_second.rs",
+            "pub struct Second;\nimpl Second { pub fn run(&self) {} }\n",
+        ),
+        (
+            "main.rs",
+            "fn main() { let thing = pick(); thing.run(); }\nfn pick() {}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let run_edge = call_graph
+        .get_callees("main.rs::main")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::run"))
+        .expect("thing.run() should produce an edge");
+
+    assert_eq!(
+        run_edge.resolution,
+        CallResolution::NameOnly,
+        "nothing distinguished the two `run` methods, so the edge is a guess"
+    );
+    assert!(!run_edge.resolution.is_certain());
+    assert_eq!(run_edge.resolution.caveat(), Some("name match only"));
 }

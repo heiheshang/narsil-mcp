@@ -50,6 +50,50 @@ pub struct CallEdge {
     /// surface this instead of silently pretending the edge is complete.
     #[serde(default)]
     pub resolved: bool,
+    /// What the target was matched on. A call to `x.run()` cannot be tied to
+    /// the type of `x` without type inference, so some edges are name matches
+    /// among namesakes; reports must be able to say which.
+    #[serde(default)]
+    pub resolution: CallResolution,
+}
+
+/// How an edge's target was chosen among the functions of that name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CallResolution {
+    /// Recorded before this distinction existed.
+    #[default]
+    Unknown,
+    /// Only one function in the graph carries the name.
+    Unique,
+    /// The call qualifier named the target's receiver type (`Store::new()`).
+    Receiver,
+    /// The qualifier matched the target's module or file path.
+    Scope,
+    /// Several namesakes; the one in the caller's own file was taken.
+    SameFile,
+    /// Several namesakes and nothing to choose between them — the target is a
+    /// deterministic pick, not a fact.
+    NameOnly,
+    /// No function of that name is in the graph (third-party, stdlib, macro).
+    Unresolved,
+}
+
+impl CallResolution {
+    /// Does this edge point at a function the graph actually identified?
+    pub fn is_certain(self) -> bool {
+        matches!(self, Self::Unique | Self::Receiver | Self::Scope)
+    }
+
+    /// Short label for reports; `None` for edges that need no caveat.
+    pub fn caveat(self) -> Option<&'static str> {
+        match self {
+            Self::SameFile => Some("same-file match"),
+            Self::NameOnly => Some("name match only"),
+            Self::Unresolved => Some("not in graph"),
+            Self::Unknown => Some("match unrecorded"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -400,7 +444,7 @@ impl CallGraph {
                 if let Some(ref caller_key) = current_function {
                     if let Some(edge) = self.extract_call_edge(node, source, path) {
                         // Resolve callee with scope hint for disambiguation
-                        let callee_key =
+                        let (callee_key, resolution) =
                             self.resolve_callee(&edge.target, path, edge.scope_hint.as_deref());
 
                         // Add to caller's outgoing calls (with resolved key as target)
@@ -413,6 +457,7 @@ impl CallGraph {
                             let mut resolved_edge = edge.clone();
                             resolved_edge.target = callee_key.clone();
                             resolved_edge.resolved = resolved;
+                            resolved_edge.resolution = resolution;
                             caller_node.calls.push(resolved_edge);
                         }
                     }
@@ -506,7 +551,7 @@ impl CallGraph {
                     continue;
                 }
 
-                let callee_key = self.resolve_callee(ident, caller_file, None);
+                let (callee_key, resolution) = self.resolve_callee(ident, caller_file, None);
 
                 // Add to caller's outgoing calls
                 // Compute `resolved` *before* taking the caller's write lock
@@ -524,6 +569,7 @@ impl CallGraph {
                             call_type: CallType::Direct,
                             scope_hint: None,
                             resolved,
+                            resolution,
                         });
                     }
                 }
@@ -572,7 +618,7 @@ impl CallGraph {
         bare_name: &str,
         caller_file: &str,
         scope_hint: Option<&str>,
-    ) -> String {
+    ) -> (String, CallResolution) {
         // 0. A scope qualifier naming a receiver type is harder evidence than
         //    the caller's own file: `Store::new()` means `Store`, wherever it
         //    lives. Only a unique match counts.
@@ -583,7 +629,7 @@ impl CallGraph {
                     .filter(|key| self.receiver_matches(key, scope, true));
                 if let Some(first) = by_receiver.next() {
                     if by_receiver.next().is_none() {
-                        return first.clone();
+                        return (first.clone(), CallResolution::Receiver);
                     }
                 }
             }
@@ -593,18 +639,28 @@ impl CallGraph {
         //    lookup rather than a scan of every namesake.
         let same_file_key = Self::qualified_key(caller_file, bare_name);
         if self.nodes.contains_key(&same_file_key) {
-            return same_file_key;
+            let namesakes = self
+                .name_index
+                .get(bare_name)
+                .map(|candidates| candidates.len())
+                .unwrap_or(1);
+            let resolution = if namesakes > 1 {
+                CallResolution::SameFile
+            } else {
+                CallResolution::Unique
+            };
+            return (same_file_key, resolution);
         }
 
         // 2. O(1) candidate lookup via the name index, borrowing the Ref — no
         // full Vec clone per call (a name with hundreds of candidates called
         // thousands of times would otherwise re-clone and re-sort every time).
         let Some(candidates) = self.name_index.get(bare_name) else {
-            return bare_name.to_string();
+            return (bare_name.to_string(), CallResolution::Unresolved);
         };
 
         match candidates.len() {
-            1 => candidates[0].clone(),
+            1 => (candidates[0].clone(), CallResolution::Unique),
             _ => {
                 // 3. Same file next. Methods key as `file::Type::name`, so a
                 // prefix test is needed where an exact key lookup was enough.
@@ -614,7 +670,7 @@ impl CallGraph {
                     .filter(|key| key.starts_with(&file_prefix))
                     .min()
                 {
-                    return key.clone();
+                    return (key.clone(), CallResolution::SameFile);
                 }
 
                 // 4. If scope_hint present, try to narrow down
@@ -627,13 +683,18 @@ impl CallGraph {
 
                     if let Some(first) = scope_matches.next() {
                         if scope_matches.next().is_none() {
-                            return first.clone();
+                            return (first.clone(), CallResolution::Scope);
                         }
                     }
                 }
 
                 // 5. Deterministic fallback: alphabetically smallest, no sort.
-                candidates.iter().min().cloned().unwrap_or_default()
+                // Nothing distinguished the namesakes, so the edge is a name
+                // match and says so.
+                (
+                    candidates.iter().min().cloned().unwrap_or_default(),
+                    CallResolution::NameOnly,
+                )
             }
         }
     }
@@ -838,6 +899,7 @@ impl CallGraph {
             call_type,
             scope_hint,
             resolved: false,
+            resolution: CallResolution::Unknown,
         })
     }
 
@@ -904,6 +966,7 @@ impl CallGraph {
             call_type,
             scope_hint,
             resolved: false,
+            resolution: CallResolution::Unknown,
         })
     }
 
@@ -1292,6 +1355,9 @@ impl CallGraph {
                     call_type: e.call_type.clone(),
                     scope_hint: None,
                     resolved: true,
+                    // How the *forward* edge was matched is what a reader of
+                    // "who calls me" needs to weigh.
+                    resolution: e.resolution,
                 });
             }
         }
@@ -1844,6 +1910,7 @@ mod tests {
             call_type: CallType::Direct,
             scope_hint: None,
             resolved: false,
+            resolution: CallResolution::Unknown,
         };
 
         graph
@@ -1887,6 +1954,7 @@ mod tests {
                         call_type,
                         scope_hint: None,
                         resolved: false,
+                        resolution: CallResolution::Unknown,
                     }],
                     metrics: FunctionMetrics::default(),
                     receiver: None,
@@ -1957,6 +2025,7 @@ mod tests {
                     call_type: CallType::Direct,
                     scope_hint: None,
                     resolved: false,
+                    resolution: CallResolution::Unknown,
                 },
                 CallEdge {
                     target: "callee2".to_string(),
@@ -1966,6 +2035,7 @@ mod tests {
                     call_type: CallType::StaticMethod,
                     scope_hint: None,
                     resolved: false,
+                    resolution: CallResolution::Unknown,
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -2069,6 +2139,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2086,6 +2157,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2103,6 +2175,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2154,6 +2227,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2197,6 +2271,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2214,6 +2289,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2231,6 +2307,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2282,6 +2359,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2299,6 +2377,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2371,6 +2450,7 @@ mod tests {
                     call_type: CallType::Direct,
                     scope_hint: None,
                     resolved: false,
+                    resolution: CallResolution::Unknown,
                 },
                 CallEdge {
                     target: "f2".to_string(),
@@ -2380,6 +2460,7 @@ mod tests {
                     call_type: CallType::Direct,
                     scope_hint: None,
                     resolved: false,
+                    resolution: CallResolution::Unknown,
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -2399,6 +2480,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
@@ -2420,6 +2502,7 @@ mod tests {
                         call_type: CallType::Direct,
                         scope_hint: None,
                         resolved: false,
+                        resolution: CallResolution::Unknown,
                     }],
                     metrics: FunctionMetrics::default(),
                     receiver: None,
@@ -2482,6 +2565,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics {
                 loc: 10,
@@ -2510,6 +2594,7 @@ mod tests {
                     call_type: CallType::Direct,
                     scope_hint: None,
                     resolved: false,
+                    resolution: CallResolution::Unknown,
                 }],
                 metrics: FunctionMetrics::default(),
                 receiver: None,
@@ -2581,6 +2666,7 @@ mod tests {
                 call_type: CallType::Direct,
                 scope_hint: None,
                 resolved: false,
+                resolution: CallResolution::Unknown,
             }],
             metrics: FunctionMetrics {
                 loc: 5,
@@ -2614,6 +2700,7 @@ mod tests {
             call_type: CallType::Method,
             scope_hint: None,
             resolved: false,
+            resolution: CallResolution::Unknown,
         };
 
         assert_eq!(edge.target, "target_func");
@@ -2745,7 +2832,12 @@ mod tests {
         let result1 = graph.resolve_callee("run", "src/main.rs", None);
         let result2 = graph.resolve_callee("run", "src/main.rs", None);
         assert_eq!(result1, result2, "resolve_callee must be deterministic");
-        assert_eq!(result1, "src/agents/mod.rs::run");
+        assert_eq!(result1.0, "src/agents/mod.rs::run");
+        assert_eq!(
+            result1.1,
+            CallResolution::NameOnly,
+            "a deterministic pick between namesakes is still only a name match"
+        );
     }
 
     #[test]
@@ -2774,18 +2866,20 @@ mod tests {
         graph.insert_node(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
 
         // With scope hint "App", should pick app/mod.rs::run
-        let result = graph.resolve_callee("run", "src/main.rs", Some("App"));
+        let (result, resolution) = graph.resolve_callee("run", "src/main.rs", Some("App"));
         assert_eq!(
             result, "src/app/mod.rs::run",
             "scope hint 'App' should resolve to app module"
         );
+        assert_eq!(resolution, CallResolution::Scope);
 
         // With scope hint "agents", should pick agents/mod.rs::run
-        let result = graph.resolve_callee("run", "src/main.rs", Some("agents"));
+        let (result, resolution) = graph.resolve_callee("run", "src/main.rs", Some("agents"));
         assert_eq!(
             result, "src/agents/mod.rs::run",
             "scope hint 'agents' should resolve to agents module"
         );
+        assert_eq!(resolution, CallResolution::Scope);
     }
 
     #[test]
@@ -2817,7 +2911,7 @@ mod tests {
             .insert(CallGraph::qualified_key("src/utils.rs", "helper"), node_b);
 
         // Same-file match should always win, even with a scope hint pointing elsewhere
-        let result = graph.resolve_callee("helper", "src/main.rs", Some("utils"));
+        let (result, _) = graph.resolve_callee("helper", "src/main.rs", Some("utils"));
         assert_eq!(result, "src/main.rs::helper");
     }
 
