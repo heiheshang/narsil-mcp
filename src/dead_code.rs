@@ -385,12 +385,12 @@ impl DeadCodeReport {
 }
 
 /// Truncate text to a maximum length
+///
+/// Dead-store text is a line of source, so on a Cyrillic codebase a naive
+/// `&text[..max_len]` cut lands mid-character and panics — taking down
+/// `find_dead_code` for the whole file.
 fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..max_len])
-    }
+    crate::text::truncate_with_ellipsis(text, max_len).into_owned()
 }
 
 /// Find exported symbols that are never imported by other files in the repository
@@ -1589,6 +1589,39 @@ mod tests {
     #[test]
     fn test_truncate_text_long() {
         assert_eq!(truncate_text("hello world", 5), "hello...");
+    }
+
+    /// `find_dead_code` renders the source line of every dead store. On a
+    /// Cyrillic codebase the 60-byte cut lands inside a character, and a
+    /// byte-indexed slice took the whole tool down with a panic.
+    #[test]
+    fn test_truncate_text_does_not_split_multibyte_characters() {
+        let text = "xСуммаДокументаПоВсемСтрокамТабличнойЧастиТоваровИУслуг = 0;";
+        assert!(!text.is_char_boundary(60), "test string lost its odd offset");
+
+        let truncated = truncate_text(text, 60);
+        assert!(truncated.ends_with("..."));
+        assert!(text.starts_with(truncated.trim_end_matches('.')));
+    }
+
+    /// The same cut, reached the way the tool reaches it.
+    #[test]
+    fn test_markdown_report_renders_cyrillic_dead_stores() {
+        let report = DeadCodeReport {
+            file_path: "Модуль.bsl".to_string(),
+            unreachable_blocks: Vec::new(),
+            dead_stores: vec![DeadStore {
+                function_name: "ОбработкаПроведения".to_string(),
+                variable: "СуммаДокумента".to_string(),
+                line: 42,
+                text: "xСуммаДокументаПоВсемСтрокамТабличнойЧастиТоваровИУслуг = 0;"
+                    .to_string(),
+            }],
+            unused_imports: Vec::new(),
+        };
+
+        let md = report.to_markdown();
+        assert!(md.contains("СуммаДокумента"), "got:\n{md}");
     }
 
     // ==== Rust Unused Import Tests ====

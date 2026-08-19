@@ -10,7 +10,6 @@
 use anyhow::{bail, Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
@@ -395,6 +394,31 @@ impl ApiEmbedder {
     }
 }
 
+/// Clamp over-long inputs to `MAX_TEXT_LENGTH`, reporting how many were cut.
+///
+/// Embedding servers reject the *whole* request when one input exceeds their
+/// context, so a single huge symbol used to cost the embeddings of every other
+/// text batched with it. Nothing is copied: every element borrows from `texts`,
+/// truncated or not.
+///
+/// The count comes from the *input* length. The cut lands on a character
+/// boundary, so a clamped Cyrillic text is typically `MAX_TEXT_LENGTH - 1`
+/// bytes — measuring the output against the cap reports zero truncations on
+/// exactly the corpus that needs them.
+fn clamp_embedding_inputs(texts: &[String]) -> (Vec<&str>, usize) {
+    let mut truncated = 0usize;
+    let clamped = texts
+        .iter()
+        .map(|text| {
+            if crate::text::is_truncated(text, MAX_TEXT_LENGTH) {
+                truncated += 1;
+            }
+            crate::text::truncate(text, MAX_TEXT_LENGTH)
+        })
+        .collect();
+    (clamped, truncated)
+}
+
 impl EmbeddingBackend for ApiEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed_batch(&[text.to_string()])?;
@@ -414,25 +438,10 @@ impl EmbeddingBackend for ApiEmbedder {
             );
         }
 
-        // Clamp over-long inputs instead of failing the batch. Allocation is
-        // avoided in the common case: `Cow::Borrowed` unless something is
-        // actually too long.
-        let texts: Vec<Cow<'_, str>> = texts
-            .iter()
-            .map(|text| {
-                if text.len() > MAX_TEXT_LENGTH {
-                    // Byte-slicing must land on a char boundary: MAX_TEXT_LENGTH
-                    // can fall mid-codepoint in Cyrillic, which is 2 bytes per char.
-                    Cow::Borrowed(&text[..text.floor_char_boundary(MAX_TEXT_LENGTH)])
-                } else {
-                    Cow::Borrowed(text.as_str())
-                }
-            })
-            .collect();
-        let truncated = texts.iter().filter(|t| t.len() == MAX_TEXT_LENGTH).count();
+        let (texts, truncated) = clamp_embedding_inputs(texts);
         if truncated > 0 {
             tracing::debug!(
-                "Truncated {} of {} texts to {} chars before embedding",
+                "Truncated {} of {} texts to {} bytes before embedding",
                 truncated,
                 texts.len(),
                 MAX_TEXT_LENGTH
@@ -442,7 +451,7 @@ impl EmbeddingBackend for ApiEmbedder {
         #[derive(Serialize)]
         struct Request<'a> {
             model: &'a str,
-            input: &'a [Cow<'a, str>],
+            input: &'a [&'a str],
             #[serde(skip_serializing_if = "Option::is_none")]
             dimensions: Option<usize>,
         }
@@ -479,7 +488,11 @@ impl EmbeddingBackend for ApiEmbedder {
         if let Some(key) = &self.api_key {
             // Redact API key in logs - only show first/last 4 chars
             let redacted = if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len() - 4..])
+                format!(
+                    "{}...{}",
+                    crate::text::truncate(key, 4),
+                    crate::text::truncate_start(key, 4)
+                )
             } else {
                 "****".to_string()
             };
@@ -517,8 +530,8 @@ impl EmbeddingBackend for ApiEmbedder {
 
         if !status.is_success() {
             // Redact potential sensitive info from error messages
-            let safe_text = if text.len() > 500 {
-                format!("{}... (truncated)", &text[..text.floor_char_boundary(500)])
+            let safe_text = if crate::text::is_truncated(&text, 500) {
+                format!("{}... (truncated)", crate::text::truncate(&text, 500))
             } else {
                 text.clone()
             };
@@ -1852,6 +1865,37 @@ mod tests {
                 sent.len()
             );
             assert!(sent.starts_with("Процедура "), "prefix must be preserved");
+        }
+
+        /// The truncation counter feeds the only diagnostic this clamp has.
+        /// Counting clamped texts whose length equals the cap reported zero on
+        /// Cyrillic input, where the boundary pulls the cut a byte short.
+        #[test]
+        fn test_clamp_counts_truncations_on_multibyte_input() {
+            let huge = "Процедура ОбработкаПроведения() ".repeat(2_000);
+            assert!(huge.len() > MAX_TEXT_LENGTH);
+
+            let inputs = vec!["short".to_string(), huge, "also short".to_string()];
+            let (clamped, truncated) = clamp_embedding_inputs(&inputs);
+
+            assert_eq!(truncated, 1, "the over-long text was not counted");
+            assert_eq!(clamped.len(), 3);
+            assert_eq!(clamped[0], "short");
+            assert_eq!(clamped[2], "also short");
+            assert!(clamped[1].len() <= MAX_TEXT_LENGTH);
+            assert_eq!(
+                clamped[1].len(),
+                MAX_TEXT_LENGTH - 1,
+                "this input is the case a cap-equality check misses"
+            );
+        }
+
+        #[test]
+        fn test_clamp_leaves_short_inputs_alone() {
+            let inputs = vec!["fn main() {}".to_string()];
+            let (clamped, truncated) = clamp_embedding_inputs(&inputs);
+            assert_eq!(truncated, 0);
+            assert_eq!(clamped, vec!["fn main() {}"]);
         }
 
         #[test]
