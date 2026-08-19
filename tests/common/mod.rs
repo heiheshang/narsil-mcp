@@ -6,6 +6,10 @@
 //! - Assertion macros for common patterns
 //! - Fixture loading utilities
 
+// A shared harness: each integration-test binary that includes this module
+// compiles all of it, so helpers used by one binary look dead to another.
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;

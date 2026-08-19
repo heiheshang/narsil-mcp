@@ -61,7 +61,10 @@ mod tests {
     #[test]
     fn test_truncate_never_splits_cyrillic() {
         let text = "xСуммаДокументаПоВсемСтрокамТабличнойЧастиТоваровИУслуг = 0;";
-        assert!(!text.is_char_boundary(60), "test string lost its odd offset");
+        assert!(
+            !text.is_char_boundary(60),
+            "test string lost its odd offset"
+        );
 
         for max in 1..text.len() {
             let cut = truncate(text, max);
@@ -76,8 +79,14 @@ mod tests {
         let text = "postgres://user:парольОтБазы@";
         for max in 1..text.len() {
             let tail = truncate_start(text, max);
-            assert!(tail.len() <= max, "truncate_start exceeded the cap at {max}");
-            assert!(text.ends_with(tail), "truncate_start did not return a suffix");
+            assert!(
+                tail.len() <= max,
+                "truncate_start exceeded the cap at {max}"
+            );
+            assert!(
+                text.ends_with(tail),
+                "truncate_start did not return a suffix"
+            );
         }
     }
 
@@ -120,7 +129,10 @@ mod tests {
         // Multi-byte: the ellipsis is appended to a boundary-safe prefix.
         let cyrillic = "Процедура";
         let cut = truncate_with_ellipsis(cyrillic, 5);
-        assert_eq!(cut, "Пр...", "the cap of 5 bytes holds two 2-byte characters");
+        assert_eq!(
+            cut, "Пр...",
+            "the cap of 5 bytes holds two 2-byte characters"
+        );
     }
 
     #[test]

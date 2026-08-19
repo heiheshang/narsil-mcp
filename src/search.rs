@@ -155,8 +155,8 @@ impl SearchIndex {
             .iter()
             .map(|d| {
                 d.term_freq
-                    .iter()
-                    .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+                    .keys()
+                    .map(|k| k.len() + std::mem::size_of::<usize>())
                     .sum::<usize>()
             })
             .sum();
@@ -167,8 +167,8 @@ impl SearchIndex {
             .sum();
         let doc_freq_bytes: usize = self
             .doc_freq
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
         (
             self.documents.len(),

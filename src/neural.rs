@@ -1028,8 +1028,7 @@ impl NeuralEngine {
 
         use rayon::prelude::*;
         items.par_chunks(BATCH_SIZE).try_for_each(|chunk| {
-            let contents: Vec<String> =
-                chunk.iter().map(|(doc,)| doc.content.clone()).collect();
+            let contents: Vec<String> = chunk.iter().map(|(doc,)| doc.content.clone()).collect();
             let embeddings = self.backend.embed_batch(&contents)?;
 
             for ((doc,), embedding) in chunk.iter().zip(embeddings.iter()) {

@@ -83,11 +83,8 @@ impl TfIdfEmbedding {
         // retain their counts and can still climb into the top-N later.
         let limit = self.max_vocab_size * 2;
         if self.document_freq.len() > limit {
-            let keep: std::collections::HashSet<&String> = ranked
-                .iter()
-                .take(limit)
-                .map(|(term, _)| term)
-                .collect();
+            let keep: std::collections::HashSet<&String> =
+                ranked.iter().take(limit).map(|(term, _)| term).collect();
             self.document_freq.retain(|term, _| keep.contains(term));
         }
     }
@@ -341,10 +338,15 @@ impl VectorStore {
             .sum();
         let index_bytes: usize = self
             .id_to_idx
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
-        (self.documents.len(), content_bytes, embedding_bytes, index_bytes)
+        (
+            self.documents.len(),
+            content_bytes,
+            embedding_bytes,
+            index_bytes,
+        )
     }
 
     /// Check if store is empty
@@ -550,15 +552,22 @@ impl EmbeddingEngine {
         let p = self.provider.read();
         let vocab_bytes: usize = p
             .vocabulary
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
         let df_bytes: usize = p
             .document_freq
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
-        (docs, content_bytes, embedding_bytes, index_bytes, vocab_bytes, df_bytes)
+        (
+            docs,
+            content_bytes,
+            embedding_bytes,
+            index_bytes,
+            vocab_bytes,
+            df_bytes,
+        )
     }
 
     /// Clear all data
