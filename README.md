@@ -787,6 +787,20 @@ const symbols = client.findSymbols('Handler');
 | `get_complexity` | Get cyclomatic/cognitive complexity |
 | `get_function_hotspots` | Find highly connected functions |
 
+Function arguments accept a bare name (`Handle`), a qualified method
+(`Server.Handle`, `Server::Handle`) or a graph key. Methods are keyed
+`file::Type::name` (`internal/api/api.go::Server::Handle`), free functions
+`file::name`, so two same-named methods on different types are distinct nodes.
+
+**Resolution limits.** A call is still resolved by name: an unqualified
+`x.Handle()` cannot be tied to the type of `x` without type inference, so it
+is attributed to a receiver type named by the qualifier (`Server::Handle()`),
+else to a same-named function in the caller's own file, else to a module
+matching the qualifier, else — deterministically — to the first candidate
+alphabetically. When a name is ambiguous, `get_callers` / `get_callees` say
+so and list the other candidates with their types instead of silently picking
+one; query by `Type.name` to pin down the one you mean.
+
 ### Control Flow Analysis
 
 | Tool | Description |

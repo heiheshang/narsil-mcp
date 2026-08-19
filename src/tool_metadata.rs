@@ -748,7 +748,7 @@ lazy_static! {
 
         map.insert("get_callers", ToolMetadata {
             name: "get_callers",
-            description: "Find functions that call a given function. Requires --call-graph flag.",
+            description: "Find functions that call a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callers", "callgraph", "references", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -771,7 +771,7 @@ lazy_static! {
 
         map.insert("get_callees", ToolMetadata {
             name: "get_callees",
-            description: "Find functions called by a given function. Requires --call-graph flag.",
+            description: "Find functions called by a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callees", "callgraph", "dependencies", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,

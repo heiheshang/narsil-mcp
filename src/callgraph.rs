@@ -21,6 +21,12 @@ pub struct CallNode {
     pub calls: Vec<CallEdge>,
     /// Complexity metrics
     pub metrics: FunctionMetrics,
+    /// The type this function is defined on: the Go receiver, the Rust `impl`
+    /// type, or the enclosing class/trait elsewhere. `None` for free
+    /// functions. Node keys are `file::name`, so this is what tells two
+    /// same-named methods apart.
+    #[serde(default)]
+    pub receiver: Option<String>,
 }
 
 /// An edge in the call graph
@@ -134,6 +140,17 @@ impl CallGraph {
         format!("{}::{}", file_path, name)
     }
 
+    /// Key for a definition: `file::name` for a free function, and
+    /// `file::Type::name` for a method. Without the type, two methods of the
+    /// same name in one file collapse onto a single node and one of them
+    /// disappears from the graph.
+    fn definition_key(file_path: &str, receiver: Option<&str>, name: &str) -> String {
+        match receiver {
+            Some(receiver) => format!("{}::{}::{}", file_path, receiver, name),
+            None => Self::qualified_key(file_path, name),
+        }
+    }
+
     /// Insert a node and maintain the bare-name index so `resolve_callee`
     /// stays O(1). The only way a node should enter the graph.
     fn insert_node(&self, key: String, node: CallNode) {
@@ -152,13 +169,13 @@ impl CallGraph {
         self.walk_for_functions(&mut cursor, source, path, &mut functions);
 
         for func in &functions {
-            let key = Self::qualified_key(path, &func.name);
+            let key = Self::definition_key(path, func.receiver.as_deref(), &func.name);
             self.insert_node(key, func.clone());
         }
 
         let names: Vec<_> = functions
             .into_iter()
-            .map(|f| Self::qualified_key(path, &f.name))
+            .map(|f| Self::definition_key(path, f.receiver.as_deref(), &f.name))
             .collect();
         self.file_functions.insert(path.to_string(), names);
 
@@ -191,6 +208,97 @@ impl CallGraph {
         }
     }
 
+    /// Kinds that declare a type whose body holds methods.
+    fn is_type_declaration(kind: &str) -> bool {
+        matches!(
+            kind,
+            "trait_item"
+                | "class_definition"
+                | "class_declaration"
+                | "class_specifier"
+                | "struct_declaration"
+                | "struct_specifier"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "trait_declaration"
+                | "object_declaration"
+                | "protocol_declaration"
+                | "extension_declaration"
+                // Ruby
+                | "class"
+                | "module"
+        )
+    }
+
+    /// First type name in a subtree: `*Server` -> `Server`, `Store[T]` ->
+    /// `Store`. Falls back to a plain identifier for grammars without a
+    /// dedicated type node (Ruby constants, Python class names).
+    fn first_type_identifier(node: Node, source: &[u8]) -> Option<String> {
+        fn walk(node: Node, kinds: &[&str], out: &mut Option<String>, source: &[u8]) {
+            if out.is_some() {
+                return;
+            }
+            if kinds.contains(&node.kind()) {
+                *out = node.utf8_text(source).ok().map(|s| s.to_string());
+                return;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, kinds, out, source);
+            }
+        }
+
+        let mut found = None;
+        walk(node, &["type_identifier"], &mut found, source);
+        if found.is_none() {
+            walk(
+                node,
+                &["identifier", "constant", "simple_identifier", "name"],
+                &mut found,
+                source,
+            );
+        }
+        found
+    }
+
+    /// The type a function is defined on, or `None` for a free function.
+    ///
+    /// Go keeps it in the method's `receiver` field; every other supported
+    /// language nests the function inside the `impl`/class/trait that owns it.
+    fn extract_receiver_type(node: Node, source: &[u8]) -> Option<String> {
+        if let Some(receiver) = node.child_by_field_name("receiver") {
+            if let Some(name) = Self::first_type_identifier(receiver, source) {
+                return Some(name);
+            }
+        }
+
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if current.kind() == "impl_item" {
+                // Rust: `impl Foo` and `impl Trait for Foo` both own `Foo`.
+                return current
+                    .child_by_field_name("type")
+                    .and_then(|owner| Self::first_type_identifier(owner, source));
+            }
+            if Self::is_type_declaration(current.kind()) {
+                if let Some(name) = current
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok().map(|s| s.to_string()))
+                {
+                    return Some(name);
+                }
+                // Python's root node is also called `module`; unlike Ruby's it
+                // names no type, so the walk continues past it.
+                if current.kind() != "module" {
+                    return Self::first_type_identifier(current, source);
+                }
+            }
+            ancestor = current.parent();
+        }
+        None
+    }
+
     fn try_extract_function(&self, node: Node, source: &[u8], path: &str) -> Option<CallNode> {
         let kind = node.kind();
 
@@ -203,6 +311,9 @@ impl CallGraph {
                 | "function_declaration"
                 | "method_definition"
                 | "method_declaration"
+                // Ruby
+                | "method"
+                | "singleton_method"
                 | "arrow_function"
                 | "lambda"
                 | "closure_expression"
@@ -222,6 +333,7 @@ impl CallGraph {
             line: node.start_position().row + 1,
             calls: Vec::new(),
             metrics,
+            receiver: Self::extract_receiver_type(node, source),
         })
     }
 
@@ -257,9 +369,14 @@ impl CallGraph {
                     | "function_declaration"
                     | "method_definition"
                     | "method_declaration"
+                    // Ruby
+                    | "method"
+                    | "singleton_method"
             ) {
                 if let Some(name) = extract_function_name(node, source) {
-                    *current_function = Some(Self::qualified_key(path, &name));
+                    let receiver = Self::extract_receiver_type(node, source);
+                    *current_function =
+                        Some(Self::definition_key(path, receiver.as_deref(), &name));
                 }
             }
 
@@ -268,7 +385,16 @@ impl CallGraph {
             // `Module.Func()`) is handled by the parent, so skip it here.
             let is_call = matches!(
                 kind,
-                "call_expression" | "call" | "method_call_expression" | "invocation_expression"
+                "call_expression"
+                    | "call"
+                    | "method_call_expression"
+                    | "invocation_expression"
+                    // Java
+                    | "method_invocation"
+                    // PHP
+                    | "function_call_expression"
+                    | "member_call_expression"
+                    | "scoped_call_expression"
             ) || (kind == "method_call" && parent_kind != "call_expression");
             if is_call {
                 if let Some(ref caller_key) = current_function {
@@ -407,15 +533,64 @@ impl CallGraph {
         }
     }
 
+    /// The file a key belongs to, read from the node rather than parsed out of
+    /// the key: a method key carries an extra `::Type` segment.
+    fn key_file_path(&self, key: &str) -> Option<String> {
+        self.nodes.get(key).map(|node| node.file_path.clone())
+    }
+
+    /// Does the node behind `key` belong to the type named `qualifier`?
+    ///
+    /// `case_sensitive` is on for call-site resolution, where Go's `store.Get()`
+    /// (package `store`) must not be captured by a method on type `Store`, and
+    /// off for user-typed queries, which are approximations by nature.
+    fn receiver_matches(&self, key: &str, qualifier: &str, case_sensitive: bool) -> bool {
+        let Some(node) = self.nodes.get(key) else {
+            return false;
+        };
+        let Some(receiver) = node.receiver.as_deref() else {
+            return false;
+        };
+        // `app.Server.Handle` -> compare against `Server` as well as `app.Server`.
+        let tail = qualifier
+            .rsplit(['.', ':', '/'])
+            .next()
+            .unwrap_or(qualifier);
+        if case_sensitive {
+            receiver == qualifier || receiver == tail
+        } else {
+            receiver.eq_ignore_ascii_case(qualifier) || receiver.eq_ignore_ascii_case(tail)
+        }
+    }
+
     /// Resolve a callee name to a qualified key.
-    /// Prefers same-file match, then scope-hint match, then deterministic alphabetical fallback.
+    /// Prefers a receiver-type match on the scope qualifier, then the caller's
+    /// own file, then a scope hint matching the file path, and finally a
+    /// deterministic alphabetical fallback.
     fn resolve_callee(
         &self,
         bare_name: &str,
         caller_file: &str,
         scope_hint: Option<&str>,
     ) -> String {
-        // 1. Try same-file first
+        // 0. A scope qualifier naming a receiver type is harder evidence than
+        //    the caller's own file: `Store::new()` means `Store`, wherever it
+        //    lives. Only a unique match counts.
+        if let Some(scope) = scope_hint {
+            if let Some(candidates) = self.name_index.get(bare_name) {
+                let mut by_receiver = candidates
+                    .iter()
+                    .filter(|key| self.receiver_matches(key, scope, true));
+                if let Some(first) = by_receiver.next() {
+                    if by_receiver.next().is_none() {
+                        return first.clone();
+                    }
+                }
+            }
+        }
+
+        // 1. Exact same-file hit: the common case for free functions, and one
+        //    lookup rather than a scan of every namesake.
         let same_file_key = Self::qualified_key(caller_file, bare_name);
         if self.nodes.contains_key(&same_file_key) {
             return same_file_key;
@@ -431,11 +606,22 @@ impl CallGraph {
         match candidates.len() {
             1 => candidates[0].clone(),
             _ => {
-                // 3. If scope_hint present, try to narrow down
+                // 3. Same file next. Methods key as `file::Type::name`, so a
+                // prefix test is needed where an exact key lookup was enough.
+                let file_prefix = format!("{}::", caller_file);
+                if let Some(key) = candidates
+                    .iter()
+                    .filter(|key| key.starts_with(&file_prefix))
+                    .min()
+                {
+                    return key.clone();
+                }
+
+                // 4. If scope_hint present, try to narrow down
                 if let Some(scope) = scope_hint {
                     let mut scope_matches = candidates.iter().filter(|key| {
-                        key.rsplit_once("::")
-                            .map(|(file_part, _)| Self::scope_matches_file_path(scope, file_part))
+                        self.key_file_path(key)
+                            .map(|file_path| Self::scope_matches_file_path(scope, &file_path))
                             .unwrap_or(false)
                     });
 
@@ -446,7 +632,7 @@ impl CallGraph {
                     }
                 }
 
-                // 4. Deterministic fallback: alphabetically smallest, no sort.
+                // 5. Deterministic fallback: alphabetically smallest, no sort.
                 candidates.iter().min().cloned().unwrap_or_default()
             }
         }
@@ -487,7 +673,179 @@ impl CallGraph {
         path_lower.contains(&with_slash) || path_lower.contains(&with_dot)
     }
 
+    /// Text of a receiver/qualifier node, when it can plausibly narrow a
+    /// callee down to a file. `self`/`this` receivers carry no such
+    /// information, so they are dropped instead of being fed to
+    /// [`resolve_callee`](Self::resolve_callee).
+    fn scope_hint_from(node: Node, source: &[u8]) -> Option<String> {
+        let usable = matches!(
+            node.kind(),
+            "identifier"
+                | "field_identifier"
+                | "property_identifier"
+                | "package_identifier"
+                | "simple_identifier"
+                | "type_identifier"
+                | "name"
+                | "constant"
+                | "variable_name"
+        );
+        if !usable {
+            return None;
+        }
+        let text = node.utf8_text(source).ok()?.trim_start_matches('$');
+        if text.is_empty() || matches!(text, "self" | "Self" | "this") {
+            return None;
+        }
+        Some(text.to_string())
+    }
+
+    /// Describe the callee slot of a call: `(name, call type, scope hint)`.
+    ///
+    /// Each language spells a method callee differently, and the name always
+    /// lives in a named field: Go `selector_expression.field`, Python
+    /// `attribute.attribute`, JS/TS `member_expression.property`, C#
+    /// `member_access_expression.name`, Kotlin/Swift `navigation_expression`'s
+    /// trailing `navigation_suffix`, Rust/C `field_expression.field`.
+    /// Returns `None` for shapes it does not know so the caller can fall back.
+    fn describe_callee(
+        &self,
+        node: Node,
+        source: &[u8],
+    ) -> Option<(String, CallType, Option<String>)> {
+        let kind = node.kind();
+        let text_of = |n: Node| n.utf8_text(source).ok().map(|s| s.to_string());
+
+        match kind {
+            "identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "simple_identifier"
+            | "name"
+            | "constant" => Some((text_of(node)?, CallType::Direct, None)),
+
+            "selector_expression"
+            | "attribute"
+            | "member_expression"
+            | "field_expression"
+            | "member_access_expression" => {
+                let name_field = match kind {
+                    "attribute" => "attribute",
+                    "member_expression" => "property",
+                    "member_access_expression" => "name",
+                    _ => "field",
+                };
+                let name = node
+                    .child_by_field_name(name_field)
+                    .and_then(text_of)
+                    .or_else(|| self.get_last_identifier(node, source))?;
+                let scope = node
+                    .child_by_field_name("object")
+                    .or_else(|| node.child_by_field_name("operand"))
+                    .or_else(|| node.child_by_field_name("expression"))
+                    .or_else(|| node.child_by_field_name("value"))
+                    .or_else(|| node.child_by_field_name("argument"))
+                    .and_then(|receiver| Self::scope_hint_from(receiver, source));
+                Some((name, CallType::Method, scope))
+            }
+
+            // Kotlin/Swift: `target . (navigation_suffix suffix)`. The suffix is
+            // unnamed in Kotlin, so it is located by kind rather than by field.
+            "navigation_expression" => {
+                let mut walker = node.walk();
+                let suffix = node
+                    .children(&mut walker)
+                    .filter(|child| child.kind() == "navigation_suffix")
+                    .last()?;
+                let name = self.get_last_identifier(suffix, source)?;
+                let scope = node
+                    .child_by_field_name("target")
+                    .or_else(|| node.named_child(0))
+                    .and_then(|target| Self::scope_hint_from(target, source));
+                Some((name, CallType::Method, scope))
+            }
+
+            "scoped_identifier" | "qualified_identifier" => {
+                let scope = Self::extract_scope_qualifier(node, source);
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(text_of)
+                    .or_else(|| self.get_last_identifier(node, source))?;
+                Some((name, CallType::StaticMethod, scope))
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Locate the callee expression of a call node through tree-sitter fields
+    /// and turn it into an edge. Returns `None` for call shapes without a known
+    /// callee field (BSL among them) so [`extract_call_edge`](Self::extract_call_edge)
+    /// can fall back to its sibling scan.
+    fn extract_call_edge_by_fields(
+        &self,
+        node: Node,
+        source: &[u8],
+        path: &str,
+    ) -> Option<CallEdge> {
+        let kind = node.kind();
+
+        // `receiver` is set only for shapes where the callee node itself does
+        // not carry the receiver (Ruby `call`, Java/PHP method invocations).
+        let (callee, receiver) = match kind {
+            "call_expression" | "call" | "invocation_expression" | "function_call_expression" => {
+                if let Some(function) = node.child_by_field_name("function") {
+                    (function, None)
+                } else if let Some(method) = node.child_by_field_name("method") {
+                    // Ruby: `(call receiver: (identifier) method: (identifier))`
+                    (method, node.child_by_field_name("receiver"))
+                } else {
+                    // Kotlin/Swift: callee and `call_suffix` are unnamed children.
+                    let mut walker = node.walk();
+                    let callee = node.children(&mut walker).find(|child| {
+                        child.is_named()
+                            && !child.kind().contains("argument")
+                            && child.kind() != "call_suffix"
+                    })?;
+                    (callee, None)
+                }
+            }
+            // Java `obj.m()`, PHP `$obj->m()` and `Obj::m()`.
+            "method_invocation" | "member_call_expression" | "scoped_call_expression" => (
+                node.child_by_field_name("name")?,
+                node.child_by_field_name("object")
+                    .or_else(|| node.child_by_field_name("scope")),
+            ),
+            _ => return None,
+        };
+
+        let (target, mut call_type, mut scope_hint) = self.describe_callee(callee, source)?;
+
+        if let Some(receiver) = receiver {
+            call_type = if kind == "scoped_call_expression" {
+                CallType::StaticMethod
+            } else {
+                CallType::Method
+            };
+            scope_hint = Self::scope_hint_from(receiver, source);
+        }
+
+        Some(CallEdge {
+            target,
+            file_path: path.to_string(),
+            line: node.start_position().row + 1,
+            column: node.start_position().column + 1,
+            call_type,
+            scope_hint,
+            resolved: false,
+        })
+    }
+
     fn extract_call_edge(&self, node: Node, source: &[u8], path: &str) -> Option<CallEdge> {
+        if let Some(edge) = self.extract_call_edge_by_fields(node, source, path) {
+            return Some(edge);
+        }
+
         let mut cursor = node.walk();
         cursor.goto_first_child();
 
@@ -560,7 +918,14 @@ impl CallGraph {
         ) {
             loop {
                 let n = cursor.node();
-                if n.kind() == "identifier" || n.kind() == "field_identifier" {
+                if matches!(
+                    n.kind(),
+                    "identifier"
+                        | "field_identifier"
+                        | "property_identifier"
+                        | "simple_identifier"
+                        | "name"
+                ) {
                     *last = n.utf8_text(source).ok().map(|s| s.to_string());
                 }
                 if cursor.goto_first_child() {
@@ -697,6 +1062,37 @@ impl CallGraph {
     /// 6. Contains match
     ///
     /// Returns the actual qualified key in the graph, or None if not found.
+    /// Split a qualified query into `(qualifier, bare name)`.
+    ///
+    /// `Server.Handle` -> `("Server", "Handle")`, `A::run` -> `("A", "run")`,
+    /// `$obj->method` -> `("$obj", "method")`. Returns `None` when the query is
+    /// already a bare name, or when the trailing segment is not identifier-like.
+    fn split_qualified_query(query: &str) -> Option<(&str, &str)> {
+        let (index, sep_len) = ["::", "->", ".", "/"]
+            .iter()
+            .filter_map(|sep| query.rfind(sep).map(|index| (index, sep.len())))
+            .max_by_key(|(index, _)| *index)?;
+
+        let qualifier = query.get(..index)?;
+        let bare = query.get(index + sep_len..)?;
+        let identifier_like = !bare.is_empty()
+            && bare
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if qualifier.is_empty() || !identifier_like {
+            return None;
+        }
+        Some((qualifier, bare))
+    }
+
+    /// The bare function name of a query: the trailing segment of
+    /// `Type::method`, `pkg.Func` or `dir/file.go::Method`.
+    pub fn bare_name(query: &str) -> &str {
+        Self::split_qualified_query(query)
+            .map(|(_, bare)| bare)
+            .unwrap_or(query)
+    }
+
     pub fn find_function(&self, query: &str) -> Option<String> {
         // 1. Exact match on qualified key
         if self.nodes.contains_key(query) {
@@ -756,6 +1152,48 @@ impl CallGraph {
                 .collect();
             if !matches.is_empty() {
                 matches.sort();
+                return Some(matches.remove(0));
+            }
+        }
+
+        // 4b. Qualified forms the graph does not key on: `Type::method`,
+        // `Type.method`, `pkg.Func`, `$obj->method`. Retry on the trailing
+        // segment and use the qualifier to narrow candidates by file path.
+        if let Some((qualifier, bare)) = Self::split_qualified_query(query) {
+            let bare_suffix = format!("::{}", bare);
+            let mut matches: Vec<String> = self
+                .nodes
+                .iter()
+                .filter(|entry| entry.key().ends_with(&bare_suffix))
+                .map(|entry| entry.key().clone())
+                .collect();
+            if !matches.is_empty() {
+                matches.sort();
+                // The qualifier is usually a type name (`Server.Handle`), so
+                // try the receiver first; a module/package qualifier
+                // (`app/handler.go::Handle`) then falls back to the file path.
+                let by_receiver = matches
+                    .iter()
+                    .find(|key| self.receiver_matches(key, qualifier, true))
+                    .or_else(|| {
+                        matches
+                            .iter()
+                            .find(|key| self.receiver_matches(key, qualifier, false))
+                    });
+                if let Some(key) = by_receiver {
+                    return Some(key.clone());
+                }
+                let by_path = matches.iter().find(|key| {
+                    self.key_file_path(key)
+                        .map(|file_path| {
+                            file_path.ends_with(qualifier)
+                                || Self::scope_matches_file_path(qualifier, &file_path)
+                        })
+                        .unwrap_or(false)
+                });
+                if let Some(key) = by_path {
+                    return Some(key.clone());
+                }
                 return Some(matches.remove(0));
             }
         }
@@ -1289,11 +1727,14 @@ fn extract_function_name(node: Node, source: &[u8]) -> Option<String> {
         let child = cursor.node();
         let kind = child.kind();
 
-        if kind == "identifier"
-            || kind == "name"
-            || kind == "field_identifier"
-            || kind == "property_identifier"
-        {
+        if matches!(
+            kind,
+            "identifier"
+                | "name"
+                | "field_identifier"
+                | "property_identifier"
+                | "simple_identifier"
+        ) {
             return child.utf8_text(source).ok().map(|s| s.to_string());
         }
 
@@ -1353,6 +1794,7 @@ mod tests {
                 returns: 1,
                 cognitive: 3,
             },
+            receiver: None,
         };
 
         graph
@@ -1378,6 +1820,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let callee = CallNode {
@@ -1386,6 +1829,7 @@ mod tests {
             line: 20,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -1445,6 +1889,7 @@ mod tests {
                         resolved: false,
                     }],
                     metrics: FunctionMetrics::default(),
+                    receiver: None,
                 },
             );
         }
@@ -1456,6 +1901,7 @@ mod tests {
                 line: 30,
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
+                receiver: None,
             },
         );
 
@@ -1476,6 +1922,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("isolated".to_string(), node);
@@ -1522,6 +1969,7 @@ mod tests {
                 },
             ],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -1544,6 +1992,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("leaf".to_string(), node);
@@ -1579,6 +2028,7 @@ mod tests {
             line: 100,
             calls: Vec::new(),
             metrics: metrics.clone(),
+            receiver: None,
         };
 
         graph.nodes.insert("complex_function".to_string(), node);
@@ -1621,6 +2071,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_b = CallNode {
@@ -1637,6 +2088,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_c = CallNode {
@@ -1653,6 +2105,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_d = CallNode {
@@ -1661,6 +2114,7 @@ mod tests {
             line: 30,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -1702,6 +2156,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_c = CallNode {
@@ -1710,6 +2165,7 @@ mod tests {
             line: 20,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("b".to_string(), node_b);
@@ -1743,6 +2199,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_b = CallNode {
@@ -1759,6 +2216,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_c = CallNode {
@@ -1775,6 +2233,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_d = CallNode {
@@ -1783,6 +2242,7 @@ mod tests {
             line: 30,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -1824,6 +2284,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_b = CallNode {
@@ -1840,6 +2301,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_c = CallNode {
@@ -1848,6 +2310,7 @@ mod tests {
             line: 20,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -1871,6 +2334,7 @@ mod tests {
             line: 1,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_b = CallNode {
@@ -1879,6 +2343,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -1918,6 +2383,7 @@ mod tests {
                 },
             ],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         // Create a less connected function
@@ -1935,6 +2401,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         // Three callers point at "hotspot" (forward edges).
@@ -1955,6 +2422,7 @@ mod tests {
                         resolved: false,
                     }],
                     metrics: FunctionMetrics::default(),
+                    receiver: None,
                 },
             );
         }
@@ -2023,6 +2491,7 @@ mod tests {
                 returns: 1,
                 cognitive: 4,
             },
+            receiver: None,
         };
 
         graph.nodes.insert("test_func".to_string(), node);
@@ -2043,6 +2512,7 @@ mod tests {
                     resolved: false,
                 }],
                 metrics: FunctionMetrics::default(),
+                receiver: None,
             },
         );
 
@@ -2082,6 +2552,7 @@ mod tests {
                 returns: 1,
                 cognitive: 2,
             },
+            receiver: None,
         };
 
         graph.nodes.insert("func1".to_string(), node1);
@@ -2119,6 +2590,7 @@ mod tests {
                 returns: 1,
                 cognitive: 2,
             },
+            receiver: None,
         };
 
         graph.nodes.insert("func".to_string(), node);
@@ -2193,6 +2665,7 @@ mod tests {
                 line: (i + 1) * 10,
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
+                receiver: None,
             };
             graph.nodes.insert(name.to_string(), node);
         }
@@ -2253,6 +2726,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -2260,6 +2734,7 @@ mod tests {
             line: 20,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -2284,6 +2759,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -2291,6 +2767,7 @@ mod tests {
             line: 20,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -2321,6 +2798,7 @@ mod tests {
             line: 5,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
         let node_b = CallNode {
             name: "helper".to_string(),
@@ -2328,6 +2806,7 @@ mod tests {
             line: 10,
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         graph
@@ -2354,6 +2833,7 @@ mod tests {
                 line: 1,
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
+                receiver: None,
             };
             graph
                 .nodes

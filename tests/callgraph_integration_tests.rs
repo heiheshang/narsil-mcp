@@ -506,3 +506,354 @@ fn test_bsl_common_module_call_resolution() {
         "cross-module call should resolve"
     );
 }
+
+/// Build a one-file call graph, so the per-language method tests stay readable.
+fn graph_of(path: &str, code: &str) -> CallGraph {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+    let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+    let files = vec![(path.to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+    call_graph
+}
+
+fn caller_names(call_graph: &CallGraph, function: &str) -> Vec<String> {
+    call_graph
+        .get_callers(function)
+        .iter()
+        .map(|edge| edge.target.clone())
+        .collect()
+}
+
+#[test]
+fn test_go_method_calls_are_edges() {
+    // `s.helper()` is a `selector_expression` callee; before it was handled,
+    // every Go method call and every `pkg.Func()` call was silently dropped.
+    let call_graph = graph_of(
+        "main.go",
+        r#"
+package main
+
+type Server struct{}
+
+func (s *Server) Handle() {
+	s.helper()
+	plain()
+}
+
+func (s *Server) helper() {}
+
+func plain() {}
+
+func main() {
+	s := &Server{}
+	s.Handle()
+}
+"#,
+    );
+
+    assert_eq!(
+        caller_names(&call_graph, "helper"),
+        vec!["main.go::Server::Handle"],
+        "s.helper() should be an edge from Handle"
+    );
+    assert_eq!(
+        caller_names(&call_graph, "Handle"),
+        vec!["main.go::main"],
+        "s.Handle() should be an edge from main"
+    );
+    assert_eq!(
+        caller_names(&call_graph, "plain"),
+        vec!["main.go::Server::Handle"],
+        "plain function calls should keep working"
+    );
+}
+
+#[test]
+fn test_python_method_calls_are_edges() {
+    // Python spells the callee as `attribute`, which used to fall through.
+    let call_graph = graph_of(
+        "app.py",
+        r#"
+class Service:
+    def run(self):
+        self.step()
+
+    def step(self):
+        pass
+
+def main():
+    Service().run()
+"#,
+    );
+
+    assert_eq!(
+        caller_names(&call_graph, "step"),
+        vec!["app.py::Service::run"]
+    );
+    assert_eq!(caller_names(&call_graph, "run"), vec!["app.py::main"]);
+}
+
+#[test]
+fn test_javascript_method_calls_are_edges() {
+    // JS names the method `property_identifier`; the old last-identifier walk
+    // returned the receiver (`a`) instead of the method (`run`).
+    let call_graph = graph_of(
+        "app.js",
+        r#"
+class Service {
+  run() {
+    this.step();
+  }
+  step() {}
+}
+
+function main() {
+  const a = new Service();
+  a.run();
+}
+"#,
+    );
+
+    assert_eq!(
+        caller_names(&call_graph, "step"),
+        vec!["app.js::Service::run"]
+    );
+    assert_eq!(caller_names(&call_graph, "run"), vec!["app.js::main"]);
+}
+
+#[test]
+fn test_java_method_invocations_are_edges() {
+    // Java calls are `method_invocation`, a node kind the walker did not treat
+    // as a call at all.
+    let call_graph = graph_of(
+        "App.java",
+        r#"
+class Service {
+    void run() {
+        this.step();
+    }
+
+    void step() {}
+
+    void main() {
+        Service a = new Service();
+        a.run();
+    }
+}
+"#,
+    );
+
+    assert_eq!(
+        caller_names(&call_graph, "step"),
+        vec!["App.java::Service::run"]
+    );
+    assert_eq!(
+        caller_names(&call_graph, "run"),
+        vec!["App.java::Service::main"]
+    );
+}
+
+#[test]
+fn test_method_call_carries_receiver_as_scope_hint() {
+    // A receiver that names a package/module narrows cross-file resolution;
+    // `self`/`this` receivers must not become scope hints.
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let store_code = "package store\n\nfunc Get() {}\n";
+    let api_code = "package api\n\nfunc Handle() {\n\tstore.Get()\n}\n";
+    let other_code = "package other\n\nfunc Get() {}\n";
+
+    let files = vec![
+        ("internal/store/store.go", store_code),
+        ("internal/api/api.go", api_code),
+        ("internal/other/other.go", other_code),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let callers = call_graph.get_callers("internal/store/store.go::Get");
+    assert_eq!(
+        callers.iter().map(|e| e.target.clone()).collect::<Vec<_>>(),
+        vec!["internal/api/api.go::Handle"],
+        "store.Get() should resolve to the store package, not to other"
+    );
+}
+
+#[test]
+fn test_find_function_accepts_qualified_method_names() {
+    let call_graph = graph_of(
+        "main.go",
+        r#"
+package main
+
+type Server struct{}
+
+func (s *Server) Handle() {}
+
+func main() {
+	s := &Server{}
+	s.Handle()
+}
+"#,
+    );
+
+    // `Type.Method` / `Type::method` are how people spell methods; the graph
+    // keys on `file::name`, so these have to be understood as queries.
+    for query in [
+        "Server.Handle",
+        "Server::Handle",
+        "main.go::Server::Handle",
+        "main.go::Handle",
+    ] {
+        assert_eq!(
+            call_graph.find_function(query).as_deref(),
+            Some("main.go::Server::Handle"),
+            "query {query} should resolve"
+        );
+        assert_eq!(
+            caller_names(&call_graph, query),
+            vec!["main.go::main"],
+            "query {query} should report callers"
+        );
+    }
+
+    assert_eq!(call_graph.find_function("Server.NoSuchThing"), None);
+    assert_eq!(CallGraph::bare_name("Server.Handle"), "Handle");
+    assert_eq!(CallGraph::bare_name("Handle"), "Handle");
+}
+
+#[test]
+fn test_same_named_methods_on_different_types_stay_distinct() {
+    // The node key used to be `file::name`, so the second `Handle` overwrote
+    // the first and one method vanished from the graph entirely.
+    let call_graph = graph_of(
+        "main.go",
+        r#"
+package main
+
+type Server struct{}
+type Client struct{}
+
+func (s *Server) Handle() {
+	serverWork()
+}
+
+func (c Client) Handle() {
+	clientWork()
+}
+
+func serverWork() {}
+func clientWork() {}
+"#,
+    );
+
+    let mut keys = call_graph.get_all_function_names();
+    keys.sort();
+    assert!(
+        keys.contains(&"main.go::Server::Handle".to_string())
+            && keys.contains(&"main.go::Client::Handle".to_string()),
+        "both methods should have their own node, got: {keys:?}"
+    );
+
+    assert_eq!(
+        caller_names(&call_graph, "serverWork"),
+        vec!["main.go::Server::Handle"]
+    );
+    assert_eq!(
+        caller_names(&call_graph, "clientWork"),
+        vec!["main.go::Client::Handle"]
+    );
+    assert_eq!(
+        call_graph.find_function("Client.Handle").as_deref(),
+        Some("main.go::Client::Handle"),
+        "the type in the query picks the method apart from its namesake"
+    );
+}
+
+#[test]
+fn test_receiver_type_is_recorded_per_language() {
+    let cases = [
+        (
+            "a.go",
+            "package a\ntype Service struct{}\nfunc (s *Service) run() {}\nfunc free() {}\n",
+        ),
+        (
+            "a.rs",
+            "struct Service;\nimpl Service { fn run(&self) {} }\nfn free() {}\n",
+        ),
+        (
+            "a.py",
+            "class Service:\n    def run(self):\n        pass\n\ndef free():\n    pass\n",
+        ),
+        ("a.js", "class Service { run() {} }\nfunction free() {}\n"),
+        ("A.java", "class Service { void run() {} }\n"),
+        (
+            "a.rb",
+            "class Service\n  def run\n  end\nend\ndef free\nend\n",
+        ),
+    ];
+
+    for (path, code) in cases {
+        let call_graph = graph_of(path, code);
+        let method = call_graph
+            .get_node(&format!("{path}::Service::run"))
+            .map(|node| node.receiver.clone());
+        assert_eq!(
+            method,
+            Some(Some("Service".to_string())),
+            "{path}: the method should be keyed and tagged with its type"
+        );
+
+        // A module-level function must not inherit the class it follows —
+        // Python's root node is called `module`, like Ruby's `module` keyword.
+        let free = call_graph
+            .get_node(&format!("{path}::free"))
+            .map(|node| node.receiver.clone());
+        if let Some(receiver) = free {
+            assert_eq!(receiver, None, "{path}: free function has no receiver");
+        }
+    }
+}
+
+#[test]
+fn test_static_call_resolves_by_receiver_across_files() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    // `a_other.rs` sorts first, so the alphabetical fallback would pick the
+    // wrong `new`; only the receiver type points at `Store`.
+    let files = vec![
+        (
+            "a_other.rs",
+            "pub struct Other;\nimpl Other { pub fn new() -> Self { Other } }\n",
+        ),
+        (
+            "z_store.rs",
+            "pub struct Store;\nimpl Store { pub fn new() -> Self { Store } }\n",
+        ),
+        ("main.rs", "fn main() { let s = Store::new(); }\n"),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees: Vec<String> = call_graph
+        .get_callees("main.rs::main")
+        .iter()
+        .map(|edge| edge.target.clone())
+        .collect();
+    assert_eq!(callees, vec!["z_store.rs::Store::new"]);
+}
