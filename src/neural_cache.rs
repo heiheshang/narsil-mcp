@@ -517,10 +517,16 @@ mod tests {
 
         let cache = EmbeddingCache::open(&dir, "test-model", 4).unwrap();
         assert_eq!(cache.len(), 2, "complete records must survive");
+
+        // The 7 stray bytes must be gone: what is left is the header plus a
+        // whole number of records.
+        let header_len = (8 + 2 + 4 + 2 + "test-model".len()) as u64;
+        let record_len = (KEY_LEN + 4 * 4) as u64;
+        let len = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
-            std::fs::metadata(&path).unwrap().len() % 1,
-            0,
-            "file must be truncated to a record boundary"
+            len,
+            header_len + 2 * record_len,
+            "file must be truncated back to the last complete record"
         );
 
         // And the truncated file must still accept new writes.
