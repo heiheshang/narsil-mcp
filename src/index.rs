@@ -8420,7 +8420,11 @@ impl CodeIntelEngine {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| path_str.clone());
                 let language = detect_language_from_path(&path_str);
-                let size_bytes = entry.value().len();
+                // `file_cache` holds paths only since the on-demand read
+                // (lever 2) — the size comes from disk, not from a cached body.
+                let size_bytes = std::fs::metadata(path)
+                    .map(|meta| meta.len() as usize)
+                    .unwrap_or(0);
                 FileInfo {
                     path: relative_path,
                     language,
