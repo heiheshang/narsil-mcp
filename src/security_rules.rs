@@ -2153,11 +2153,19 @@ fn calculate_entropy(s: &str) -> f64 {
 }
 
 /// Redact a secret for safe display
+///
+/// Both ends are cut on a character boundary: secret patterns such as
+/// `postgres://[^:]+:[^@]+@` match non-ASCII passwords, where a byte-indexed
+/// `&secret[secret.len() - 4..]` lands mid-character and panics.
 fn redact_secret(secret: &str) -> String {
     if secret.len() <= 8 {
         "*".repeat(secret.len())
     } else {
-        format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
+        format!(
+            "{}...{}",
+            crate::text::truncate(secret, 4),
+            crate::text::truncate_start(secret, 4)
+        )
     }
 }
 
@@ -2599,6 +2607,19 @@ strcpy(dest, src);
     fn test_secret_redaction() {
         assert_eq!(redact_secret("short"), "*****");
         assert_eq!(redact_secret("longsecretvalue123"), "long...e123"); // First 4 + ... + last 4
+    }
+
+    /// Secret patterns such as `postgres://[^:]+:[^@]+@` match non-ASCII
+    /// passwords, where the last four *bytes* land inside a character and a
+    /// byte-indexed slice panicked mid-scan.
+    #[test]
+    fn test_redact_secret_multibyte() {
+        let redacted = redact_secret("postgres://user:парольОтБазы@");
+        assert!(redacted.starts_with("post"), "got: {redacted}");
+        assert!(redacted.contains("..."), "got: {redacted}");
+        // The tail is cut on a character boundary, so it can be shorter than
+        // four bytes — it must never be a broken character.
+        assert!(redacted.ends_with('@'), "got: {redacted}");
     }
 
     #[test]

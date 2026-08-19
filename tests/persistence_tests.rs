@@ -820,3 +820,70 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
 
     Ok(())
 }
+
+/// A warm start must describe the repository the same way a cold one does.
+///
+/// Files whose symbols come from the persisted index are never parsed, so their
+/// language label is looked up instead of produced by the parser. Deriving it
+/// from the extension gave `Rust` where a parsed file gives `rust`, splitting
+/// one repository's files across two buckets in `list_repos`.
+#[tokio::test]
+async fn test_warm_start_reports_the_same_languages() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn alpha() -> i32 { 1 }\n")?;
+    repo.add_rust_file("src/other.rs", "pub fn beta() -> i32 { 2 }\n")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: true,
+        watch_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let languages_of = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .skip_while(|line| !line.contains("**Languages**"))
+            .skip(1)
+            .take_while(|line| line.starts_with("  - "))
+            .map(|line| line.trim().to_string())
+            .collect()
+    };
+
+    // Cold start: every file is parsed.
+    let cold = {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            options.clone(),
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        languages_of(&engine.list_repos().await?)
+    };
+    assert!(!cold.is_empty(), "cold start reported no languages");
+
+    // Warm start: the same files come back from the persisted index.
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+    let warm = languages_of(&engine.list_repos().await?);
+
+    assert_eq!(
+        cold, warm,
+        "a warm --persist start labelled the languages differently"
+    );
+
+    Ok(())
+}

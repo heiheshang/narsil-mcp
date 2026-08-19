@@ -422,12 +422,19 @@ impl CodeIntelEngine {
                             let mut total_lines = 0;
 
                             for file_meta in persisted.files.values() {
-                                let ext = file_meta
-                                    .path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .unwrap_or("unknown");
-                                let lang = ext_to_language(ext);
+                                // Same label the walk uses, so the numbers do
+                                // not change shape once indexing completes.
+                                let lang = engine
+                                    .parser
+                                    .language_name(&file_meta.path)
+                                    .unwrap_or_else(|| {
+                                        let ext = file_meta
+                                            .path
+                                            .extension()
+                                            .and_then(|e| e.to_str())
+                                            .unwrap_or("unknown");
+                                        ext_to_language(ext)
+                                    });
                                 let stats = languages.entry(lang).or_default();
                                 stats.file_count += 1;
                                 stats.byte_count += file_meta.size as usize;
@@ -752,10 +759,13 @@ impl CodeIntelEngine {
                             Some(symbols) => (
                                 Some(crate::parser::ParsedFile {
                                     path: file_path.to_string_lossy().to_string(),
-                                    language: file_path
-                                        .extension()
-                                        .and_then(|ext| ext.to_str())
-                                        .map(ext_to_language)
+                                    // Ask the parser for the label instead of
+                                    // deriving one from the extension: a warm
+                                    // start must report the same language names
+                                    // as a cold one, not `Rust` beside `rust`.
+                                    language: self
+                                        .parser
+                                        .language_name(file_path)
                                         .unwrap_or_else(|| "unknown".to_string()),
                                     symbols,
                                     tree: None,
@@ -1957,11 +1967,7 @@ impl CodeIntelEngine {
                 "- `{}:{}` - `{}`\n",
                 path,
                 line,
-                if content.len() > 80 {
-                    &content[..content.floor_char_boundary(80)]
-                } else {
-                    content
-                }
+                crate::text::truncate(content, 80)
             ));
         }
 
@@ -6941,11 +6947,7 @@ impl CodeIntelEngine {
                     symbol.name,
                     symbol.kind,
                     symbol.start_line,
-                    if sig.len() > 50 {
-                        &sig[..sig.floor_char_boundary(50)]
-                    } else {
-                        sig
-                    }
+                    crate::text::truncate(sig, 50)
                 ));
             }
 
@@ -7049,11 +7051,7 @@ impl CodeIntelEngine {
                             result.document.end_line,
                         )
                     });
-                let snippet = if content.len() > 500 {
-                    format!("{}...", &content[..content.floor_char_boundary(500)])
-                } else {
-                    content
-                };
+                let snippet = crate::text::truncate_with_ellipsis(&content, 500).into_owned();
                 output.push_str("```\n");
                 output.push_str(&snippet);
                 output.push_str("\n```\n\n");
@@ -7150,11 +7148,7 @@ impl CodeIntelEngine {
                             result.document.end_line,
                         )
                     });
-                let snippet = if content.len() > 300 {
-                    format!("{}...", &content[..content.floor_char_boundary(300)])
-                } else {
-                    content
-                };
+                let snippet = crate::text::truncate_with_ellipsis(&content, 300).into_owned();
                 output.push_str("```\n");
                 output.push_str(&snippet);
                 output.push_str("\n```\n\n");

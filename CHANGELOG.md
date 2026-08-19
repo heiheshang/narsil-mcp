@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **UTF-8 boundary panics in `find_dead_code` and `scan_security`.** The
+  crash class fixed earlier for snippet previews survived in two more places,
+  both reachable from a tool call on any non-ASCII codebase: `find_dead_code`
+  renders each dead store's source line through a 60-byte cut, and
+  `scan_security` redacts a matched secret as "first 4 … last 4" bytes —
+  secret patterns such as `postgres://[^:]+:[^@]+@` match non-ASCII passwords,
+  where the tail lands mid-character. Both cuts now go through the new
+  `narsil_mcp::text` helpers (`truncate`, `truncate_start`,
+  `truncate_with_ellipsis`), which every display truncation in the codebase
+  shares so the bug cannot be reintroduced one file at a time.
+- **The embedding truncation counter reported zero on Cyrillic input.** It
+  counted clamped texts whose length equalled `MAX_TEXT_LENGTH`, but the cut
+  lands on a character boundary, so a clamped Cyrillic text is one byte short
+  of the cap — the only diagnostic the clamp has read "nothing was truncated"
+  on exactly the corpus it was built for. It now counts by input length.
+  (The clamp itself landed with the 32k → 23k `MAX_TEXT_LENGTH` change: an
+  input over the cap is truncated before embedding instead of failing the
+  request, so one oversized symbol no longer costs its whole batch.)
+- **A warm `--persist` start labelled languages differently from a cold one.**
+  Files whose symbols come from the persisted index are never parsed, and the
+  language label was derived from the extension (`Rust`, `C++`, `C#`) instead
+  of taken from the parser (`rust`, `cpp`, `csharp`), so `list_repos` split one
+  repository's files across two buckets after a restart. Both paths now ask
+  `LanguageParser::language_name`.
+
 - **`semantic_search` and `neural_search` honour the `repo` parameter.** Both
   tools accepted `repo` but searched the whole corpus anyway: `semantic_search`
   only validated the name and then ranked every indexed repository, and
