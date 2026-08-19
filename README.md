@@ -801,6 +801,11 @@ alphabetically. When a name is ambiguous, `get_callers` / `get_callees` say
 so and list the other candidates with their types instead of silently picking
 one; query by `Type.name` to pin down the one you mean.
 
+Every edge records what it was matched on, and the listings mark the weak
+ones: `name match only` (several namesakes, nothing to choose between them),
+`same-file match`, `not in graph` (third-party or standard library), plus a
+count of each below the list.
+
 ### Control Flow Analysis
 
 | Tool | Description |

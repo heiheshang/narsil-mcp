@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
-use crate::callgraph::CallGraph;
+use crate::callgraph::{CallEdge, CallGraph, CallResolution};
 use crate::cfg;
 use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
@@ -3288,6 +3288,52 @@ impl CodeIntelEngine {
     }
 
     /// Get callers of a function
+    /// Render call edges, saying for each what its target was matched on.
+    ///
+    /// A call like `x.run()` cannot be tied to the type of `x` without type
+    /// inference, so some targets are one namesake out of many. Listing those
+    /// unmarked next to exact matches reads as a claim the graph cannot make.
+    fn format_call_edges(edges: &[CallEdge]) -> String {
+        let mut output = String::new();
+        for edge in edges {
+            let caveat = match edge.resolution.caveat() {
+                Some(caveat) => format!(", {caveat}"),
+                None => String::new(),
+            };
+            output.push_str(&format!(
+                "- `{}` at `{}:{}` ({:?}{})\n",
+                edge.target, edge.file_path, edge.line, edge.call_type, caveat
+            ));
+        }
+
+        let guessed = edges
+            .iter()
+            .filter(|edge| {
+                !edge.resolution.is_certain() && edge.resolution != CallResolution::Unresolved
+            })
+            .count();
+        let external = edges
+            .iter()
+            .filter(|edge| edge.resolution == CallResolution::Unresolved)
+            .count();
+
+        if guessed > 0 {
+            output.push_str(&format!(
+                "\n> {} of {} targets share their name with other functions and were matched by name alone — treat them as candidates.\n",
+                guessed,
+                edges.len()
+            ));
+        }
+        if external > 0 {
+            output.push_str(&format!(
+                "\n> {} of {} targets are not in the graph (third-party, standard library, or an unindexed file).\n",
+                external,
+                edges.len()
+            ));
+        }
+        output
+    }
+
     /// A graph key plus the type it is defined on, which is what distinguishes
     /// same-named methods from each other.
     fn describe_graph_node(call_graph: &CallGraph, key: &str) -> String {
@@ -3394,13 +3440,7 @@ impl CodeIntelEngine {
         } else {
             let callers = call_graph.get_callers(function);
             output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
-
-            for caller in &callers {
-                output.push_str(&format!(
-                    "- `{}` at `{}:{}` ({:?})\n",
-                    caller.target, caller.file_path, caller.line, caller.call_type
-                ));
-            }
+            output.push_str(&Self::format_call_edges(&callers));
         }
 
         if output.ends_with("\n\n") {
@@ -3451,13 +3491,7 @@ impl CodeIntelEngine {
         } else {
             let callees = call_graph.get_callees(function);
             output.push_str(&format!("Found {} direct callees\n\n", callees.len()));
-
-            for callee in &callees {
-                output.push_str(&format!(
-                    "- `{}` at `{}:{}` ({:?})\n",
-                    callee.target, callee.file_path, callee.line, callee.call_type
-                ));
-            }
+            output.push_str(&Self::format_call_edges(&callees));
         }
 
         if output.ends_with("\n\n") {
