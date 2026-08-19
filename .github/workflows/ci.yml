@@ -76,6 +76,40 @@ jobs:
       - name: Run tests
         run: cargo test --features "${{ env.CI_FEATURES }}" --verbose -- --test-threads=1
 
+  # The graph feature is deliberately outside CI_FEATURES: oxigraph/RocksDB is
+  # slow to compile, so it gets one Linux job instead of a slot in the 3-OS
+  # matrix. It cannot be left uncovered either — release.yml builds the
+  # published binaries with "native,neural,graph", and the feature has broken
+  # three times behind CI's back (the lib build in 3ce10aa, and test code in
+  # 24446b4 and when CallEdge gained `resolved`), each time noticed only when
+  # someone happened to build it by hand.
+  graph:
+    name: Graph feature (Linux)
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Own cache prefix: a graph build shares almost no artifacts with the
+      # default one, and pointing both at the same key just evicts the other.
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-graph"
+          cache-on-failure: true
+
+      - name: Clippy (graph)
+        run: cargo clippy --all-targets --features "$CI_FEATURES,graph" -- -D warnings
+
+      - name: Run tests (graph)
+        run: cargo test --features "$CI_FEATURES,graph" -- --test-threads=1
+
   # Security audit
   security:
     name: Security Audit
@@ -94,6 +128,6 @@ jobs:
   # Build release binaries
   build-release:
     name: Build Release Binaries
-    needs: [test, security]
+    needs: [test, graph, security]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/build-binaries.yml
