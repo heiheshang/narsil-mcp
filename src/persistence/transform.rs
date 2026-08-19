@@ -824,6 +824,7 @@ mod tests {
                 returns: 1,
                 cognitive: 8,
             },
+            receiver: None,
         };
 
         let iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -863,6 +864,7 @@ mod tests {
                 resolved: false,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let caller_iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -895,6 +897,7 @@ mod tests {
                 resolved: true,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_b = CallNode {
@@ -911,6 +914,7 @@ mod tests {
                 resolved: true,
             }],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_c = CallNode {
@@ -919,6 +923,7 @@ mod tests {
             line: 20,
             calls: vec![],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         CallGraphTransformer::transform_node(&graph, "test-repo", &node_a).unwrap();

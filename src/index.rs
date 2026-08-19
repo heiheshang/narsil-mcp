@@ -3288,6 +3288,72 @@ impl CodeIntelEngine {
     }
 
     /// Get callers of a function
+    /// A graph key plus the type it is defined on, which is what distinguishes
+    /// same-named methods from each other.
+    fn describe_graph_node(call_graph: &CallGraph, key: &str) -> String {
+        match call_graph
+            .get_node(key)
+            .and_then(|node| node.receiver.clone())
+        {
+            Some(receiver) => format!("`{}` (on `{}`)", key, receiver),
+            None => format!("`{}`", key),
+        }
+    }
+
+    /// Report for a query the call graph could not resolve to any function.
+    ///
+    /// Without this, an unknown name and a function with genuinely no callers
+    /// both rendered as "No callers found", which reads as a fact about the
+    /// code when it is really a failure to resolve the query.
+    fn unresolved_function_report(call_graph: &CallGraph, function: &str) -> String {
+        let mut output = format!("*Function `{}` is not in the call graph.*\n\n", function);
+        let suggestions = call_graph.get_similar_functions(CallGraph::bare_name(function), 5);
+        if suggestions.is_empty() {
+            output.push_str(
+                "No similar names indexed. Check the repo name, or that the file's language is supported.\n",
+            );
+        } else {
+            output.push_str("Did you mean:\n\n");
+            for suggestion in &suggestions {
+                output.push_str(&format!("- `{}`\n", suggestion));
+            }
+        }
+        output
+    }
+
+    /// Note which graph node a query resolved to, and warn when the bare name
+    /// is shared by several functions (overloads, same-named methods on
+    /// different types), since only one of them is being reported on.
+    fn resolution_report(call_graph: &CallGraph, function: &str, resolved: &str) -> String {
+        // An exact graph key is an explicit choice: nothing to resolve, and no
+        // point warning about the other functions sharing the name.
+        if resolved == function {
+            return String::new();
+        }
+
+        let mut output = format!(
+            "Resolved to {}\n\n",
+            Self::describe_graph_node(call_graph, resolved)
+        );
+        let candidates = call_graph.find_all_functions(CallGraph::bare_name(function));
+        if candidates.len() > 1 {
+            output.push_str(&format!(
+                "> **Ambiguous name**: {} functions are named `{}`; reporting on `{}` only.\n",
+                candidates.len(),
+                CallGraph::bare_name(function),
+                resolved
+            ));
+            for candidate in candidates.iter().filter(|c| *c != resolved).take(5) {
+                output.push_str(&format!(
+                    "> Other: {}\n",
+                    Self::describe_graph_node(call_graph, candidate)
+                ));
+            }
+            output.push('\n');
+        }
+        output
+    }
+
     pub async fn get_callers(
         &self,
         repo: &str,
@@ -3306,6 +3372,13 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Callers of `{}`\n\n", function));
+
+        let Some(resolved) = call_graph.find_function(function) else {
+            output.push_str(&Self::unresolved_function_report(&call_graph, function));
+            return Ok(output);
+        };
+        output.push_str(&Self::resolution_report(&call_graph, function, &resolved));
+        let function = resolved.as_str();
 
         if transitive {
             let callers = call_graph.get_transitive_callers(function, max_depth);
@@ -3356,6 +3429,13 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Callees of `{}`\n\n", function));
+
+        let Some(resolved) = call_graph.find_function(function) else {
+            output.push_str(&Self::unresolved_function_report(&call_graph, function));
+            return Ok(output);
+        };
+        output.push_str(&Self::resolution_report(&call_graph, function, &resolved));
+        let function = resolved.as_str();
 
         if transitive {
             let callees = call_graph.get_transitive_callees(function, max_depth);

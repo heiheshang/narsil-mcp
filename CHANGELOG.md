@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Method calls were missing from the call graph in most languages.** The
+  call-site walker only understood a handful of callee shapes, so Go
+  `selector_expression` (`s.helper()`, `pkg.Func()`), Python `attribute`
+  (`self.step()`) and Java `method_invocation` produced no edge at all, and
+  JavaScript/TypeScript recorded the receiver (`a`) instead of the method
+  (`run`). `get_callers` on any method therefore answered "No callers found"
+  on a Go, Python or Java repository. The callee is now located through
+  tree-sitter field names, covering Go, Python, JS/TS, Java, C#, PHP, Ruby,
+  Kotlin and Swift alongside the Rust/C shapes that already worked, and the
+  receiver (a package or module, but never `self`/`this`) is carried through
+  as a scope hint for cross-file resolution. Ruby `method` definitions and
+  Kotlin/Swift `simple_identifier` names are now recognised as functions, so
+  those languages have call graph nodes at all.
+
+- **Same-named methods no longer collapse onto one node.** `CallNode` now
+  records the type a function is defined on — the Go receiver, the Rust `impl`
+  type, the enclosing class/trait elsewhere — and method nodes are keyed
+  `file::Type::name` instead of `file::name`. Previously `func (s *Server)
+  Handle()` and `func (c Client) Handle()` in one file shared a key and the
+  second overwrote the first, so one method was absent from the graph and the
+  other's callers were a mix of both. The type also narrows resolution:
+  `Store::new()` now resolves to the `Store` node wherever it lives, instead of
+  to whichever `new` sorted first, and `get_callers` reports which type each
+  candidate belongs to.
+
+- **`get_callers` / `get_callees` accept qualified method names.** Graph nodes
+  were keyed `file::name`, so `Server.Handle` or `A::run` — how a method is
+  normally spelled — resolved to nothing. Such queries now fall back to the
+  trailing segment, with the qualifier matched first against the receiver type
+  and then against the file path.
+
+- **An unresolved function no longer reads as "no callers".** Both tools
+  reported "*No callers found.*" whether the name was unknown or genuinely
+  uncalled. They now say when a name is not in the graph and suggest similar
+  names, note which node a query resolved to, and warn when several functions
+  share the name instead of silently reporting on the alphabetically first.
+
 ## [1.7.1] - 2026-08-19
 
 ### Fixed
