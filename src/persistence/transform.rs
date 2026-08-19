@@ -816,7 +816,6 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 10,
             calls: vec![],
-            called_by: vec![],
             metrics: FunctionMetrics {
                 loc: 20,
                 cyclomatic: 5,
@@ -860,8 +859,9 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                // The test never creates a `callee` node.
+                resolved: false,
             }],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
         };
 
@@ -892,8 +892,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: true,
             }],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
         };
 
@@ -908,8 +908,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: true,
             }],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
         };
 
@@ -918,7 +918,6 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 20,
             calls: vec![],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
         };
 
