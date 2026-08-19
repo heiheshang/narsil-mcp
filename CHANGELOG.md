@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-08-19
+
 ### Fixed
 
 - **UTF-8 boundary panics in `find_dead_code` and `scan_security`.** The
