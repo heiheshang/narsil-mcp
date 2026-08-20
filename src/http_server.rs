@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use uuid::Uuid;
+use std::path::PathBuf;
+use std::fs;
 
 use crate::index::CodeIntelEngine;
 use crate::mcp::McpServer;
@@ -68,6 +70,8 @@ pub struct AppState {
     mcp: Arc<McpServer>,
     /// Active MCP streamable-http sessions.
     sessions: Arc<Mutex<HashSet<String>>>,
+    /// Path for persistent session storage
+    sessions_file: PathBuf,
 }
 
 /// Request body for tool calls
@@ -127,11 +131,27 @@ impl HttpServer {
 
     /// Run the HTTP server
     pub async fn run(self) -> Result<()> {
+        // Create sessions file path in temp directory
+        let sessions_file = std::env::temp_dir().join(format!("narsil-mcp-sessions-{}.json", self.port));
+
+        // Load existing sessions or create empty set
+        let sessions = if sessions_file.exists() {
+            if let Ok(content) = fs::read_to_string(&sessions_file) {
+                serde_json::from_str::<HashSet<String>>(&content)
+                    .unwrap_or_else(|_| HashSet::new())
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+
         let state = AppState {
             engine: self.engine,
             tool_registry: Arc::new(self.tool_registry),
             mcp: self.mcp,
-            sessions: Arc::new(Mutex::new(HashSet::new())),
+            sessions: Arc::new(Mutex::new(sessions)),
+            sessions_file,
         };
 
         // Configure CORS to allow frontend access (needed for development mode)
@@ -447,6 +467,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
         (None, true) => {
             let sid = Uuid::new_v4().to_string();
             state.sessions.lock().unwrap().insert(sid.clone());
+            save_sessions(&state);
             info!("MCP streamable-http session started: {}", sid);
             session_to_issue = Some(sid);
         }
@@ -518,6 +539,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
 async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
     if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.sessions.lock().unwrap().remove(sid) {
+            save_sessions(&state);
             info!("MCP streamable-http session terminated: {}", sid);
         }
     }
@@ -529,6 +551,14 @@ fn is_initialize(body: &str) -> bool {
     serde_json::from_str::<Value>(body)
         .map(|v| v.get("method").and_then(|m| m.as_str()) == Some("initialize"))
         .unwrap_or(false)
+}
+
+/// Save active sessions to disk for persistence across restarts
+fn save_sessions(state: &AppState) {
+    let sessions = state.sessions.lock().unwrap();
+    if let Ok(json) = serde_json::to_string(&*sessions) {
+        let _ = fs::write(&state.sessions_file, json);
+    }
 }
 
 #[cfg(test)]
