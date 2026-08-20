@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
@@ -595,6 +595,37 @@ impl CodeIntelEngine {
                         }
                         Err(e) => {
                             warn!("Failed to initialize git for {}: {}", repo_name, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load persisted call-graphs if enabled
+        if self.options.call_graph_enabled {
+            if let Some(store) = &self.index_store {
+                for repo_path in &self.repo_paths {
+                    let repo_name = repo_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    match store.load_call_graph(repo_path) {
+                        Ok(Some(json)) => {
+                            if let Some(cg) = self.call_graphs.get(&repo_name) {
+                                if let Err(e) = cg.from_json(&json) {
+                                    warn!("Failed to load persisted call-graph for {}: {}", repo_name, e);
+                                } else {
+                                    info!("Loaded persisted call-graph for {}", repo_name);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            debug!("No persisted call-graph found for {}", repo_name);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load call-graph for {}: {}", repo_name, e);
                         }
                     }
                 }
@@ -2225,6 +2256,21 @@ impl CodeIntelEngine {
 
             // Save the index
             store.save(&persisted)?;
+
+            // Save call-graph if enabled
+            if self.options.call_graph_enabled {
+                if let Some(cg) = self.call_graphs.get(&repo_name) {
+                    match cg.to_json() {
+                        Ok(json) => {
+                            if let Err(e) = store.save_call_graph(repo_path, &json) {
+                                warn!("Failed to save call-graph for {}: {}", repo_name, e);
+                            }
+                        }
+                        Err(e) => warn!("Failed to serialize call-graph: {}", e),
+                    }
+                }
+            }
+
             saved_count += 1;
             info!(
                 "Saved index for {} ({} files)",
@@ -2346,10 +2392,31 @@ impl CodeIntelEngine {
                             // Remove old symbols from this file
                             symbols.retain(|s| s.file_path != rel_path);
 
-                            if let Some(parsed) = parsed {
-                                for mut symbol in parsed.symbols {
+                            if let Some(parsed) = &parsed {
+                                for mut symbol in parsed.symbols.clone() {
                                     symbol.file_path = rel_path.clone();
                                     symbols.push(symbol);
+                                }
+                            }
+                        }
+
+                        // Update call-graph for this file if enabled
+                        if self.options.call_graph_enabled {
+                            if let Some(cg) = self.call_graphs.get(&repo_name) {
+                                let _ = cg.remove_functions_for_file(&rel_path);
+                                if let Some(parsed) = &parsed {
+                                    if let Some(tree) = &parsed.tree {
+                                        let _ = cg.collect_functions(&[(
+                                            rel_path.clone(),
+                                            content.clone(),
+                                            tree.clone(),
+                                        )]);
+                                        let _ = cg.collect_calls(&[(
+                                            rel_path.clone(),
+                                            content.clone(),
+                                            tree.clone(),
+                                        )]);
+                                    }
                                 }
                             }
                         }
@@ -2404,6 +2471,13 @@ impl CodeIntelEngine {
                     // Remove symbols for this file
                     if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
                         symbols.retain(|s| s.file_path != rel_path);
+                    }
+
+                    // Remove from call-graph
+                    if self.options.call_graph_enabled {
+                        if let Some(cg) = self.call_graphs.get(&repo_name) {
+                            let _ = cg.remove_functions_for_file(&rel_path);
+                        }
                     }
 
                     // Remove from file cache
