@@ -3,6 +3,13 @@
     "forgemax": {
       "command": "forgemax",
       "args": []
+    },
+    "sage-wiki-narsil": {
+      "type": "http",
+      "url": "http://192.168.17.119:8484/w/narsil/mcp",
+      "headers": {
+        "Authorization": "Bearer 04a6392b8aaca985b0cad155455b1a58"
+      }
     }
   }
 }
