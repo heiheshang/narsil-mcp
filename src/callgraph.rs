@@ -2,7 +2,7 @@
 //!
 //! This is critical for AI understanding of code flow and impact analysis.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -175,6 +175,23 @@ impl CallGraph {
     pub fn collect_calls(&self, files: &[(String, String, Tree)]) -> Result<()> {
         for (path, content, tree) in files {
             self.extract_calls(path, content, tree)?;
+        }
+        Ok(())
+    }
+
+    /// Remove all functions defined in a file from the call graph.
+    /// Call this before re-indexing a file to clean up stale function definitions.
+    pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {
+        if let Some((_, function_keys)) = self.file_functions.remove(path) {
+            for key in function_keys {
+                self.nodes.remove(&key);
+
+                if let Some(bare_name) = key.split("::").last() {
+                    if let Some(mut entry) = self.name_index.get_mut(bare_name) {
+                        entry.retain(|k| k != &key);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1773,6 +1790,27 @@ impl CallGraph {
             bytes += e.key().len() + e.value().iter().map(|s| s.len() + 24).sum::<usize>();
         }
         (self.nodes.len(), edges, bytes)
+    }
+
+    /// Serialize call graph to JSON
+    pub fn to_json(&self) -> Result<String> {
+        let nodes: Vec<(String, CallNode)> = self
+            .nodes
+            .iter()
+            .map(|ref_multi| (ref_multi.key().clone(), ref_multi.value().clone()))
+            .collect();
+        serde_json::to_string(&nodes).map_err(|e| anyhow!("Failed to serialize call-graph: {}", e))
+    }
+
+    /// Deserialize call graph from JSON and populate this instance
+    pub fn from_json(&self, json: &str) -> Result<()> {
+        let nodes: Vec<(String, CallNode)> = serde_json::from_str(json)
+            .map_err(|e| anyhow!("Failed to deserialize call-graph: {}", e))?;
+
+        for (key, node) in nodes {
+            self.insert_node(key, node);
+        }
+        Ok(())
     }
 
     /// Get all nodes (for iteration)
