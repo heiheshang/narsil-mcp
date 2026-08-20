@@ -20,10 +20,11 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn, error};
 use uuid::Uuid;
 use std::path::PathBuf;
 use std::fs;
+use std::env;
 
 use crate::index::CodeIntelEngine;
 use crate::mcp::McpServer;
@@ -131,16 +132,34 @@ impl HttpServer {
 
     /// Run the HTTP server
     pub async fn run(self) -> Result<()> {
-        // Create sessions file path in temp directory
-        let sessions_file = std::env::temp_dir().join(format!("narsil-mcp-sessions-{}.json", self.port));
+        // Create sessions file path in config directory
+        let config_dir = env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|h| h.join(".config")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+        let sessions_dir = config_dir.join("narsil-mcp");
+        if let Err(e) = fs::create_dir_all(&sessions_dir) {
+            warn!("Failed to create sessions directory {}: {}", sessions_dir.display(), e);
+        }
+
+        let sessions_file = sessions_dir.join(format!("sessions-{}.json", self.port));
 
         // Load existing sessions or create empty set
         let sessions = if sessions_file.exists() {
-            if let Ok(content) = fs::read_to_string(&sessions_file) {
-                serde_json::from_str::<HashSet<String>>(&content)
-                    .unwrap_or_else(|_| HashSet::new())
-            } else {
-                HashSet::new()
+            match fs::read_to_string(&sessions_file) {
+                Ok(content) => match serde_json::from_str::<HashSet<String>>(&content) {
+                    Ok(sessions) => sessions,
+                    Err(e) => {
+                        warn!("Failed to parse sessions file {}: {}", sessions_file.display(), e);
+                        HashSet::new()
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to read sessions file {}: {}", sessions_file.display(), e);
+                    HashSet::new()
+                }
             }
         } else {
             HashSet::new()
@@ -556,9 +575,23 @@ fn is_initialize(body: &str) -> bool {
 /// Save active sessions to disk for persistence across restarts
 fn save_sessions(state: &AppState) {
     let sessions = state.sessions.lock().unwrap();
-    if let Ok(json) = serde_json::to_string(&*sessions) {
-        let _ = fs::write(&state.sessions_file, json);
+    match serde_json::to_string(&*sessions) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&state.sessions_file, json) {
+                error!("Failed to save sessions to {}: {}", state.sessions_file.display(), e);
+            }
+        }
+        Err(e) => {
+            error!("Failed to serialize sessions: {}", e);
+        }
     }
+}
+
+/// Get home directory, with fallback
+fn dirs_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 #[cfg(test)]
