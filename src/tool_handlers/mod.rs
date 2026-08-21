@@ -224,6 +224,8 @@ impl Default for ToolRegistry {
 /// Helper trait for extracting arguments from JSON
 pub trait ArgExtractor {
     fn get_str(&self, key: &str) -> Option<&str>;
+    /// First present string value among several accepted key spellings
+    fn get_str_any(&self, keys: &[&str]) -> Option<&str>;
     fn get_str_or(&self, key: &str, default: &str) -> String;
     fn get_u64(&self, key: &str) -> Option<u64>;
     fn get_u64_or(&self, key: &str, default: u64) -> u64;
@@ -235,6 +237,10 @@ pub trait ArgExtractor {
 impl ArgExtractor for Value {
     fn get_str(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(|v| v.as_str())
+    }
+
+    fn get_str_any(&self, keys: &[&str]) -> Option<&str> {
+        keys.iter().find_map(|k| self.get_str(k))
     }
 
     fn get_str_or(&self, key: &str, default: &str) -> String {

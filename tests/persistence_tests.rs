@@ -128,6 +128,7 @@ async fn test_persistence_index_loading() -> Result<()> {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
         assert!(symbols.contains("User"));
@@ -153,6 +154,7 @@ async fn test_persistence_index_loading() -> Result<()> {
         let symbols = engine2
             .find_symbols(
                 repo.path().file_name().unwrap().to_str().unwrap(),
+                None,
                 None,
                 None,
                 None,
@@ -243,6 +245,7 @@ async fn test_persistence_stale_file_detection() -> Result<()> {
                 Some("Modified"),
                 None,
                 None,
+                None,
             )
             .await?;
         assert!(symbols.contains("ModifiedStruct"));
@@ -291,6 +294,7 @@ async fn test_persistence_disabled() -> Result<()> {
     let symbols = engine
         .find_symbols(
             repo.path().file_name().unwrap().to_str().unwrap(),
+            None,
             None,
             None,
             None,
@@ -358,6 +362,7 @@ async fn test_empty_persisted_index() -> Result<()> {
         let symbols = engine2
             .find_symbols(
                 repo.path().file_name().unwrap().to_str().unwrap(),
+                None,
                 None,
                 None,
                 None,
@@ -669,7 +674,14 @@ async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
     // The new symbol must be visible — proves the watcher is alive and
     // processed the file change.
     let result = engine
-        .find_symbols(&repo_name, None, Some("watcher_reindexed_me"), None, None)
+        .find_symbols(
+            &repo_name,
+            None,
+            Some("watcher_reindexed_me"),
+            None,
+            None,
+            None,
+        )
         .await?;
     assert!(
         result.contains("watcher_reindexed_me"),
@@ -787,7 +799,7 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
     engine.complete_initialization().await?;
 
     let symbols = engine
-        .find_symbols(&repo_name, None, Some("calculate"), None, None)
+        .find_symbols(&repo_name, None, Some("calculate"), None, None, None)
         .await?;
     assert!(
         symbols.contains("calculate_invoice_total"),

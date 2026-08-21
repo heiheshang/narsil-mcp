@@ -18,11 +18,19 @@ impl ToolHandler for FindSymbolsHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let symbol_type = args.get_str("symbol_type");
-        let pattern = args.get_str("pattern");
+        let pattern = args.get_str_any(&["pattern", "query", "name"]);
         let file_pattern = args.get_str("file_pattern");
         let exclude_tests = args.get_bool("exclude_tests");
+        let limit = args.get_u64("limit").map(|v| v as usize);
         engine
-            .find_symbols(repo, symbol_type, pattern, file_pattern, exclude_tests)
+            .find_symbols(
+                repo,
+                symbol_type,
+                pattern,
+                file_pattern,
+                exclude_tests,
+                limit,
+            )
             .await
     }
 }

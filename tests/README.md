@@ -144,12 +144,12 @@ cargo test --test integration_tests
 ## Coverage
 
 The integration tests cover:
-- âœ… All 9 MCP tools (list_repos, get_project_structure, find_symbols, etc.)
-- âœ… JSON-RPC protocol compliance
-- âœ… Multi-language parsing (Rust, Python, TypeScript, JavaScript, Go, C, C++, Java)
-- âœ… Error handling and edge cases
-- âœ… Search and filtering capabilities
-- âœ… File system operations (.gitignore, large files, syntax errors)
+- ✅ All 9 MCP tools (list_repos, get_project_structure, find_symbols, etc.)
+- ✅ JSON-RPC protocol compliance
+- ✅ Multi-language parsing (Rust, Python, TypeScript, JavaScript, Go, C, C++, Java)
+- ✅ Error handling and edge cases
+- ✅ Search and filtering capabilities
+- ✅ File system operations (.gitignore, large files, syntax errors)
 
 ## Continuous Integration
 
