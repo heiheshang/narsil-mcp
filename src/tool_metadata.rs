@@ -197,6 +197,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
+                    "file": {"type": "string", "description": "Alias for 'path'"},
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line numbers to extract around (1-indexed)"},
                     "line": {"type": "integer", "description": "Single anchor line (alternative to 'lines')"},
                     "start_line": {"type": "integer", "description": "First line of an explicit range (1-indexed, alternative to 'lines'; disables context padding and scope expansion by default)"},
@@ -344,9 +345,11 @@ lazy_static! {
                     "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
                     "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex."},
                     "query": {"type": "string", "description": "Alias for 'pattern'"},
+                    "name": {"type": "string", "description": "Alias for 'pattern'"},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py'); a bare filename matches at any depth"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
-                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated"}
+                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
                 },
                 "required": ["repo"]
             }),
@@ -499,6 +502,7 @@ lazy_static! {
                     "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md'; a bare filename matches at any depth"},
                     "path": {"type": "string", "description": "Alias for 'file_pattern'"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -1733,7 +1737,15 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "view": {"type": "string", "enum": ["call", "import", "symbol", "hybrid", "control_flow"]},
-                    "depth": {"type": "integer", "description": "Maximum depth (default: 3)"}
+                    "depth": {"type": "integer", "description": "Maximum depth (default: 3)"},
+                    "root": {"type": "string", "description": "Root symbol/file to start the graph from"},
+                    "direction": {"type": "string", "enum": ["in", "out", "both"], "description": "Edge direction to follow (default: both)"},
+                    "include_metrics": {"type": "boolean", "description": "Include complexity metrics on nodes (default: true)"},
+                    "include_security": {"type": "boolean", "description": "Overlay security findings (default: false)"},
+                    "include_excerpts": {"type": "boolean", "description": "Include code excerpts on nodes (default: false)"},
+                    "cluster_by": {"type": "string", "description": "Cluster nodes by 'file', 'module' or 'none' (default: none)"},
+                    "max_nodes": {"type": "integer", "description": "Maximum nodes in the graph (default: 200)"},
+                    "filter": {"type": "object", "description": "Node filter: {min_complexity: int, file_pattern: glob}"}
                 },
                 "required": ["repo"]
             }),

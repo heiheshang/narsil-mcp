@@ -19,7 +19,7 @@ impl ToolHandler for SearchCodeHandler {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
         let file_pattern = args.get_str_any(&["file_pattern", "path"]);
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .search_code(repo, query, file_pattern, max_results, exclude_tests)
