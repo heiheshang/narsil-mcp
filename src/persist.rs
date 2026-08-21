@@ -289,7 +289,8 @@ impl IndexStore {
             hasher.update(repo_root.to_string_lossy().as_bytes());
             format!("{:x}", hasher.finalize())
         };
-        self.index_dir.join(format!("{}.callgraph.json", &hash[..16]))
+        self.index_dir
+            .join(format!("{}.callgraph.json", &hash[..16]))
     }
 
     /// Save call-graph to disk
