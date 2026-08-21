@@ -293,3 +293,91 @@ fn no_mojibake_literals_in_source() {
         bad.join("\n")
     );
 }
+
+#[tokio::test]
+async fn dispatch_rejects_unknown_argument() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("a.md", "needle\n")?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let err = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "needle", "serach_pattern": "typo"}),
+        )
+        .await
+        .expect_err("unknown argument key must be rejected, not silently dropped");
+    let msg = err.to_string();
+    assert!(msg.contains("serach_pattern"), "{msg}");
+    assert!(
+        msg.contains("Accepted parameters"),
+        "error must list accepted params: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_rejects_missing_required_argument() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("a.md", "alpha\n")?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let err = registry
+        .dispatch(
+            "get_excerpt",
+            &engine,
+            json!({"repo": repo.name(), "start_line": 1}),
+        )
+        .await
+        .expect_err("missing required 'path' must be rejected");
+    assert!(err.to_string().contains("path"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_alias_satisfies_required_argument() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("a.md", "alpha\nbeta\n")?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // 'file' is a declared alias for the required 'path'
+    let out = registry
+        .dispatch(
+            "get_excerpt",
+            &engine,
+            json!({"repo": repo.name(), "file": "a.md", "start_line": 1, "end_line": 2}),
+        )
+        .await?;
+    assert!(out.contains("alpha"), "{out}");
+    Ok(())
+}
+
+#[test]
+fn validate_modes_behave_as_documented() {
+    use narsil_mcp::tool_handlers::{validate_tool_args, ArgValidationMode};
+
+    let bad = json!({"query": "x", "bogus_key": 1});
+    assert!(validate_tool_args("search_code", &bad, ArgValidationMode::Strict).is_err());
+    assert!(validate_tool_args("search_code", &bad, ArgValidationMode::Warn).is_ok());
+    assert!(validate_tool_args("search_code", &bad, ArgValidationMode::Off).is_ok());
+
+    // Underscore-prefixed keys are reserved and never rejected
+    let meta_key = json!({"query": "x", "_meta": {"traceparent": "t"}});
+    assert!(validate_tool_args("search_code", &meta_key, ArgValidationMode::Strict).is_ok());
+
+    // Tools without metadata are not validated
+    let anything = json!({"whatever": true});
+    assert!(validate_tool_args("no_such_tool", &anything, ArgValidationMode::Strict).is_ok());
+
+    // Null arguments are fine when nothing is required
+    assert!(validate_tool_args(
+        "list_repos",
+        &serde_json::Value::Null,
+        ArgValidationMode::Strict
+    )
+    .is_ok());
+}

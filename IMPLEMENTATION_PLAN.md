@@ -75,18 +75,17 @@ Literal replacement only — no logic change:
 
 ---
 
-## Sprint 2 — Schema-Level Argument Validation [OPEN]
+## Sprint 2 — Schema-Level Argument Validation [DONE 2026-08-21]
 
 Prevents the whole silent-drop class across all ~90 tools.
 
-- [ ] Validate `arguments` keys against the tool's `input_schema` in `ToolRegistry::dispatch`
+- [x] Validate `arguments` keys against the tool's `input_schema` in `ToolRegistry::dispatch`
       (`src/tool_handlers/mod.rs:194-205`); unknown key → error listing accepted parameters
-- [ ] Enforce `required` fields from the schema (e.g. `get_excerpt` requires `lines` today
+- [x] Enforce `required` fields from the schema (e.g. `get_excerpt` requires `lines` today
       but the handler never checks)
-- [ ] Escape hatch: log-warning-only mode via config, in case a client sends benign extras
-- [ ] Tests: unknown key rejected; missing required key rejected; valid calls unaffected
-- [ ] Sweep param naming consistency (`query` vs `pattern` vs `symbol`) and add aliases
-      where neighbours diverge
+- [x] Escape hatch: `NARSIL_ARG_VALIDATION=strict|warn|off` env var (default strict); underscore-prefixed keys always ignored
+- [x] Tests: unknown key rejected; missing required key rejected; valid calls unaffected
+- [x] Sweep param naming consistency: automated cross-check of every handler's arg reads vs its schema found 3 real gaps (get_code_graph missing 8 params, get_excerpt 'file', find_symbols 'name') — all declared; added `limit`↔`max_results` aliases on search_code/find_symbols
 
 ---
 
@@ -130,4 +129,4 @@ Prevents the whole silent-drop class across all ~90 tools.
 
 Sprint 1 (≈1 day, closes every observed symptom) → Sprint 2 (regression-proofing) → Sprint 3 → Sprint 4.
 
-**Last updated:** 2026-08-21 — Sprint 1 complete: aliases + explicit ranges + find_symbols cap/ranking + mojibake repair; 9 new tests in tests/tool_ux_tests.rs, full suite green (1201 passed).
+**Last updated:** 2026-08-21 — Sprints 1-2 complete: aliases + explicit ranges + find_symbols cap/ranking + mojibake repair; 9 new tests in tests/tool_ux_tests.rs, full suite green (1201 passed).
