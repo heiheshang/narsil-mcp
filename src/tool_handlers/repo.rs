@@ -51,7 +51,10 @@ impl ToolHandler for GetFileHandler {
         let path = args.get_str("path").unwrap_or("");
         let start_line = args.get_u64("start_line").map(|v| v as usize);
         let end_line = args.get_u64("end_line").map(|v| v as usize);
-        engine.get_file(repo, path, start_line, end_line).await
+        let git_ref = args.get_str_any(&["ref", "revision"]);
+        engine
+            .get_file(repo, path, start_line, end_line, git_ref)
+            .await
     }
 }
 

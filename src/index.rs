@@ -1900,11 +1900,23 @@ impl CodeIntelEngine {
         path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
+        git_ref: Option<&str>,
     ) -> Result<String> {
         let repo_path = self.get_repo_path(repo)?;
-        let file_path = validate_path(&repo_path, path)?;
 
-        let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
+        let content = if let Some(rev) = git_ref {
+            // Validate the path lexically (relative to repo, no traversal) without
+            // requiring it to exist in the current working tree - it only needs to
+            // exist at `rev`, which git itself will report if it doesn't.
+            validate_relative_path(path)?;
+            let git_repo = self.git_repos.get(repo).ok_or_else(|| {
+                anyhow!("Git not available for {}. Enable with --git flag.", repo)
+            })?;
+            git_repo.show_file_at_ref(rev, path)?
+        } else {
+            let file_path = validate_path(&repo_path, path)?;
+            std::fs::read_to_string(&file_path).context("Failed to read file")?
+        };
 
         let lines: Vec<&str> = content.lines().collect();
         let start = start_line.unwrap_or(1).saturating_sub(1);
@@ -1912,6 +1924,9 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", path));
+        if let Some(rev) = git_ref {
+            output.push_str(&format!("**Ref**: `{}`\n\n", rev));
+        }
         output.push_str(&format!(
             "Lines {}-{} of {}\n\n",
             start + 1,
@@ -9299,6 +9314,24 @@ fn validate_path(repo_root: &Path, requested: &str) -> Result<PathBuf> {
     }
 
     Ok(canonical_path)
+}
+
+/// Validate that a requested path is a relative path with no traversal segments,
+/// without requiring it to exist on disk (used for git-ref lookups, where the
+/// path only needs to exist inside the ref's tree, not the current working tree).
+fn validate_relative_path(requested: &str) -> Result<()> {
+    if requested.starts_with('/') {
+        return Err(anyhow!("Absolute paths not allowed"));
+    }
+    if Path::new(requested)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "Path traversal attempt blocked: '..' not allowed in path"
+        ));
+    }
+    Ok(())
 }
 
 fn format_size(bytes: u64) -> String {

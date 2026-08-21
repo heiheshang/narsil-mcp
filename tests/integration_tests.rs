@@ -1581,6 +1581,35 @@ mod git_tests {
             }
         }
     }
+
+    #[test]
+    fn test_git_show_file_at_ref() {
+        let repo = GitRepo::new(Path::new(".")).unwrap();
+
+        // HEAD:Cargo.toml should resolve to the currently committed Cargo.toml
+        let content = repo.show_file_at_ref("HEAD", "Cargo.toml");
+        assert!(
+            content.is_ok(),
+            "Should read Cargo.toml at HEAD: {:?}",
+            content.err()
+        );
+        let content = content.unwrap();
+        assert!(
+            content.contains("[package]"),
+            "Cargo.toml content should contain [package]"
+        );
+
+        // A bogus ref should fail cleanly rather than panic
+        let bad_ref = repo.show_file_at_ref("not-a-real-ref-xyz", "Cargo.toml");
+        assert!(bad_ref.is_err(), "Nonexistent ref should error");
+
+        // Argument injection attempts must still be rejected
+        let bad_rev = repo.show_file_at_ref("-suspicious", "Cargo.toml");
+        assert!(
+            bad_rev.is_err(),
+            "Should reject refs starting with '-' to prevent flag injection"
+        );
+    }
 }
 
 #[test]

@@ -427,6 +427,26 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Get the content of a file as of a specific ref (branch, tag, or commit)
+    pub fn show_file_at_ref(&self, rev: &str, file_path: &str) -> Result<String> {
+        Self::validate_input(rev, "ref")?;
+        Self::validate_input(file_path, "file_path")?;
+
+        let object = format!("{}:{}", rev, file_path);
+        let output = Command::new("git")
+            .args(["show", &object])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to run git show")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("git show {} failed: {}", object, err));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     /// Find commits that modified a specific function/symbol
     pub fn symbol_history(
         &self,
