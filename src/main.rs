@@ -82,6 +82,17 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_DISCOVER")]
     discover: Option<PathBuf>,
 
+    /// Extra glob patterns to exclude from indexing, on top of the built-in
+    /// defaults (vendor/, node_modules/, minified/lock files, ...).
+    /// Prefix a pattern with '!' to re-include, e.g. '!**/vendor/**'.
+    /// Comma-separated when set via `NARSIL_EXCLUDE`.
+    #[arg(long = "exclude", env = "NARSIL_EXCLUDE", value_delimiter = ',')]
+    exclude: Vec<String>,
+
+    /// Maximum file size in bytes to index (default: 10485760 = 10MB; 0 = unlimited)
+    #[arg(long, env = "NARSIL_MAX_FILE_SIZE")]
+    max_file_size: Option<u64>,
+
     /// Enable index persistence (save/load index to/from disk)
     #[arg(short, long, env = "NARSIL_PERSIST")]
     persist: bool,
@@ -271,6 +282,12 @@ async fn main() -> Result<()> {
         neural_config,
         cache_enabled: !server_args.no_cache,
         cache_ttl_seconds: server_args.cache_ttl,
+        index_exclude: server_args.exclude.clone(),
+        index_max_file_size: match server_args.max_file_size {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => index::EngineOptions::default().index_max_file_size,
+        },
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
@@ -384,6 +401,12 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     }
     if server_args.preset.is_none() {
         server_args.preset = profile.preset.clone();
+    }
+    if server_args.exclude.is_empty() {
+        server_args.exclude = profile.exclude.clone();
+    }
+    if server_args.max_file_size.is_none() {
+        server_args.max_file_size = profile.max_file_size;
     }
 
     apply_bool_default(&mut server_args.git, profile.git);

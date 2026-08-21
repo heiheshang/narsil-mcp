@@ -1245,27 +1245,9 @@ fn is_source_file(path: &Path) -> bool {
 
 /// Check if a file/directory should be ignored
 fn should_ignore(name: &str) -> bool {
-    // Hidden files/directories
-    if name.starts_with('.') {
-        return true;
-    }
-
-    // Common ignore patterns
-    let ignore_patterns = [
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".git",
-        ".svn",
-        "vendor",
-        "venv",
-        ".venv",
-        "env",
-    ];
-
-    ignore_patterns.contains(&name)
+    // Hidden files/directories, plus the shared vendored-content defaults
+    // so the Merkle scan agrees with the main index walk.
+    name.starts_with('.') || crate::security_rules::VENDORED_DIRS.contains(&name)
 }
 
 // =============================================================================
