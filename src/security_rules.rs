@@ -102,6 +102,118 @@ pub fn is_test_file(path: &str) -> bool {
     false
 }
 
+/// Directory names excluded from indexing by default: vendored dependencies
+/// and build artifacts. Shared by the index walk, the incremental Merkle
+/// scan and the file watcher so all three agree on what is indexable.
+pub const VENDORED_DIRS: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "bower_components",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "env",
+    ".git",
+    ".svn",
+];
+
+/// File-name suffixes excluded from indexing by default (minified/generated).
+pub const VENDORED_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".min.mjs", ".map"];
+
+/// Exact file names excluded from indexing by default (machine-generated
+/// lockfiles that drown short/numeric queries; supply-chain tools read them
+/// directly from disk, not from the index).
+pub const VENDORED_FILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "Cargo.lock",
+    "poetry.lock",
+    "Gemfile.lock",
+    "go.sum",
+];
+
+/// Check whether a repo-relative path is vendored/generated content that
+/// should be excluded from indexing by default.
+///
+/// # Examples
+/// ```
+/// use narsil_mcp::security_rules::is_vendored_path;
+/// use std::path::Path;
+/// assert!(is_vendored_path(Path::new("vendor/pkg/mod.go")));
+/// assert!(is_vendored_path(Path::new("web/assets/app.min.js")));
+/// assert!(is_vendored_path(Path::new("go.sum")));
+/// assert!(!is_vendored_path(Path::new("src/vendors_report.rs")));
+/// ```
+pub fn is_vendored_path(rel_path: &std::path::Path) -> bool {
+    for comp in rel_path.components() {
+        if let std::path::Component::Normal(name) = comp {
+            if let Some(name) = name.to_str() {
+                if VENDORED_DIRS.contains(&name) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(file_name) = rel_path.file_name().and_then(|n| n.to_str()) {
+        if VENDORED_FILE_NAMES.contains(&file_name) {
+            return true;
+        }
+        if VENDORED_FILE_SUFFIXES
+            .iter()
+            .any(|s| file_name.ends_with(s))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compiled index-exclusion filter: built-in vendored defaults plus user
+/// glob patterns. A pattern starting with `!` re-includes matching paths,
+/// overriding both the defaults and other exclude patterns — e.g.
+/// `"!**/vendor/**"` opts vendored code back into the index.
+pub struct IndexFilter {
+    exclude: Vec<glob::Pattern>,
+    include: Vec<glob::Pattern>,
+}
+
+impl IndexFilter {
+    /// Compile user patterns. Invalid globs are a hard error so a config
+    /// typo cannot silently disable the filter.
+    pub fn new(patterns: &[String]) -> anyhow::Result<Self> {
+        let mut exclude = Vec::new();
+        let mut include = Vec::new();
+        for raw in patterns {
+            let (negated, pat) = match raw.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, raw.as_str()),
+            };
+            let compiled = glob::Pattern::new(pat)
+                .map_err(|e| anyhow::anyhow!("Invalid exclude pattern '{}': {}", raw, e))?;
+            if negated {
+                include.push(compiled);
+            } else {
+                exclude.push(compiled);
+            }
+        }
+        Ok(Self { exclude, include })
+    }
+
+    /// Whether a repo-relative path should be excluded from indexing.
+    pub fn is_excluded(&self, rel_path: &std::path::Path) -> bool {
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+        if self.include.iter().any(|g| g.matches(&rel_str)) {
+            return false;
+        }
+        is_vendored_path(rel_path) || self.exclude.iter().any(|g| g.matches(&rel_str))
+    }
+}
+
 /// Remove inline test-only Rust items while preserving line numbers.
 ///
 /// Security scans exclude test files by default because test code often contains

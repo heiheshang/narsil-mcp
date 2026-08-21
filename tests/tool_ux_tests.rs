@@ -42,15 +42,11 @@ impl TestRepo {
     }
 }
 
-async fn engine_for(repo: &TestRepo) -> Result<(CodeIntelEngine, TempDir)> {
+async fn engine_with(
+    repo: &TestRepo,
+    options: EngineOptions,
+) -> Result<(CodeIntelEngine, TempDir)> {
     let index_dir = TempDir::new()?;
-    let options = EngineOptions {
-        git_enabled: false,
-        call_graph_enabled: false,
-        persist_enabled: false,
-        watch_enabled: false,
-        ..Default::default()
-    };
     let engine = CodeIntelEngine::with_options(
         index_dir.path().to_path_buf(),
         vec![repo.path().to_path_buf()],
@@ -59,6 +55,20 @@ async fn engine_for(repo: &TestRepo) -> Result<(CodeIntelEngine, TempDir)> {
     .await?;
     engine.complete_initialization().await?;
     Ok((engine, index_dir))
+}
+
+async fn engine_for(repo: &TestRepo) -> Result<(CodeIntelEngine, TempDir)> {
+    engine_with(
+        repo,
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: false,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 #[tokio::test]
@@ -380,4 +390,130 @@ fn validate_modes_behave_as_documented() {
         ArgValidationMode::Strict
     )
     .is_ok());
+}
+
+#[tokio::test]
+async fn vendored_paths_excluded_from_index_by_default() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("src/lib.rs", "pub fn app_needle_fn() {}\n")?;
+    repo.add_file("vendor/dep/lib.rs", "pub fn vendored_needle_fn() {}\n")?;
+    repo.add_file("package-lock.json", "{\"needle_fn\": true}\n")?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "needle_fn"}),
+        )
+        .await?;
+    assert!(out.contains("src/lib.rs"), "app code not indexed:\n{out}");
+    assert!(
+        !out.contains("vendor/"),
+        "vendored file leaked into search:\n{out}"
+    );
+    assert!(
+        !out.contains("package-lock.json"),
+        "lockfile leaked into search:\n{out}"
+    );
+
+    let symbols = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "needle_fn"}),
+        )
+        .await?;
+    assert!(symbols.contains("app_needle_fn"), "{symbols}");
+    assert!(
+        !symbols.contains("vendored_needle_fn"),
+        "vendored symbol leaked:\n{symbols}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn exclude_negation_reincludes_vendored_paths() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("vendor/dep/lib.rs", "pub fn vendored_needle_fn() {}\n")?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            index_exclude: vec!["!**/vendor/**".to_string()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "vendored_needle_fn"}),
+        )
+        .await?;
+    assert!(
+        out.contains("vendor/dep/lib.rs"),
+        "'!' pattern must re-include vendored paths:\n{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_exclude_glob_is_applied() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("docs/generated.md", "gen_needle here\n")?;
+    repo.add_file("README.md", "gen_needle here too\n")?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            index_exclude: vec!["docs/**".to_string()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "gen_needle"}),
+        )
+        .await?;
+    assert!(out.contains("README.md"), "{out}");
+    assert!(!out.contains("docs/"), "custom exclude ignored:\n{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_files_skipped_from_index() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file("small.md", "size_needle small\n")?;
+    repo.add_file(
+        "huge.md",
+        &format!("size_needle huge\n{}", "x".repeat(4096)),
+    )?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            index_max_file_size: Some(1024),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "size_needle"}),
+        )
+        .await?;
+    assert!(out.contains("small.md"), "{out}");
+    assert!(!out.contains("huge.md"), "oversized file indexed:\n{out}");
+    Ok(())
 }

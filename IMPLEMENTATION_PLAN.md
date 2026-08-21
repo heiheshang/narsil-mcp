@@ -89,25 +89,25 @@ Prevents the whole silent-drop class across all ~90 tools.
 
 ---
 
-## Sprint 3 — Default vendor/ Exclusion [OPEN]
+## Sprint 3 — Default vendor/ Exclusion [DONE 2026-08-21]
 
-- [ ] **Pre-check on the affected repo:** confirm vendor/ is actually committed/not-gitignored.
-      If it IS gitignored yet still indexed, the bug is in walker config or the unconditionally
-      scanned `normalized_docs` branch (1C dumps under `vendor/erp_dump`, `src/index.rs:1713-1725`) —
-      fix that first, don't paper over it
-- [ ] Shared `is_vendored_path()` helper next to `is_test_file` (`src/security_rules.rs:34`).
+- [x] **Pre-check done:** go-rest-api commits vendor/ (3,888 git-tracked files, Go vendoring),
+      so the walker indexed it legitimately — default exclusion is the correct remedy, not a
+      walker bug. 1C dumps under vendor/erp_dump are unaffected: discover_repos registers them
+      as separate repo roots, and exclusion applies to paths relative to each walk root
+- [x] Shared `is_vendored_path()` helper next to `is_test_file` (`src/security_rules.rs:34`).
       Defaults: `vendor/`, `node_modules/`, `target/`, `dist/`, `build/`, `__pycache__/`,
       `venv/`/`.venv/`, `*.min.js`/`*.min.css`, lockfiles. Consolidate the two existing copies
       (`src/incremental.rs:1247-1268` — watch-only; `src/repo.rs:38-50` — dead code) into it
-- [ ] Apply in the main index walk after the walker filter (`src/index.rs:758-762`) so
+- [x] Apply in the main index walk after the walker filter (`src/index.rs:758-762`) so
       search_code, BM25, embeddings, call graph and index size all benefit
-- [ ] Add `max_file_size` guard in `read_indexable_text_file` (`src/index.rs:9031-9038`) —
+- [x] Add `max_file_size` guard in `read_indexable_text_file` (`src/index.rs:9031-9038`) —
       currently unbounded; minified/generated files are the other half of the noise
-- [ ] Config escape hatch: `exclude: Vec<String>` globs (+ `!`-negation for opt-in back, e.g.
+- [x] Config escape hatch: `exclude: Vec<String>` globs (+ `!`-negation for opt-in back, e.g.
       when auditing vendor/) on `RepoProfile` (`src/config/schema.rs:63-107`), threaded through
       `EngineOptions` (`src/index.rs:96`)
-- [ ] Optional follow-up: query-time `exclude_paths` param on `search_code` as a per-call override
-- [ ] Tests: vendored file not indexed by default; config negation re-includes it; oversized file skipped
+- [ ] Optional follow-up (not done, still optional): query-time `exclude_paths` param on `search_code`
+- [x] Tests: vendored file not indexed by default; config negation re-includes it; oversized file skipped
 
 ---
 
@@ -129,4 +129,4 @@ Prevents the whole silent-drop class across all ~90 tools.
 
 Sprint 1 (≈1 day, closes every observed symptom) → Sprint 2 (regression-proofing) → Sprint 3 → Sprint 4.
 
-**Last updated:** 2026-08-21 — Sprints 1-2 complete: aliases + explicit ranges + find_symbols cap/ranking + mojibake repair; 9 new tests in tests/tool_ux_tests.rs, full suite green (1201 passed).
+**Last updated:** 2026-08-21 — Sprints 1-3 complete: aliases + explicit ranges + find_symbols cap/ranking + mojibake repair; 9 new tests in tests/tool_ux_tests.rs, full suite green (1201 passed).

@@ -117,6 +117,14 @@ pub struct EngineOptions {
     pub cache_enabled: bool,
     /// Cache TTL in seconds (default: 1800 = 30 minutes)
     pub cache_ttl_seconds: u64,
+    /// Extra glob patterns excluded from indexing, on top of the built-in
+    /// vendored defaults (see `security_rules::VENDORED_DIRS`). A pattern
+    /// starting with `!` re-includes matching paths, e.g. `"!**/vendor/**"`
+    /// opts vendored code back into the index.
+    pub index_exclude: Vec<String>,
+    /// Maximum file size in bytes to index; larger files are skipped and
+    /// counted in the indexing log. None = unlimited.
+    pub index_max_file_size: Option<u64>,
     /// Enable RDF knowledge graph storage (requires graph feature)
     #[cfg(feature = "graph")]
     pub graph_enabled: bool,
@@ -138,6 +146,8 @@ impl Default for EngineOptions {
             neural_config: NeuralConfig::default(),
             cache_enabled: true,
             cache_ttl_seconds: 1800,
+            index_exclude: Vec::new(),
+            index_max_file_size: Some(10 * 1024 * 1024),
             #[cfg(feature = "graph")]
             graph_enabled: false,
             #[cfg(feature = "graph")]
@@ -759,11 +769,40 @@ impl CodeIntelEngine {
             .require_git(false)
             .build();
 
+        // Vendored/generated content is excluded by default so committed
+        // vendor/, node_modules/ etc. don't drown search results; users can
+        // opt back in with a `!`-prefixed pattern in `index_exclude`.
+        let index_filter = crate::security_rules::IndexFilter::new(&self.options.index_exclude)?;
+        let max_file_size = self.options.index_max_file_size;
+        let mut skipped_vendored = 0usize;
+        let mut skipped_large = 0usize;
+
         let files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .filter(|e| {
+                let rel = e.path().strip_prefix(path).unwrap_or(e.path());
+                if index_filter.is_excluded(rel) {
+                    skipped_vendored += 1;
+                    return false;
+                }
+                if let Some(max) = max_file_size {
+                    if e.metadata().map(|m| m.len() > max).unwrap_or(false) {
+                        skipped_large += 1;
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|e| e.path().to_path_buf())
             .collect();
+
+        if skipped_vendored > 0 || skipped_large > 0 {
+            info!(
+                "{}: skipped {} vendored/generated file(s) and {} oversized file(s) during indexing",
+                repo_name, skipped_vendored, skipped_large
+            );
+        }
 
         // Process in chunks so the whole corpus's content + tree-sitter trees
         // are never resident at once. The pre-streaming `collect()` held every
@@ -2416,6 +2455,9 @@ impl CodeIntelEngine {
         use crate::persist::ChangeType;
 
         let mut count = 0;
+        // Same exclusion rules as the index walk: a change under vendor/
+        // etc. must not leak into the index through the watcher.
+        let index_filter = crate::security_rules::IndexFilter::new(&self.options.index_exclude)?;
 
         for change in changes {
             // Find which repo this file belongs to. Notify may emit canonical
@@ -2431,6 +2473,11 @@ impl CodeIntelEngine {
                 Some(p) => p,
                 None => continue,
             };
+
+            if index_filter.is_excluded(change.path.strip_prefix(repo_path).unwrap_or(&change.path))
+            {
+                continue;
+            }
 
             let repo_name = repo_path
                 .file_name()

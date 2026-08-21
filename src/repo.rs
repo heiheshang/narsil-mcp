@@ -3,58 +3,15 @@
 //! Handles repository discovery, validation, and configuration.
 
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Configuration for a repository
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoConfig {
-    /// Repository name
-    pub name: String,
-
-    /// Path to repository root
-    pub path: PathBuf,
-
-    /// Patterns to exclude from indexing
-    pub exclude_patterns: Vec<String>,
-
-    /// Patterns to include (if empty, include all)
-    pub include_patterns: Vec<String>,
-
-    /// Maximum file size to index (bytes)
-    pub max_file_size: u64,
-
-    /// Whether to follow symlinks
-    pub follow_symlinks: bool,
-}
-
-impl Default for RepoConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            path: PathBuf::new(),
-            exclude_patterns: vec![
-                "**/node_modules/**".to_string(),
-                "**/target/**".to_string(),
-                "**/.git/**".to_string(),
-                "**/vendor/**".to_string(),
-                "**/__pycache__/**".to_string(),
-                "**/dist/**".to_string(),
-                "**/build/**".to_string(),
-                "**/*.min.js".to_string(),
-                "**/*.min.css".to_string(),
-                "**/package-lock.json".to_string(),
-                "**/yarn.lock".to_string(),
-                "**/Cargo.lock".to_string(),
-            ],
-            include_patterns: vec![],
-            max_file_size: 1024 * 1024, // 1MB
-            follow_symlinks: false,
-        }
-    }
-}
+// Note: exclusion of vendored/generated content lives in
+// `security_rules::{VENDORED_DIRS, is_vendored_path, IndexFilter}` and is
+// configured via `EngineOptions::{index_exclude, index_max_file_size}`.
+// (An earlier `RepoConfig` struct duplicated those defaults but was never
+// wired into the engine; it was removed in favour of the shared module.)
 
 /// Discover repositories in a directory
 pub fn discover_repos(base_path: &Path, max_depth: usize) -> Result<Vec<PathBuf>> {
