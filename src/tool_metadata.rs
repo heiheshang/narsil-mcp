@@ -164,7 +164,7 @@ lazy_static! {
 
         map.insert("get_file", ToolMetadata {
             name: "get_file",
-            description: "Get the contents of a specific file with optional line range",
+            description: "Get the contents of a specific file with optional line range. Pass 'ref' (branch, tag, or commit) to read the file as of that revision instead of the current working tree; requires the repository to be indexed with --git.",
             category: ToolCategory::Repository,
             tags: ["file", "read", "content"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -176,7 +176,8 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path relative to repository root"},
                     "start_line": {"type": "integer", "description": "Start line (1-indexed, optional)"},
-                    "end_line": {"type": "integer", "description": "End line (inclusive, optional)"}
+                    "end_line": {"type": "integer", "description": "End line (inclusive, optional)"},
+                    "ref": {"type": "string", "description": "Branch, tag, or commit to read the file from instead of the current working tree (requires --git)"}
                 },
                 "required": ["repo", "path"]
             }),
