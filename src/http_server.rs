@@ -18,13 +18,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use uuid::Uuid;
-use std::path::PathBuf;
-use std::fs;
-use std::env;
 
 use crate::index::CodeIntelEngine;
 use crate::mcp::McpServer;
@@ -141,7 +141,11 @@ impl HttpServer {
 
         let sessions_dir = config_dir.join("narsil-mcp");
         if let Err(e) = fs::create_dir_all(&sessions_dir) {
-            warn!("Failed to create sessions directory {}: {}", sessions_dir.display(), e);
+            warn!(
+                "Failed to create sessions directory {}: {}",
+                sessions_dir.display(),
+                e
+            );
         }
 
         let sessions_file = sessions_dir.join(format!("sessions-{}.json", self.port));
@@ -152,12 +156,20 @@ impl HttpServer {
                 Ok(content) => match serde_json::from_str::<HashSet<String>>(&content) {
                     Ok(sessions) => sessions,
                     Err(e) => {
-                        warn!("Failed to parse sessions file {}: {}", sessions_file.display(), e);
+                        warn!(
+                            "Failed to parse sessions file {}: {}",
+                            sessions_file.display(),
+                            e
+                        );
                         HashSet::new()
                     }
                 },
                 Err(e) => {
-                    warn!("Failed to read sessions file {}: {}", sessions_file.display(), e);
+                    warn!(
+                        "Failed to read sessions file {}: {}",
+                        sessions_file.display(),
+                        e
+                    );
                     HashSet::new()
                 }
             }
@@ -578,7 +590,11 @@ fn save_sessions(state: &AppState) {
     match serde_json::to_string(&*sessions) {
         Ok(json) => {
             if let Err(e) = fs::write(&state.sessions_file, json) {
-                error!("Failed to save sessions to {}: {}", state.sessions_file.display(), e);
+                error!(
+                    "Failed to save sessions to {}: {}",
+                    state.sessions_file.display(),
+                    e
+                );
             }
         }
         Err(e) => {
