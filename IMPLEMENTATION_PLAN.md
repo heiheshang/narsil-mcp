@@ -20,58 +20,58 @@ dropped, so a tool "succeeds" with an empty filter instead of erroring.
 
 ---
 
-## Sprint 1 — Point Fixes (closes all 5 observed symptoms) [OPEN]
+## Sprint 1 — Point Fixes (closes all 5 observed symptoms) [DONE 2026-08-21]
 
 ### 1.1 `search_code`: path filtering
 
-- [ ] Accept `path` as alias for `file_pattern` in handler (`src/tool_handlers/search.rs:21`):
+- [x] Accept `path` as alias for `file_pattern` in handler (`src/tool_handlers/search.rs:21`):
       `args.get_str("file_pattern").or_else(|| args.get_str("path"))`
-- [ ] Normalize a wildcard-free pattern with no `/` into `**/<pattern>` (`src/index.rs:1646`) —
+- [x] Normalize a wildcard-free pattern with no `/` into `**/<pattern>` (`src/index.rs:1646`) —
       today a bare `plan-review.md` is a literal repo-root-relative match and matches nothing
-- [ ] Return an error on invalid glob instead of swallowing via `.ok()` (`src/index.rs:1646`;
+- [x] Return an error on invalid glob instead of swallowing via `.ok()` (`src/index.rs:1646`;
       same defect in `find_symbols` at `src/index.rs:1472`)
-- [ ] Schema: add `path` property (documented as alias) and glob examples
+- [x] Schema: add `path` property (documented as alias) and glob examples
       (`'**/plan-review.md'`, `'src/**/*.rs'`) to `file_pattern` description (`src/tool_metadata.rs:494`)
-- [ ] Tests: alias works; bare-filename normalization; invalid glob errors
+- [x] Tests: alias works; bare-filename normalization; invalid glob errors
 
 ### 1.2 `get_excerpt`: line-range mode
 
-- [ ] Accept `start_line`/`end_line` (and single `line`) as aliases building the anchor list;
+- [x] Accept `start_line`/`end_line` (and single `line`) as aliases building the anchor list;
       accept `file` as alias for `path` (`src/tool_handlers/repo.rs:67-86`)
-- [ ] When an explicit range is given: default `expand_to_scope=false` and
+- [x] When an explicit range is given: default `expand_to_scope=false` and
       `max_lines >= end - start + 1` (otherwise clamping at `src/extract.rs:255-277` silently trims)
-- [ ] Error instead of empty success when no anchor can be derived
+- [x] Error instead of empty success when no anchor can be derived
       (currently `unwrap_or_default()` at `src/tool_handlers/repo.rs:67`)
-- [ ] Fix out-of-range anchor panic: `expand_to_scope` indexes `lines[i]` out of bounds when
+- [x] Fix out-of-range anchor panic: `expand_to_scope` indexes `lines[i]` out of bounds when
       `line > file length` (`src/extract.rs:157-159`); also guard `start > end` slice (`src/extract.rs:98`)
-- [ ] Tests: range on a .md file returns exact lines; out-of-range anchor errors, doesn't panic
+- [x] Tests: range on a .md file returns exact lines; out-of-range anchor errors, doesn't panic
 
 ### 1.3 `find_symbols`: exact match, cap, ranking
 
-- [ ] Accept `query`/`name` as aliases for `pattern` (`src/tool_handlers/symbols.rs:21`)
-- [ ] Add `limit` param (default ~200) with hard cap and visible truncation marker
+- [x] Accept `query`/`name` as aliases for `pattern` (`src/tool_handlers/symbols.rs:21`)
+- [x] Add `limit` param (default ~200) with hard cap and visible truncation marker
       "showing 200 of N" (`src/index.rs:1505-1530`; WASM twin already does `.take(100)` at `src/wasm.rs:200`)
-- [ ] Rank exact name match first, then case-insensitive exact, then by name length,
+- [x] Rank exact name match first, then case-insensitive exact, then by name length,
       before applying the cap
-- [ ] Reject empty `pattern` and unknown `symbol_type` with an error instead of silently
+- [x] Reject empty `pattern` and unknown `symbol_type` with an error instead of silently
       widening to everything (`src/index.rs:1460-1470, 1489`)
-- [ ] Fix schema description: says "Glob or regex pattern" but code does case-insensitive
+- [x] Fix schema description: says "Glob or regex pattern" but code does case-insensitive
       substring (`src/tool_metadata.rs:342`) — `*Foo*` currently returns 0 hits
-- [ ] Bump/namespace the query-cache key so previously cached full dumps don't replay
+- [x] Bump/namespace the query-cache key so previously cached full dumps don't replay
       (`src/index.rs:1533-1537`)
-- [ ] Tests: exact PHP class name returns that class first; output capped; empty pattern errors
+- [x] Tests: exact PHP class name returns that class first; output capped; empty pattern errors
 
 ### 1.4 Mojibake literals (get_file gutter et al.)
 
 Literal replacement only — no logic change:
 
-- [ ] `src/index.rs:1825` (get_file gutter), `:1602`, `:1598` — `â”‚`→`│`, `â†’`→`→`
-- [ ] `src/index.rs:3588-3648` — call-path arrows and status emoji (`â†’`, `â†“`, `âš ï¸`, `âš¡`, `âœ…`)
-- [ ] `src/extract.rs:299, 305` — excerpt/search snippet gutter
-- [ ] `src/symbols.rs:63-81` — 19 lines of symbol-kind emoji
-- [ ] CI guard: `git grep -nP '[\x{00e0}-\x{00ff}][\x{0080}-\x{00bf}\x{2000}-\x{20ff}]' -- 'src/*.rs'`
-      must return empty (add to CI / pre-commit)
-- [ ] Test: `get_file` output for a file with box-drawing chars contains `│` and no `â` bytes
+- [x] `src/index.rs:1825` (get_file gutter), `:1602`, `:1598` — `â”‚`→`│`, `â†’`→`→`
+- [x] `src/index.rs:3588-3648` — call-path arrows and status emoji (`â†’`, `â†“`, `âš ï¸`, `âš¡`, `âœ…`)
+- [x] `src/extract.rs:299, 305` — excerpt/search snippet gutter
+- [x] `src/symbols.rs:63-81` — 19 lines of symbol-kind emoji
+- [x] CI guard: `git grep -nP '[\x{00e0}-\x{00ff}][\x{0080}-\x{00bf}\x{2000}-\x{20ff}]' -- 'src/*.rs'`
+      must return empty (implemented as the `no_mojibake_literals_in_source` test in tests/tool_ux_tests.rs)
+- [x] Test: `get_file` output for a file with box-drawing chars contains `│` and no `â` bytes
 
 ---
 
@@ -130,4 +130,4 @@ Prevents the whole silent-drop class across all ~90 tools.
 
 Sprint 1 (≈1 day, closes every observed symptom) → Sprint 2 (regression-proofing) → Sprint 3 → Sprint 4.
 
-**Last updated:** 2026-08-21 — initial plan from field-report root-cause analysis.
+**Last updated:** 2026-08-21 — Sprint 1 complete: aliases + explicit ranges + find_symbols cap/ranking + mojibake repair; 9 new tests in tests/tool_ux_tests.rs, full suite green (1201 passed).

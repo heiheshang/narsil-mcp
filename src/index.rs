@@ -615,7 +615,10 @@ impl CodeIntelEngine {
                         Ok(Some(json)) => {
                             if let Some(cg) = self.call_graphs.get(&repo_name) {
                                 if let Err(e) = cg.from_json(&json) {
-                                    warn!("Failed to load persisted call-graph for {}: {}", repo_name, e);
+                                    warn!(
+                                        "Failed to load persisted call-graph for {}: {}",
+                                        repo_name, e
+                                    );
                                 } else {
                                     info!("Loaded persisted call-graph for {}", repo_name);
                                 }
@@ -1418,6 +1421,25 @@ impl CodeIntelEngine {
         Ok(())
     }
 
+    /// Compile a user-supplied file glob. A bare filename (no separators, no
+    /// wildcards) is normalized to `**/<name>` so it matches at any depth,
+    /// and an invalid glob is a hard error instead of a silently-dropped filter.
+    fn compile_file_pattern(pattern: &str) -> Result<glob::Pattern> {
+        let has_wildcard = pattern.contains(['*', '?', '[']);
+        let normalized = if !pattern.contains('/') && !has_wildcard {
+            format!("**/{}", pattern)
+        } else {
+            pattern.to_string()
+        };
+        glob::Pattern::new(&normalized).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid file pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.rs')",
+                pattern,
+                e
+            )
+        })
+    }
+
     pub async fn find_symbols(
         &self,
         repo: &str,
@@ -1425,14 +1447,23 @@ impl CodeIntelEngine {
         pattern: Option<&str>,
         file_pattern: Option<&str>,
         exclude_tests: Option<bool>,
+        limit: Option<usize>,
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
+
+        if let Some(p) = pattern {
+            if p.trim().is_empty() {
+                anyhow::bail!("'pattern' must not be empty; omit it to list all symbols");
+            }
+        }
+
+        let limit = limit.unwrap_or(200).max(1);
 
         // Build cache key from query parameters
         let cache_key = {
             let options = SearchOptions {
                 file_pattern: file_pattern.map(String::from),
-                max_results: None,
+                max_results: Some(limit),
                 exclude_tests,
             };
             let query = format!(
@@ -1457,21 +1488,25 @@ impl CodeIntelEngine {
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
 
-        let type_filter: Option<SymbolKind> = symbol_type.and_then(|t| match t {
-            "struct" => Some(SymbolKind::Struct),
-            "class" => Some(SymbolKind::Class),
-            "enum" => Some(SymbolKind::Enum),
-            "interface" => Some(SymbolKind::Interface),
-            "function" => Some(SymbolKind::Function),
-            "method" => Some(SymbolKind::Method),
-            "trait" => Some(SymbolKind::Trait),
-            "type" => Some(SymbolKind::TypeAlias),
-            _ => None,
-        });
+        let type_filter: Option<SymbolKind> = match symbol_type {
+            None | Some("all") | Some("") => None,
+            Some("struct") => Some(SymbolKind::Struct),
+            Some("class") => Some(SymbolKind::Class),
+            Some("enum") => Some(SymbolKind::Enum),
+            Some("interface") => Some(SymbolKind::Interface),
+            Some("function") => Some(SymbolKind::Function),
+            Some("method") => Some(SymbolKind::Method),
+            Some("trait") => Some(SymbolKind::Trait),
+            Some("type") => Some(SymbolKind::TypeAlias),
+            Some(other) => anyhow::bail!(
+                "Unknown symbol_type '{}'. Expected one of: struct, class, enum, interface, function, method, trait, type, all",
+                other
+            ),
+        };
 
-        let glob_pattern = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
+        let glob_pattern = file_pattern.map(Self::compile_file_pattern).transpose()?;
 
-        let filtered: Vec<_> = symbols
+        let mut filtered: Vec<_> = symbols
             .iter()
             .filter(|s| {
                 // Test file filter
@@ -1500,12 +1535,40 @@ impl CodeIntelEngine {
             })
             .collect();
 
+        // Rank exact name matches first, then case-insensitive exact,
+        // then shorter (more specific) names — so an exact-name query
+        // surfaces its target even before the limit is applied.
+        if let Some(pat) = pattern {
+            let pat_lower = pat.to_lowercase();
+            filtered.sort_by(|a, b| {
+                let rank = |s: &Symbol| {
+                    (
+                        s.name != pat,
+                        s.name.to_lowercase() != pat_lower,
+                        s.name.len(),
+                    )
+                };
+                rank(a).cmp(&rank(b))
+            });
+        }
+
+        let total = filtered.len();
+        filtered.truncate(limit);
+
         // Collect dependent files for smart invalidation
         let dependent_files: Vec<String> = filtered.iter().map(|s| s.file_path.clone()).collect();
 
         let mut output = String::new();
         output.push_str(&format!("# Symbols in {}\n\n", repo));
-        output.push_str(&format!("Found {} symbols\n\n", filtered.len()));
+        if total > filtered.len() {
+            output.push_str(&format!(
+                "Found {} symbols (showing first {}; pass 'limit' to adjust, or narrow with 'pattern')\n\n",
+                total,
+                filtered.len()
+            ));
+        } else {
+            output.push_str(&format!("Found {} symbols\n\n", total));
+        }
 
         // Group by kind
         let mut by_kind: HashMap<SymbolKind, Vec<&Symbol>> = HashMap::new();
@@ -1595,11 +1658,11 @@ impl CodeIntelEngine {
         for (i, line) in lines[start..end].iter().enumerate() {
             let line_num = start + i + 1;
             let marker = if line_num >= symbol.start_line && line_num <= symbol.end_line {
-                "â†’"
+                "→"
             } else {
                 " "
             };
-            output.push_str(&format!("{} {:4} â”‚ {}\n", marker, line_num, line));
+            output.push_str(&format!("{} {:4} │ {}\n", marker, line_num, line));
         }
 
         output.push_str("```\n");
@@ -1643,7 +1706,7 @@ impl CodeIntelEngine {
             None => self.repos.iter().map(|r| r.key().clone()).collect(),
         };
 
-        let glob = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
+        let glob = file_pattern.map(Self::compile_file_pattern).transpose()?;
 
         for repo_name in repos_to_search {
             let repo_path = match self.get_repo_path(&repo_name) {
@@ -1822,7 +1885,7 @@ impl CodeIntelEngine {
         output.push('\n');
 
         for (i, line) in lines[start..end].iter().enumerate() {
-            output.push_str(&format!("{:4} â”‚ {}\n", start + i + 1, line));
+            output.push_str(&format!("{:4} │ {}\n", start + i + 1, line));
         }
 
         output.push_str("```\n");
@@ -3585,14 +3648,14 @@ impl CodeIntelEngine {
         })?;
 
         let mut output = String::new();
-        output.push_str(&format!("# Call Path: `{}` â†’ `{}`\n\n", from, to));
+        output.push_str(&format!("# Call Path: `{}` → `{}`\n\n", from, to));
 
         match call_graph.find_call_path(from, to) {
             Some(path) => {
                 output.push_str(&format!("Found path with {} steps:\n\n", path.len() - 1));
                 for (i, func) in path.iter().enumerate() {
                     if i > 0 {
-                        output.push_str("  â†“\n");
+                        output.push_str("  ↓\n");
                     }
                     output.push_str(&format!("{}. `{}`\n", i + 1, func));
                 }
@@ -3637,15 +3700,15 @@ impl CodeIntelEngine {
                 // Add health assessment
                 output.push_str("\n## Health Assessment\n\n");
                 if metrics.cyclomatic > 10 {
-                    output.push_str("âš ï¸ **High cyclomatic complexity** - Consider refactoring into smaller functions.\n");
+                    output.push_str("⚠️ **High cyclomatic complexity** - Consider refactoring into smaller functions.\n");
                 } else if metrics.cyclomatic > 5 {
-                    output.push_str("âš¡ **Moderate complexity** - Function is manageable but could be simplified.\n");
+                    output.push_str("⚡ **Moderate complexity** - Function is manageable but could be simplified.\n");
                 } else {
-                    output.push_str("âœ… **Low complexity** - Function is well-structured.\n");
+                    output.push_str("✅ **Low complexity** - Function is well-structured.\n");
                 }
 
                 if metrics.max_depth > 4 {
-                    output.push_str("âš ï¸ **Deep nesting** - Consider early returns or extracting nested logic.\n");
+                    output.push_str("⚠️ **Deep nesting** - Consider early returns or extracting nested logic.\n");
                 }
             }
             None => {

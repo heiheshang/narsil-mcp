@@ -186,7 +186,7 @@ lazy_static! {
 
         map.insert("get_excerpt", ToolMetadata {
             name: "get_excerpt",
-            description: "Extract code excerpts around specific lines with intelligent context expansion. Automatically expands to function/class boundaries when enabled.",
+            description: "Extract code excerpts around specific lines with intelligent context expansion. Accepts either 'lines' anchor points (with scope expansion) or an explicit 'start_line'/'end_line' range (returned verbatim).",
             category: ToolCategory::Repository,
             tags: ["excerpt", "context", "lines", "code"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -198,12 +198,15 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line numbers to extract around (1-indexed)"},
-                    "context_before": {"type": "integer", "description": "Lines of context before (default: 5)"},
-                    "context_after": {"type": "integer", "description": "Lines of context after (default: 5)"},
-                    "expand_to_scope": {"type": "boolean", "description": "Expand to function/class boundaries (default: true)"},
-                    "max_lines": {"type": "integer", "description": "Maximum lines per excerpt (default: 50)"}
+                    "line": {"type": "integer", "description": "Single anchor line (alternative to 'lines')"},
+                    "start_line": {"type": "integer", "description": "First line of an explicit range (1-indexed, alternative to 'lines'; disables context padding and scope expansion by default)"},
+                    "end_line": {"type": "integer", "description": "Last line of an explicit range (inclusive, requires 'start_line')"},
+                    "context_before": {"type": "integer", "description": "Lines of context before (default: 5, or 0 with an explicit range)"},
+                    "context_after": {"type": "integer", "description": "Lines of context after (default: 5, or 0 with an explicit range)"},
+                    "expand_to_scope": {"type": "boolean", "description": "Expand to function/class boundaries (default: true, or false with an explicit range)"},
+                    "max_lines": {"type": "integer", "description": "Maximum lines per excerpt (default: 50, or the range length with an explicit range)"}
                 },
-                "required": ["repo", "path", "lines"]
+                "required": ["repo", "path"]
             }),
             requires_api_key: false,
             aliases: vec!["excerpt", "code_excerpt"],
@@ -339,9 +342,11 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
-                    "pattern": {"type": "string", "description": "Glob or regex pattern to filter symbol names"},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py')"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
+                    "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex."},
+                    "query": {"type": "string", "description": "Alias for 'pattern'"},
+                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py'); a bare filename matches at any depth"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
+                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated"}
                 },
                 "required": ["repo"]
             }),
@@ -491,7 +496,8 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Search query - can be natural language or code pattern"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files"},
+                    "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md'; a bare filename matches at any depth"},
+                    "path": {"type": "string", "description": "Alias for 'file_pattern'"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
