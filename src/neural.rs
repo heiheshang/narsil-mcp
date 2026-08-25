@@ -86,24 +86,48 @@ impl Default for NeuralConfig {
 /// specify a model like `text-embedding-3-large` (3072-dim), the config
 /// automatically picks the right dimension without requiring `--neural-dimension`.
 ///
+/// Ollama-style tags (`bge-m3:567m`) are stripped before matching, so the name
+/// as passed to `--neural-model` resolves the same way it is written on the
+/// serving side. Matching stays case-sensitive.
+///
+/// A model that is not listed here falls back to 1536. That fallback is only a
+/// guess: if the endpoint returns a different width, every batch is rejected and
+/// semantic search silently degrades to TF-IDF, so an unlisted model should be
+/// given an explicit `--neural-dimension`.
+///
 /// # Examples
 ///
 /// ```
 /// use narsil_mcp::neural::default_dimension_for_model;
 /// assert_eq!(default_dimension_for_model(Some("text-embedding-3-large")), 3072);
 /// assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("bge-m3")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("bge-m3:567m")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("nomic-embed-text")), 768);
 /// assert_eq!(default_dimension_for_model(None), 1536);
 /// ```
 #[must_use]
 pub fn default_dimension_for_model(model: Option<&str>) -> usize {
-    match model {
+    // Ollama reports models as `name:tag`; the tag never changes the width.
+    let normalized = model.map(|m| m.split(':').next().unwrap_or(m).trim());
+
+    match normalized {
         Some("text-embedding-3-large") => 3072,
         Some("text-embedding-3-small") => 1536,
         Some("text-embedding-ada-002") => 1536,
-        Some(m) if m.starts_with("voyage-code-3") => 1024,
-        Some(m) if m.starts_with("voyage-code-2") => 1024,
-        Some(m) if m.starts_with("voyage-3") => 1024,
         Some(m) if m.starts_with("voyage-") => 1024,
+
+        // Locally served models, typically through Ollama or another
+        // OpenAI-compatible endpoint. bge-m3 in particular is 1024, not the
+        // 1536 fallback, and the mismatch is only visible as a single warning.
+        Some("bge-m3") => 1024,
+        Some(m) if m.starts_with("bge-large") => 1024,
+        Some(m) if m.starts_with("bge-base") => 768,
+        Some(m) if m.starts_with("bge-small") => 384,
+        Some(m) if m.starts_with("mxbai-embed-large") => 1024,
+        Some(m) if m.starts_with("nomic-embed-text") => 768,
+        Some(m) if m.starts_with("all-minilm") => 384,
+
         _ => 1536,
     }
 }
@@ -545,14 +569,25 @@ impl EmbeddingBackend for ApiEmbedder {
             )
         })?;
 
-        // Validate response embedding dimensions
+        // Validate response embedding dimensions.
+        //
+        // A mismatch here is a configuration error that never heals: every
+        // later batch fails the same way, and the only symptom upstream is a
+        // warning, after which semantic search quietly runs on TF-IDF. So say
+        // outright what to change.
         for (i, emb_data) in response.data.iter().enumerate() {
             if emb_data.embedding.len() != self.dimension {
                 bail!(
-                    "Embedding at index {} has dimension {}, expected {}",
-                    i,
+                    "Model '{}' returns {}-dimensional embeddings but narsil is configured for {}. \
+                     Every batch will be rejected and semantic search will fall back to TF-IDF. \
+                     Pass --neural-dimension {} (or NARSIL_NEURAL_DIMENSION={}) to fix this. \
+                     (first mismatch at index {})",
+                    self.model,
                     emb_data.embedding.len(),
-                    self.dimension
+                    self.dimension,
+                    emb_data.embedding.len(),
+                    emb_data.embedding.len(),
+                    i
                 );
             }
         }
@@ -1866,6 +1901,73 @@ mod tests {
             assert!(sent.starts_with("Процедура "), "prefix must be preserved");
         }
 
+        /// A width mismatch is a configuration error that never heals: every
+        /// later batch fails identically while semantic search quietly runs on
+        /// TF-IDF. The message has to carry the remedy, not just an index.
+        #[test]
+        fn dimension_mismatch_error_names_model_widths_and_the_flag() {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().unwrap().port();
+
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(&stream);
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().expect("content-length");
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).expect("body");
+
+                // Three values where the caller expects five.
+                let payload = br#"{"data":[{"embedding":[0.0,0.1,0.2]}]}"#;
+                let mut stream = &stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                stream.write_all(payload).unwrap();
+                stream.flush().unwrap();
+            });
+
+            let embedder = ApiEmbedder::custom(
+                &format!("http://127.0.0.1:{port}/v1/embeddings"),
+                "pretend-bge-m3",
+                None,
+                5,
+            );
+            let err = embedder
+                .embed_batch(&["anything".to_string()])
+                .expect_err("width mismatch must be an error");
+            let msg = err.to_string();
+
+            assert!(msg.contains("pretend-bge-m3"), "must name the model: {msg}");
+            assert!(
+                msg.contains('3') && msg.contains('5'),
+                "must give both widths: {msg}"
+            );
+            assert!(
+                msg.contains("--neural-dimension 3"),
+                "must state the flag and the value to use: {msg}"
+            );
+            assert!(
+                msg.contains("TF-IDF"),
+                "must say what silently happens instead: {msg}"
+            );
+        }
+
         /// The truncation counter feeds the only diagnostic this clamp has.
         /// Counting clamped texts whose length equals the cap reported zero on
         /// Cyrillic input, where the boundary pulls the cut a byte short.
@@ -1986,6 +2088,37 @@ mod tests {
 
         // Non-matching prefixes
         assert_eq!(default_dimension_for_model(Some("my-voyage-model")), 1536);
+    }
+
+    /// bge-m3 is 1024-dimensional. Resolving it to the 1536 fallback made every
+    /// embedding batch fail with a single warning while semantic search quietly
+    /// ran on TF-IDF instead.
+    #[test]
+    fn locally_served_models_resolve_to_their_native_dimension() {
+        assert_eq!(default_dimension_for_model(Some("bge-m3")), 1024);
+        assert_eq!(default_dimension_for_model(Some("bge-large-en-v1.5")), 1024);
+        assert_eq!(default_dimension_for_model(Some("bge-base-en-v1.5")), 768);
+        assert_eq!(default_dimension_for_model(Some("bge-small-en-v1.5")), 384);
+        assert_eq!(default_dimension_for_model(Some("mxbai-embed-large")), 1024);
+        assert_eq!(default_dimension_for_model(Some("nomic-embed-text")), 768);
+        assert_eq!(default_dimension_for_model(Some("all-minilm")), 384);
+    }
+
+    /// Ollama names models `name:tag`; the tag does not change the width.
+    #[test]
+    fn ollama_model_tags_are_ignored_when_resolving_dimension() {
+        assert_eq!(default_dimension_for_model(Some("bge-m3:latest")), 1024);
+        assert_eq!(default_dimension_for_model(Some("bge-m3:567m")), 1024);
+        assert_eq!(
+            default_dimension_for_model(Some("nomic-embed-text:v1.5")),
+            768
+        );
+        assert_eq!(
+            default_dimension_for_model(Some("text-embedding-3-large:latest")),
+            3072
+        );
+        // An unknown model still falls back, tag or not.
+        assert_eq!(default_dimension_for_model(Some("mystery-model:7b")), 1536);
     }
 
     #[test]

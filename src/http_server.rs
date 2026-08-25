@@ -76,12 +76,21 @@ pub struct AppState {
 }
 
 /// Request body for tool calls
+///
+/// Accepts the MCP wire shape (`name`/`arguments`) as aliases for
+/// `tool`/`args`. Before that, `{"name": ..., "arguments": {...}}` was
+/// accepted but its arguments were silently dropped, so the call failed with
+/// "missing required parameter X" for a parameter the caller had passed.
+/// `deny_unknown_fields` makes any other envelope key a loud error rather
+/// than a silently empty argument set.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCallRequest {
     /// The tool name to execute
+    #[serde(alias = "name")]
     tool: String,
     /// Arguments as JSON object
-    #[serde(default)]
+    #[serde(default, alias = "arguments")]
     args: Value,
 }
 
@@ -635,6 +644,63 @@ mod tests {
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"test\":\"value\""));
         assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn tool_call_request_accepts_canonical_envelope() {
+        let req: ToolCallRequest =
+            serde_json::from_str(r#"{"tool":"find_symbols","args":{"repo":"R","pattern":"P"}}"#)
+                .expect("canonical envelope must parse");
+        assert_eq!(req.tool, "find_symbols");
+        assert_eq!(req.args["repo"], json!("R"));
+        assert_eq!(req.args["pattern"], json!("P"));
+    }
+
+    /// The MCP wire shape used to parse but lose its arguments, so the call
+    /// failed with "missing required parameter" for a parameter that was sent.
+    #[test]
+    fn tool_call_request_accepts_mcp_envelope() {
+        let req: ToolCallRequest = serde_json::from_str(
+            r#"{"name":"find_symbols","arguments":{"repo":"R","pattern":"P"}}"#,
+        )
+        .expect("MCP-shaped envelope must parse");
+        assert_eq!(req.tool, "find_symbols");
+        assert_eq!(req.args["repo"], json!("R"));
+        assert_eq!(req.args["pattern"], json!("P"));
+    }
+
+    #[test]
+    fn tool_call_request_allows_mixed_aliases_and_omitted_args() {
+        let req: ToolCallRequest =
+            serde_json::from_str(r#"{"tool":"list_repos","arguments":{"a":1}}"#)
+                .expect("aliases must be interchangeable");
+        assert_eq!(req.args["a"], json!(1));
+
+        let req: ToolCallRequest =
+            serde_json::from_str(r#"{"tool":"list_repos"}"#).expect("args must be optional");
+        assert!(req.args.is_null());
+    }
+
+    /// A mistyped argument key must fail loudly instead of dispatching with an
+    /// empty argument set, which reads as "the tool ignored my parameters".
+    #[test]
+    fn tool_call_request_rejects_unknown_envelope_keys() {
+        let err = serde_json::from_str::<ToolCallRequest>(
+            r#"{"tool":"find_symbols","arg":{"repo":"R"}}"#,
+        )
+        .expect_err("unknown envelope key must be rejected");
+        assert!(
+            err.to_string().contains("arg"),
+            "error should name the offending key, got: {err}"
+        );
+
+        assert!(
+            serde_json::from_str::<ToolCallRequest>(
+                r#"{"tool":"find_symbols","params":{"repo":"R"}}"#
+            )
+            .is_err(),
+            "'params' is not an accepted alias"
+        );
     }
 
     #[test]

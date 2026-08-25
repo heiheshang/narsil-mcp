@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `POST /tools/call` accepts `name`/`arguments` as aliases for `tool`/`args`,
+  and rejects any other top-level key. The MCP wire shape previously parsed but
+  lost its arguments, so a fully-specified call failed with
+  `missing required parameter <X>` for a parameter the caller had passed.
+- `--neural-dimension` is auto-detected for locally served embedding models
+  (`bge-m3` 1024, `bge-large`/`mxbai-embed-large` 1024, `bge-base`/
+  `nomic-embed-text` 768, `bge-small`/`all-minilm` 384), and Ollama-style
+  `name:tag` model names resolve the same as untagged ones. `bge-m3` previously
+  fell back to 1536, which made the endpoint reject every embedding batch while
+  semantic search silently degraded to TF-IDF.
+- A dimension mismatch now reports the model, both dimensions and the exact
+  flag to set, instead of only the index of the first offending embedding.
+
 ## [1.8.0] - 2026-08-19
 
 ### Fixed
