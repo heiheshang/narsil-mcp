@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-25
+
+### Added
+
+- `get_file` takes a `ref` parameter and reads a file at an arbitrary git
+  ref or commit, instead of only the currently indexed working tree.
+
 ### Fixed
 
 - `POST /tools/call` accepts `name`/`arguments` as aliases for `tool`/`args`,
@@ -21,6 +28,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semantic search silently degraded to TF-IDF.
 - A dimension mismatch now reports the model, both dimensions and the exact
   flag to set, instead of only the index of the first offending embedding.
+
+## [1.8.1] - 2026-08-21
+
+Field-report fixes: five reported defects, three of which shared one cause —
+`ToolRegistry::dispatch` never validated arguments against `input_schema`, so
+an unknown key was dropped and the tool "succeeded" with an empty filter.
+See `IMPLEMENTATION_PLAN.md` for the root-cause analysis.
+
+### Added
+
+- Incremental call-graph updates in watch mode, so newly added untracked files
+  no longer produce false negatives from `get_callers`.
+
+### Fixed
+
+- Unknown tool arguments are rejected instead of silently dropped, and
+  `required` fields from the schema are enforced. `NARSIL_ARG_VALIDATION=
+  strict|warn|off` is the escape hatch.
+- `search_code` accepts `path` as an alias for `file_pattern`, normalises a
+  bare filename to `**/<name>`, and errors on an invalid glob.
+- `get_excerpt` accepts `start_line`/`end_line`/`line` and `file`, and no
+  longer panics on an out-of-range anchor.
+- `find_symbols` accepts `query`/`name`, ranks exact matches first, and caps
+  output with a visible truncation marker instead of returning megabytes.
+- Vendored and generated content (`vendor/`, `node_modules/`, `target/`,
+  minified assets, lockfiles) is excluded from indexing by default, with
+  `exclude` globs and `max_file_size` to override.
+- Double-encoded UTF-8 literals repaired across `index.rs`, `extract.rs` and
+  `symbols.rs`; a test guards against reintroducing them.
+- MCP sessions persist to disk, so a reconnect no longer loses session state.
 
 ## [1.8.0] - 2026-08-19
 
