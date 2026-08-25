@@ -255,8 +255,10 @@ fn read_existing(
         let mut key = [0u8; KEY_LEN];
         key.copy_from_slice(&record[..KEY_LEN]);
         let mut vector = Vec::with_capacity(dimension);
-        for chunk in record[KEY_LEN..].chunks_exact(4) {
-            vector.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        // `.0` — только целые четвёрки, хвост отбрасывается ровно как у
+        // chunks_exact(4), который здесь был раньше.
+        for chunk in record[KEY_LEN..].as_chunks::<4>().0 {
+            vector.push(f32::from_le_bytes(*chunk));
         }
         entries.insert(key, vector);
         offset += record_len as u64;

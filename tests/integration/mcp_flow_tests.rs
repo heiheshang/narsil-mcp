@@ -181,7 +181,7 @@ fn test_mcp_flow_no_client_info() {
 #[test]
 fn test_all_tools_have_metadata() {
     // This verifies that every tool we might return has metadata
-    for (tool_name, _) in TOOL_METADATA.iter() {
+    for tool_name in TOOL_METADATA.keys() {
         assert!(!tool_name.is_empty(), "Tool name should not be empty");
     }
 
