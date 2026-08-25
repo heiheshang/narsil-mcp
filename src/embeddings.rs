@@ -67,7 +67,7 @@ impl TfIdfEmbedding {
             .iter()
             .map(|(term, &df)| (term.clone(), df))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         // Vocabulary = top `max_vocab_size` terms.
         self.vocabulary.clear();
