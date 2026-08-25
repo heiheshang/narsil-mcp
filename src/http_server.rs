@@ -34,12 +34,12 @@ use crate::tool_metadata::TOOL_METADATA;
 /// Maximum HTTP request body size (2 MB).
 const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
 
-// Embedded frontend assets (only when frontend feature is enabled)
+// Embedded frontend assets (only when frontend feature is enabled).
+// `header` и `Response` уже приходят из безусловного блока выше; повторный
+// импорт `axum::http::{header, Response}` конфликтовал с ним, из-за чего фича
+// frontend не собиралась вовсе.
 #[cfg(feature = "frontend")]
-use axum::{
-    body::Body,
-    http::{header, Response},
-};
+use axum::body::Body;
 
 #[cfg(feature = "frontend")]
 use rust_embed::Embed;
