@@ -57,6 +57,19 @@ When `--http` is enabled:
 | `POST /tools/call` | Execute any MCP tool |
 | `GET /graph?repo=...&view=call&depth=3` | Get graph visualization data |
 
+### Tool Call Body
+
+```json
+POST /tools/call
+{ "tool": "find_symbols", "args": { "repo": "myrepo", "pattern": "parse" } }
+```
+
+`name` and `arguments` are accepted as aliases for `tool` and `args`, so the
+MCP wire shape works unchanged. Any other top-level key is rejected with a
+`422`: previously an unrecognised envelope key was dropped, and the tool ran
+with no arguments at all, reporting `missing required parameter` for a
+parameter that had in fact been sent.
+
 ### Graph Endpoint Parameters
 
 ```

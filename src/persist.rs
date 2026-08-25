@@ -281,6 +281,37 @@ impl IndexStore {
 
         Ok(repos)
     }
+
+    /// Path to call-graph JSON file for a repository
+    fn call_graph_path(&self, repo_root: &Path) -> PathBuf {
+        let hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(repo_root.to_string_lossy().as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        self.index_dir
+            .join(format!("{}.callgraph.json", &hash[..16]))
+    }
+
+    /// Save call-graph to disk
+    pub fn save_call_graph(&self, repo_root: &Path, call_graph_json: &str) -> Result<()> {
+        let path = self.call_graph_path(repo_root);
+        std::fs::write(&path, call_graph_json)?;
+        debug!("Saved call-graph to {:?}", path);
+        Ok(())
+    }
+
+    /// Load call-graph from disk
+    pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<String>> {
+        let path = self.call_graph_path(repo_root);
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            debug!("Loaded call-graph from {:?}", path);
+            Ok(Some(content))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// File watcher for incremental updates (legacy, sync-based polling)

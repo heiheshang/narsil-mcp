@@ -5,6 +5,28 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Repository tag for documents indexed outside a repository walk
+/// (WASM, transient per-query indexes) and for older persisted documents.
+fn unknown_repo() -> Arc<str> {
+    Arc::from("")
+}
+
+/// Key that identifies a document uniquely across repositories.
+///
+/// Document ids are repository-relative (`src/lib.rs::main`), so two indexed
+/// repositories collide on them — in a map-backed store the second insert wins
+/// and the first document is simply lost. Stores that key documents by id use
+/// this instead; the document keeps its unprefixed `id` for display and for
+/// content lookups.
+pub fn scoped_doc_id(repo: &str, id: &str) -> String {
+    if repo.is_empty() {
+        id.to_string()
+    } else {
+        format!("{}\u{1f}{}", repo, id)
+    }
+}
 
 /// Validate regex pattern to prevent ReDoS attacks
 fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
@@ -28,6 +50,12 @@ fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchDocument {
     pub id: String,
+    /// Name of the repository this document belongs to. Interned as `Arc<str>`
+    /// so a corpus of millions of documents pays 16 bytes each, not a String
+    /// allocation each. Empty when the document was indexed outside a
+    /// repository walk (WASM, transient per-query indexes).
+    #[serde(default = "unknown_repo")]
+    pub repo: Arc<str>,
     pub file_path: String,
     /// Raw text. The PERSISTENT index stores this empty (it duplicated
     /// `file_cache` and cost ~2.4 GB on the 1C corpus) — snippets are
@@ -127,8 +155,8 @@ impl SearchIndex {
             .iter()
             .map(|d| {
                 d.term_freq
-                    .iter()
-                    .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+                    .keys()
+                    .map(|k| k.len() + std::mem::size_of::<usize>())
                     .sum::<usize>()
             })
             .sum();
@@ -139,8 +167,8 @@ impl SearchIndex {
             .sum();
         let doc_freq_bytes: usize = self
             .doc_freq
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
         (
             self.documents.len(),
@@ -227,12 +255,13 @@ impl SearchIndex {
     }
 
     /// Index content from a file
-    pub fn index_file(&mut self, file_path: &str, content: &str) {
+    pub fn index_file(&mut self, repo: Arc<str>, file_path: &str, content: &str) {
         let tokens = tokenize_code(content);
         let term_freq = count_terms(&tokens);
 
         self.add_document(SearchDocument {
             id: file_path.to_string(),
+            repo,
             file_path: file_path.to_string(),
             // Persistent index: keep raw text empty (regenerated on demand).
             content: String::new(),
@@ -244,8 +273,10 @@ impl SearchIndex {
     }
 
     /// Index a symbol (function, class, etc.)
+    #[allow(clippy::too_many_arguments)]
     pub fn index_symbol(
         &mut self,
+        repo: Arc<str>,
         file_path: &str,
         name: &str,
         content: &str,
@@ -258,6 +289,7 @@ impl SearchIndex {
 
         self.add_document(SearchDocument {
             id: format!("{}::{}", file_path, name),
+            repo,
             file_path: file_path.to_string(),
             // Persistent index: keep raw text empty (regenerated on demand).
             content: String::new(),
@@ -268,8 +300,20 @@ impl SearchIndex {
         });
     }
 
-    /// Search the index with BM25 ranking
+    /// Search the index with BM25 ranking across every indexed repository.
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
+        self.search_in(query, max_results, None)
+    }
+
+    /// Search the index with BM25 ranking, optionally restricted to one
+    /// repository. Filtering happens before ranking, so `max_results` is
+    /// honoured within the repository instead of being spent on other repos.
+    pub fn search_in(
+        &self,
+        query: &str,
+        max_results: usize,
+        repo: Option<&str>,
+    ) -> Vec<SearchResult> {
         // Validate query pattern to prevent ReDoS attacks
         if let Err(e) = validate_regex_pattern(query) {
             eprintln!("Invalid search pattern: {}", e);
@@ -289,6 +333,11 @@ impl SearchIndex {
 
                 for &doc_idx in doc_indices {
                     let doc = &self.documents[doc_idx];
+                    if let Some(repo) = repo {
+                        if &*doc.repo != repo {
+                            continue;
+                        }
+                    }
                     let tf = doc.term_freq.get(token).copied().unwrap_or(0) as f64;
                     let doc_len = doc.term_freq.values().sum::<usize>() as f64;
 
@@ -594,12 +643,14 @@ impl ConcurrentSearchIndex {
         self.inner.write().add_document(doc);
     }
 
-    pub fn index_file(&self, file_path: &str, content: &str) {
-        self.inner.write().index_file(file_path, content);
+    pub fn index_file(&self, repo: Arc<str>, file_path: &str, content: &str) {
+        self.inner.write().index_file(repo, file_path, content);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn index_symbol(
         &self,
+        repo: Arc<str>,
         file_path: &str,
         name: &str,
         content: &str,
@@ -607,13 +658,23 @@ impl ConcurrentSearchIndex {
         start_line: usize,
         end_line: usize,
     ) {
-        self.inner
-            .write()
-            .index_symbol(file_path, name, content, doc_type, start_line, end_line);
+        self.inner.write().index_symbol(
+            repo, file_path, name, content, doc_type, start_line, end_line,
+        );
     }
 
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
         self.inner.read().search(query, max_results)
+    }
+
+    /// BM25 search restricted to a single repository when `repo` is set.
+    pub fn search_in(
+        &self,
+        query: &str,
+        max_results: usize,
+        repo: Option<&str>,
+    ) -> Vec<SearchResult> {
+        self.inner.read().search_in(query, max_results, repo)
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -651,6 +712,7 @@ mod tests {
         let mut index = SearchIndex::new();
 
         index.index_file(
+            Arc::from("demo"),
             "user.rs",
             r#"
             pub fn get_user_by_id(id: u32) -> User {
@@ -660,6 +722,7 @@ mod tests {
         );
 
         index.index_file(
+            Arc::from("demo"),
             "order.rs",
             r#"
             pub fn create_order(user: &User) -> Order {
@@ -674,10 +737,69 @@ mod tests {
     }
 
     #[test]
+    fn test_scoped_doc_id_separates_repos() {
+        assert_ne!(
+            scoped_doc_id("alpha", "src/lib.rs::main"),
+            scoped_doc_id("beta", "src/lib.rs::main")
+        );
+        // Untagged documents keep their bare id.
+        assert_eq!(scoped_doc_id("", "src/lib.rs::main"), "src/lib.rs::main");
+    }
+
+    #[test]
+    fn test_search_in_restricts_to_repo() {
+        let mut index = SearchIndex::new();
+
+        index.index_file(Arc::from("alpha"), "user.rs", "pub fn get_user() {}");
+        index.index_file(Arc::from("beta"), "user.rs", "pub fn get_user() {}");
+
+        let all = index.search("user", 10);
+        assert_eq!(all.len(), 2);
+
+        let alpha = index.search_in("user", 10, Some("alpha"));
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(&*alpha[0].document.repo, "alpha");
+
+        let beta = index.search_in("user", 10, Some("beta"));
+        assert_eq!(beta.len(), 1);
+        assert_eq!(&*beta[0].document.repo, "beta");
+
+        assert!(index.search_in("user", 10, Some("gamma")).is_empty());
+    }
+
+    /// `max_results` must be spent inside the requested repository, not on
+    /// hits from other repositories that are then filtered away.
+    #[test]
+    fn test_search_in_budget_is_not_eaten_by_other_repos() {
+        let mut index = SearchIndex::new();
+
+        for i in 0..20 {
+            index.index_file(
+                Arc::from("noise"),
+                &format!("noise_{i}.rs"),
+                "pub fn handle_user_login() {}",
+            );
+        }
+        index.index_file(Arc::from("target"), "auth.rs", "pub fn user_login() {}");
+
+        let results = index.search_in("user login", 3, Some("target"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document.file_path, "auth.rs");
+    }
+
+    #[test]
     fn test_persistent_index_stores_empty_content() {
         let mut index = SearchIndex::new();
-        index.index_symbol("f.rs", "foo", "fn foo() { bar(); }", DocType::Function, 1, 1);
-        index.index_file("g.rs", "fn bar() {}");
+        index.index_symbol(
+            Arc::from("demo"),
+            "f.rs",
+            "foo",
+            "fn foo() { bar(); }",
+            DocType::Function,
+            1,
+            1,
+        );
+        index.index_file(Arc::from("demo"), "g.rs", "fn bar() {}");
 
         // The persistent index must NOT retain raw text (cost ~2.4 GB on the
         // 1C corpus) — it is regenerated from disk/file_cache at query time.
@@ -787,8 +909,8 @@ mod tests {
     fn test_sort_handles_nan_scores() {
         let mut index = SearchIndex::new();
 
-        index.index_file("a.rs", "fn hello() { }");
-        index.index_file("b.rs", "fn world() { }");
+        index.index_file(Arc::from("demo"), "a.rs", "fn hello() { }");
+        index.index_file(Arc::from("demo"), "b.rs", "fn world() { }");
 
         // Search should not panic even if scores could theoretically be NaN
         let results = index.search("hello", 10);

@@ -164,7 +164,7 @@ lazy_static! {
 
         map.insert("get_file", ToolMetadata {
             name: "get_file",
-            description: "Get the contents of a specific file with optional line range",
+            description: "Get the contents of a specific file with optional line range. Pass 'ref' (branch, tag, or commit) to read the file as of that revision instead of the current working tree; requires the repository to be indexed with --git.",
             category: ToolCategory::Repository,
             tags: ["file", "read", "content"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -176,7 +176,8 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path relative to repository root"},
                     "start_line": {"type": "integer", "description": "Start line (1-indexed, optional)"},
-                    "end_line": {"type": "integer", "description": "End line (inclusive, optional)"}
+                    "end_line": {"type": "integer", "description": "End line (inclusive, optional)"},
+                    "ref": {"type": "string", "description": "Branch, tag, or commit to read the file from instead of the current working tree (requires --git)"}
                 },
                 "required": ["repo", "path"]
             }),
@@ -186,7 +187,7 @@ lazy_static! {
 
         map.insert("get_excerpt", ToolMetadata {
             name: "get_excerpt",
-            description: "Extract code excerpts around specific lines with intelligent context expansion. Automatically expands to function/class boundaries when enabled.",
+            description: "Extract code excerpts around specific lines with intelligent context expansion. Accepts either 'lines' anchor points (with scope expansion) or an explicit 'start_line'/'end_line' range (returned verbatim).",
             category: ToolCategory::Repository,
             tags: ["excerpt", "context", "lines", "code"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -197,13 +198,17 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
+                    "file": {"type": "string", "description": "Alias for 'path'"},
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line numbers to extract around (1-indexed)"},
-                    "context_before": {"type": "integer", "description": "Lines of context before (default: 5)"},
-                    "context_after": {"type": "integer", "description": "Lines of context after (default: 5)"},
-                    "expand_to_scope": {"type": "boolean", "description": "Expand to function/class boundaries (default: true)"},
-                    "max_lines": {"type": "integer", "description": "Maximum lines per excerpt (default: 50)"}
+                    "line": {"type": "integer", "description": "Single anchor line (alternative to 'lines')"},
+                    "start_line": {"type": "integer", "description": "First line of an explicit range (1-indexed, alternative to 'lines'; disables context padding and scope expansion by default)"},
+                    "end_line": {"type": "integer", "description": "Last line of an explicit range (inclusive, requires 'start_line')"},
+                    "context_before": {"type": "integer", "description": "Lines of context before (default: 5, or 0 with an explicit range)"},
+                    "context_after": {"type": "integer", "description": "Lines of context after (default: 5, or 0 with an explicit range)"},
+                    "expand_to_scope": {"type": "boolean", "description": "Expand to function/class boundaries (default: true, or false with an explicit range)"},
+                    "max_lines": {"type": "integer", "description": "Maximum lines per excerpt (default: 50, or the range length with an explicit range)"}
                 },
-                "required": ["repo", "path", "lines"]
+                "required": ["repo", "path"]
             }),
             requires_api_key: false,
             aliases: vec!["excerpt", "code_excerpt"],
@@ -339,9 +344,13 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
-                    "pattern": {"type": "string", "description": "Glob or regex pattern to filter symbol names"},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py')"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
+                    "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex."},
+                    "query": {"type": "string", "description": "Alias for 'pattern'"},
+                    "name": {"type": "string", "description": "Alias for 'pattern'"},
+                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py'); a bare filename matches at any depth"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
+                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
                 },
                 "required": ["repo"]
             }),
@@ -491,8 +500,10 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Search query - can be natural language or code pattern"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files"},
+                    "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md'; a bare filename matches at any depth"},
+                    "path": {"type": "string", "description": "Alias for 'file_pattern'"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -503,7 +514,7 @@ lazy_static! {
 
         map.insert("semantic_search", ToolMetadata {
             name: "semantic_search",
-            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries.",
+            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries. Pass `repo` to search inside a single repository.",
             category: ToolCategory::Search,
             tags: ["search", "semantic", "bm25", "ranking"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -513,7 +524,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
+                    "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
                     "doc_type": {"type": "string", "enum": ["file", "function", "class", "struct", "method"], "description": "Filter by document type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
@@ -549,7 +560,7 @@ lazy_static! {
 
         map.insert("neural_search", ToolMetadata {
             name: "neural_search",
-            description: "Search code using neural semantic embeddings. Finds semantically similar code even with different variable names. Requires --neural flag and EMBEDDING_API_KEY.",
+            description: "Search code using neural semantic embeddings. Finds semantically similar code even with different variable names. Pass `repo` to search inside a single repository. Requires --neural flag and EMBEDDING_API_KEY.",
             category: ToolCategory::Search,
             tags: ["search", "neural", "embeddings", "semantic", "ai"].iter().copied().collect(),
             stability: StabilityLevel::Beta,
@@ -559,7 +570,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language or code query"},
-                    "repo": {"type": "string", "description": "Optional: limit to specific repository"},
+                    "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
                 },
                 "required": ["query"]
@@ -593,7 +604,7 @@ lazy_static! {
 
         map.insert("find_similar_code", ToolMetadata {
             name: "find_similar_code",
-            description: "Find code similar to a given snippet using TF-IDF embeddings. Good for finding duplicate or related code patterns.",
+            description: "Find code similar to a given snippet using TF-IDF embeddings. Good for finding duplicate or related code patterns. Pass `repo` to search inside a single repository.",
             category: ToolCategory::Search,
             tags: ["similar", "duplicate", "clone", "tfidf"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -748,7 +759,7 @@ lazy_static! {
 
         map.insert("get_callers", ToolMetadata {
             name: "get_callers",
-            description: "Find functions that call a given function. Requires --call-graph flag.",
+            description: "Find functions that call a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Each result says what it was matched on — an unmarked entry is exact, `name match only` is one namesake out of several, `not in graph` is a third-party or stdlib call. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callers", "callgraph", "references", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -771,7 +782,7 @@ lazy_static! {
 
         map.insert("get_callees", ToolMetadata {
             name: "get_callees",
-            description: "Find functions called by a given function. Requires --call-graph flag.",
+            description: "Find functions called by a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Each result says what it was matched on — an unmarked entry is exact, `name match only` is one namesake out of several, `not in graph` is a third-party or stdlib call. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callees", "callgraph", "dependencies", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -1727,7 +1738,15 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "view": {"type": "string", "enum": ["call", "import", "symbol", "hybrid", "control_flow"]},
-                    "depth": {"type": "integer", "description": "Maximum depth (default: 3)"}
+                    "depth": {"type": "integer", "description": "Maximum depth (default: 3)"},
+                    "root": {"type": "string", "description": "Root symbol/file to start the graph from"},
+                    "direction": {"type": "string", "enum": ["in", "out", "both"], "description": "Edge direction to follow (default: both)"},
+                    "include_metrics": {"type": "boolean", "description": "Include complexity metrics on nodes (default: true)"},
+                    "include_security": {"type": "boolean", "description": "Overlay security findings (default: false)"},
+                    "include_excerpts": {"type": "boolean", "description": "Include code excerpts on nodes (default: false)"},
+                    "cluster_by": {"type": "string", "description": "Cluster nodes by 'file', 'module' or 'none' (default: none)"},
+                    "max_nodes": {"type": "integer", "description": "Maximum nodes in the graph (default: 200)"},
+                    "filter": {"type": "object", "description": "Node filter: {min_complexity: int, file_pattern: glob}"}
                 },
                 "required": ["repo"]
             }),

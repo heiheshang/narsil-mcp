@@ -501,6 +501,17 @@ impl LanguageParser {
             .find(|c| c.config.extensions.contains(&ext))
     }
 
+    /// The language name this parser reports for `path`, without parsing it.
+    ///
+    /// Callers that reuse symbols from a persisted index skip `parse_file` and
+    /// would otherwise have to guess the label from the extension — producing
+    /// `"Rust"` where a parsed file says `"rust"`, and splitting the language
+    /// statistics of one repository across two buckets.
+    #[must_use]
+    pub fn language_name(&self, path: &Path) -> Option<String> {
+        self.get_config(path).map(|c| c.config.name.clone())
+    }
+
     /// Parse a file and extract symbols
     pub fn parse_file(&self, path: &Path, content: &str) -> Result<ParsedFile> {
         let lazy_config = self
@@ -623,6 +634,32 @@ fn parse_symbol_kind(capture_name: &str) -> SymbolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A warm `--persist` start reuses cached symbols and never calls
+    /// `parse_file`, so it labels the language through `language_name`. If the
+    /// two disagree, one repository's files land in two language buckets.
+    #[test]
+    fn test_language_name_matches_parse_file() {
+        let parser = LanguageParser::new().unwrap();
+
+        for (file, source) in [
+            ("a.rs", "fn main() {}"),
+            ("a.py", "def f():\n    pass\n"),
+            ("a.cpp", "int main() { return 0; }"),
+            ("a.cs", "class A { }"),
+            ("a.bsl", "Процедура Тест() КонецПроцедуры"),
+        ] {
+            let path = Path::new(file);
+            let parsed = parser.parse_file(path, source).unwrap();
+            assert_eq!(
+                parser.language_name(path).as_deref(),
+                Some(parsed.language.as_str()),
+                "language_name disagrees with parse_file for {file}"
+            );
+        }
+
+        assert!(parser.language_name(Path::new("README.md")).is_none());
+    }
 
     #[test]
     fn test_parse_rust() {

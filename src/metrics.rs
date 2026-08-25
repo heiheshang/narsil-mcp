@@ -232,14 +232,14 @@ impl Metrics {
             output.push_str("|--------|-------|\n");
             output.push_str(&format!("| Files Parsed | {} |\n", parse_stats.count));
             output.push_str(&format!(
-                "| Avg Parse Time | {:.2}Âµs |\n",
+                "| Avg Parse Time | {:.2}µs |\n",
                 parse_stats.avg_ms()
             ));
-            output.push_str(&format!("| Min Parse Time | {}Âµs |\n", parse_stats.min_ms));
-            output.push_str(&format!("| Max Parse Time | {}Âµs |\n", parse_stats.max_ms));
-            output.push_str(&format!("| P50 Parse Time | {}Âµs |\n", parse_stats.p50()));
-            output.push_str(&format!("| P95 Parse Time | {}Âµs |\n", parse_stats.p95()));
-            output.push_str(&format!("| P99 Parse Time | {}Âµs |\n", parse_stats.p99()));
+            output.push_str(&format!("| Min Parse Time | {}µs |\n", parse_stats.min_ms));
+            output.push_str(&format!("| Max Parse Time | {}µs |\n", parse_stats.max_ms));
+            output.push_str(&format!("| P50 Parse Time | {}µs |\n", parse_stats.p50()));
+            output.push_str(&format!("| P95 Parse Time | {}µs |\n", parse_stats.p95()));
+            output.push_str(&format!("| P99 Parse Time | {}µs |\n", parse_stats.p99()));
             output.push('\n');
         }
 

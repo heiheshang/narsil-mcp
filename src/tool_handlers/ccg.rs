@@ -380,11 +380,7 @@ impl ToolHandler for ImportCcgHandler {
                 "source": imported.source,
                 "size_bytes": imported.size_bytes,
                 "was_compressed": imported.was_compressed,
-                "preview": if imported.content.len() > 500 {
-                    format!("{}...", &imported.content[..imported.content.floor_char_boundary(500)])
-                } else {
-                    imported.content.clone()
-                }
+                "preview": crate::text::truncate_with_ellipsis(&imported.content, 500)
             })
             .to_string());
         }
@@ -416,11 +412,7 @@ impl ToolHandler for ImportCcgHandler {
                 "source": imported.source,
                 "size_bytes": imported.size_bytes,
                 "was_compressed": imported.was_compressed,
-                "preview": if imported.content.len() > 500 {
-                    format!("{}...", &imported.content[..imported.content.floor_char_boundary(500)])
-                } else {
-                    imported.content.clone()
-                }
+                "preview": crate::text::truncate_with_ellipsis(&imported.content, 500)
             })
             .to_string());
         }

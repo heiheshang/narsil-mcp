@@ -290,6 +290,9 @@ impl HybridSearchEngine {
         let term_freq = crate::search::count_terms(&crate::search::tokenize_code(&chunk.content));
         let search_doc = SearchDocument {
             id: chunk.id.clone(),
+            // Transient per-query index: it is built from an already
+            // repo-scoped file set, so documents carry no repo tag.
+            repo: std::sync::Arc::from(""),
             file_path: chunk.file_path.clone(),
             content: chunk.content.clone(),
             doc_type,
@@ -303,6 +306,7 @@ impl HybridSearchEngine {
         // Index in TF-IDF
         self.tfidf_engine.index_snippet(
             chunk.id.clone(),
+            std::sync::Arc::from(""),
             chunk.file_path.clone(),
             chunk.content.clone(),
             chunk.start_line,

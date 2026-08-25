@@ -639,7 +639,7 @@ fn url_encode(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::{CallType, FunctionMetrics};
+    use crate::callgraph::{CallResolution, CallType, FunctionMetrics};
     use std::collections::HashMap;
 
     // ========================================================================
@@ -816,7 +816,6 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 10,
             calls: vec![],
-            called_by: vec![],
             metrics: FunctionMetrics {
                 loc: 20,
                 cyclomatic: 5,
@@ -825,6 +824,7 @@ mod tests {
                 returns: 1,
                 cognitive: 8,
             },
+            receiver: None,
         };
 
         let iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -860,9 +860,12 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                // The test never creates a `callee` node.
+                resolved: false,
+                resolution: CallResolution::Unknown,
             }],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let caller_iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -892,9 +895,11 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: true,
+                resolution: CallResolution::Unknown,
             }],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_b = CallNode {
@@ -908,9 +913,11 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                resolved: true,
+                resolution: CallResolution::Unknown,
             }],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         let node_c = CallNode {
@@ -918,8 +925,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 20,
             calls: vec![],
-            called_by: vec![],
             metrics: FunctionMetrics::default(),
+            receiver: None,
         };
 
         CallGraphTransformer::transform_node(&graph, "test-repo", &node_a).unwrap();

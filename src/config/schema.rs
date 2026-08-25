@@ -104,6 +104,15 @@ pub struct RepoProfile {
     /// Enable graph/SPARQL/CCG tools for this profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<bool>,
+
+    /// Extra glob patterns to exclude from indexing, on top of the built-in
+    /// vendored defaults. Prefix with '!' to re-include (e.g. "!**/vendor/**").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+
+    /// Maximum file size in bytes to index (0 = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_size: Option<u64>,
 }
 
 /// Tools configuration (categories and overrides)

@@ -97,6 +97,28 @@ For multi-repo setups:
 }
 ```
 
+### Following the working directory
+
+With no `--repos` (or `--repos .`) narsil indexes the directory the MCP server
+is started in, which is the project directory Claude Code was opened in. One
+user-scoped server therefore follows you between projects:
+
+```bash
+claude mcp add narsil-mcp --scope user -- narsil-mcp --git
+```
+
+A project-scoped entry of the same name still wins where you have one, so
+per-project overrides (extra repositories, `--neural`, ...) keep working.
+
+Every search tool spans all indexed repositories by default. Pass `repo` (a
+name from `list_repos`, or a path inside the repository) to search one of them:
+
+```
+> Search only the backend repo for the retry helper
+```
+
+which maps to e.g. `semantic_search(query="retry helper", repo="backend")`.
+
 ## Environment Variables
 
 Set these in your shell for additional features:

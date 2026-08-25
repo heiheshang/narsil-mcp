@@ -5,6 +5,191 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.9.0] - 2026-08-25
+
+### Added
+
+- `get_file` takes a `ref` parameter and reads a file at an arbitrary git
+  ref or commit, instead of only the currently indexed working tree.
+
+### Fixed
+
+- `POST /tools/call` accepts `name`/`arguments` as aliases for `tool`/`args`,
+  and rejects any other top-level key. The MCP wire shape previously parsed but
+  lost its arguments, so a fully-specified call failed with
+  `missing required parameter <X>` for a parameter the caller had passed.
+- `--neural-dimension` is auto-detected for locally served embedding models
+  (`bge-m3` 1024, `bge-large`/`mxbai-embed-large` 1024, `bge-base`/
+  `nomic-embed-text` 768, `bge-small`/`all-minilm` 384), and Ollama-style
+  `name:tag` model names resolve the same as untagged ones. `bge-m3` previously
+  fell back to 1536, which made the endpoint reject every embedding batch while
+  semantic search silently degraded to TF-IDF.
+- A dimension mismatch now reports the model, both dimensions and the exact
+  flag to set, instead of only the index of the first offending embedding.
+
+## [1.8.1] - 2026-08-21
+
+Field-report fixes: five reported defects, three of which shared one cause —
+`ToolRegistry::dispatch` never validated arguments against `input_schema`, so
+an unknown key was dropped and the tool "succeeded" with an empty filter.
+See `IMPLEMENTATION_PLAN.md` for the root-cause analysis.
+
+### Added
+
+- Incremental call-graph updates in watch mode, so newly added untracked files
+  no longer produce false negatives from `get_callers`.
+
+### Fixed
+
+- Unknown tool arguments are rejected instead of silently dropped, and
+  `required` fields from the schema are enforced. `NARSIL_ARG_VALIDATION=
+  strict|warn|off` is the escape hatch.
+- `search_code` accepts `path` as an alias for `file_pattern`, normalises a
+  bare filename to `**/<name>`, and errors on an invalid glob.
+- `get_excerpt` accepts `start_line`/`end_line`/`line` and `file`, and no
+  longer panics on an out-of-range anchor.
+- `find_symbols` accepts `query`/`name`, ranks exact matches first, and caps
+  output with a visible truncation marker instead of returning megabytes.
+- Vendored and generated content (`vendor/`, `node_modules/`, `target/`,
+  minified assets, lockfiles) is excluded from indexing by default, with
+  `exclude` globs and `max_file_size` to override.
+- Double-encoded UTF-8 literals repaired across `index.rs`, `extract.rs` and
+  `symbols.rs`; a test guards against reintroducing them.
+- MCP sessions persist to disk, so a reconnect no longer loses session state.
+
+## [1.8.0] - 2026-08-19
+
+### Fixed
+
+- **Method calls were missing from the call graph in most languages.** The
+  call-site walker only understood a handful of callee shapes, so Go
+  `selector_expression` (`s.helper()`, `pkg.Func()`), Python `attribute`
+  (`self.step()`) and Java `method_invocation` produced no edge at all, and
+  JavaScript/TypeScript recorded the receiver (`a`) instead of the method
+  (`run`). `get_callers` on any method therefore answered "No callers found"
+  on a Go, Python or Java repository. The callee is now located through
+  tree-sitter field names, covering Go, Python, JS/TS, Java, C#, PHP, Ruby,
+  Kotlin and Swift alongside the Rust/C shapes that already worked, and the
+  receiver (a package or module, but never `self`/`this`) is carried through
+  as a scope hint for cross-file resolution. Ruby `method` definitions and
+  Kotlin/Swift `simple_identifier` names are now recognised as functions, so
+  those languages have call graph nodes at all.
+
+- **Same-named methods no longer collapse onto one node.** `CallNode` now
+  records the type a function is defined on — the Go receiver, the Rust `impl`
+  type, the enclosing class/trait elsewhere — and method nodes are keyed
+  `file::Type::name` instead of `file::name`. Previously `func (s *Server)
+  Handle()` and `func (c Client) Handle()` in one file shared a key and the
+  second overwrote the first, so one method was absent from the graph and the
+  other's callers were a mix of both. The type also narrows resolution:
+  `Store::new()` now resolves to the `Store` node wherever it lives, instead of
+  to whichever `new` sorted first, and `get_callers` reports which type each
+  candidate belongs to.
+
+- **Call edges say what they were matched on.** A call like `x.run()` cannot
+  be tied to the type of `x` without type inference, so its target is one
+  namesake out of several — but the listing showed it exactly like an edge the
+  graph had identified, and third-party calls like `map` or `to_string` looked
+  like project functions. Every edge now carries a `CallResolution` (unique
+  name, receiver type, module scope, same file, name only, or not in the
+  graph), and `get_callers` / `get_callees` mark the weak entries and count
+  them below the list.
+
+- **`get_callers` / `get_callees` accept qualified method names.** Graph nodes
+  were keyed `file::name`, so `Server.Handle` or `A::run` — how a method is
+  normally spelled — resolved to nothing. Such queries now fall back to the
+  trailing segment, with the qualifier matched first against the receiver type
+  and then against the file path.
+
+- **An unresolved function no longer reads as "no callers".** Both tools
+  reported "*No callers found.*" whether the name was unknown or genuinely
+  uncalled. They now say when a name is not in the graph and suggest similar
+  names, note which node a query resolved to, and warn when several functions
+  share the name instead of silently reporting on the alphabetically first.
+
+## [1.7.1] - 2026-08-19
+
+### Fixed
+
+- **UTF-8 boundary panics in `find_dead_code` and `scan_security`.** The
+  crash class fixed earlier for snippet previews survived in two more places,
+  both reachable from a tool call on any non-ASCII codebase: `find_dead_code`
+  renders each dead store's source line through a 60-byte cut, and
+  `scan_security` redacts a matched secret as "first 4 … last 4" bytes —
+  secret patterns such as `postgres://[^:]+:[^@]+@` match non-ASCII passwords,
+  where the tail lands mid-character. Both cuts now go through the new
+  `narsil_mcp::text` helpers (`truncate`, `truncate_start`,
+  `truncate_with_ellipsis`), which every display truncation in the codebase
+  shares so the bug cannot be reintroduced one file at a time.
+- **The embedding truncation counter reported zero on Cyrillic input.** It
+  counted clamped texts whose length equalled `MAX_TEXT_LENGTH`, but the cut
+  lands on a character boundary, so a clamped Cyrillic text is one byte short
+  of the cap — the only diagnostic the clamp has read "nothing was truncated"
+  on exactly the corpus it was built for. It now counts by input length.
+  (The clamp itself landed with the 32k → 23k `MAX_TEXT_LENGTH` change: an
+  input over the cap is truncated before embedding instead of failing the
+  request, so one oversized symbol no longer costs its whole batch.)
+- **A warm `--persist` start labelled languages differently from a cold one.**
+  Files whose symbols come from the persisted index are never parsed, and the
+  language label was derived from the extension (`Rust`, `C++`, `C#`) instead
+  of taken from the parser (`rust`, `cpp`, `csharp`), so `list_repos` split one
+  repository's files across two buckets after a restart. Both paths now ask
+  `LanguageParser::language_name`.
+
+- **`semantic_search` and `neural_search` honour the `repo` parameter.** Both
+  tools accepted `repo` but searched the whole corpus anyway: `semantic_search`
+  only validated the name and then ranked every indexed repository, and
+  `neural_search` post-filtered a global top-k with a
+  `file_path.contains(repo)` substring test — which both let other
+  repositories eat the `max_results` budget and matched any path that happened
+  to contain the repo name. Search and neural documents now carry an interned
+  repository tag (`Arc<str>`, 16 bytes per document, no per-document
+  allocation), and filtering happens during ranking via
+  `SearchIndex::search_in` / `NeuralEngine::search_in`, so `max_results` is
+  filled from the requested repository. An unknown `repo` name is now an error
+  instead of an empty result set. Omitting `repo` still searches every indexed
+  repository.
+- **The rest of the similarity surface is repo-scoped too.**
+  `find_similar_code` ignored `repo` the same way; `find_similar_to_symbol` and
+  `find_semantic_clones` take a required `repo` but answered from the whole
+  corpus, so "what else looks like this function" could come from an unrelated
+  codebase. All three now search inside the requested repository.
+  `search_chunks` and `hybrid_search` no longer match repositories by a loose
+  `path.ends_with(name)` test, and an unknown name is reported instead of
+  silently returning nothing. `repo` accepts a name from `list_repos` or a path
+  inside the repository.
+- **Documents with colliding ids across repositories no longer shadow each
+  other.** Ids are repository-relative (`src/lib.rs::main` exists in every
+  repository), and both the TF-IDF store and the neural document map keyed on
+  the bare id — so with several repositories indexed one document silently
+  replaced the other, and `find_similar_to_symbol` could answer from the wrong
+  codebase. Both stores now key on `search::scoped_doc_id(repo, id)`.
+- **`--persist` no longer leaves every search tool answering from an empty
+  index.** Persistence restores symbols and repository metadata only —
+  `file_cache`, the BM25 index, the TF-IDF embeddings, normalized 1C documents
+  and neural vectors are all built during the repository walk, and
+  `complete_initialization` skipped that walk whenever the cache was warm. The
+  effect: `find_symbols` worked while `semantic_search`, `search_code`,
+  `search_chunks`, `hybrid_search` and `find_similar_code` reported no results
+  (`get_index_status` showed `Total Documents: 0` next to 122 950 loaded
+  symbols). A warm start now walks the repository but reuses the cached symbols
+  for files that are unchanged on disk — staleness is checked by size + mtime
+  with a content-hash fallback — so tree-sitter parsing is skipped instead of
+  the whole index. The persisted index is rewritten only when the walk actually
+  found new, changed or removed files, so a cache-confirming start does not
+  re-hash every file. This also fixes stale-file detection: a file edited
+  between sessions is now re-parsed rather than served from the cache
+  (`test_persistence_stale_file_detection`, which failed before this change).
+  Symbol reuse is skipped when `--call-graph` is on, since the call graph needs
+  the parse trees.
+- **Snippet rendering no longer reads another repository's file.**
+  `raw_lines_for_document` / `snippet_for_document` resolved a document's
+  relative path against every indexed repository root and rendered the first
+  file that existed; `normalized_doc_content_by_id` scanned all repositories for
+  a matching id. Both now resolve inside the document's own repository.
+
 ## [1.7.0] - 2026-05-12
 
 ### Fixed

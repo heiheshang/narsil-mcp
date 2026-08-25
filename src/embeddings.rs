@@ -67,7 +67,7 @@ impl TfIdfEmbedding {
             .iter()
             .map(|(term, &df)| (term.clone(), df))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         // Vocabulary = top `max_vocab_size` terms.
         self.vocabulary.clear();
@@ -83,11 +83,8 @@ impl TfIdfEmbedding {
         // retain their counts and can still climb into the top-N later.
         let limit = self.max_vocab_size * 2;
         if self.document_freq.len() > limit {
-            let keep: std::collections::HashSet<&String> = ranked
-                .iter()
-                .take(limit)
-                .map(|(term, _)| term)
-                .collect();
+            let keep: std::collections::HashSet<&String> =
+                ranked.iter().take(limit).map(|(term, _)| term).collect();
             self.document_freq.retain(|term, _| keep.contains(term));
         }
     }
@@ -215,10 +212,18 @@ pub struct EmbeddingStats {
     pub dimension: usize,
 }
 
+/// Repository tag for documents indexed without repository context.
+fn unknown_repo() -> Arc<str> {
+    Arc::from("")
+}
+
 /// A document with its embedding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddedDocument {
     pub id: String,
+    /// Repository this document belongs to (interned; empty when unknown).
+    #[serde(default = "unknown_repo")]
+    pub repo: Arc<str>,
     pub file_path: String,
     pub content: String,
     pub start_line: usize,
@@ -256,19 +261,35 @@ impl VectorStore {
     /// Add a document with its embedding
     pub fn add(&mut self, doc: EmbeddedDocument) {
         let idx = self.documents.len();
-        self.id_to_idx.insert(doc.id.clone(), idx);
+        // Keyed per repository: `src/lib.rs::main` exists in every repository,
+        // and a bare id would make the last one indexed shadow the others.
+        self.id_to_idx
+            .insert(crate::search::scoped_doc_id(&doc.repo, &doc.id), idx);
         self.documents.push(doc);
     }
 
-    /// Find similar documents to a query embedding
+    /// Find similar documents to a query embedding across every repository
     pub fn find_similar(
         &self,
         query_embedding: &[f32],
         max_results: usize,
     ) -> Vec<SimilarityResult> {
+        self.find_similar_in(query_embedding, max_results, None)
+    }
+
+    /// Find similar documents, optionally restricted to one repository.
+    /// The filter runs before the top-k cut, so `max_results` is filled from
+    /// the requested repository.
+    pub fn find_similar_in(
+        &self,
+        query_embedding: &[f32],
+        max_results: usize,
+        repo: Option<&str>,
+    ) -> Vec<SimilarityResult> {
         let mut results: Vec<_> = self
             .documents
             .iter()
+            .filter(|doc| repo.is_none_or(|repo| &*doc.repo == repo))
             .map(|doc| {
                 let similarity = sparse_cosine(query_embedding, &doc.embedding);
                 SimilarityResult {
@@ -292,9 +313,9 @@ impl VectorStore {
     }
 
     /// Get document by ID
-    pub fn get(&self, id: &str) -> Option<&EmbeddedDocument> {
+    pub fn get(&self, repo: &str, id: &str) -> Option<&EmbeddedDocument> {
         self.id_to_idx
-            .get(id)
+            .get(&crate::search::scoped_doc_id(repo, id))
             .and_then(|&idx| self.documents.get(idx))
     }
 
@@ -317,10 +338,15 @@ impl VectorStore {
             .sum();
         let index_bytes: usize = self
             .id_to_idx
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
-        (self.documents.len(), content_bytes, embedding_bytes, index_bytes)
+        (
+            self.documents.len(),
+            content_bytes,
+            embedding_bytes,
+            index_bytes,
+        )
     }
 
     /// Check if store is empty
@@ -365,8 +391,19 @@ impl ConcurrentVectorStore {
         self.inner.read().find_similar(query_embedding, max_results)
     }
 
-    pub fn get(&self, id: &str) -> Option<EmbeddedDocument> {
-        self.inner.read().get(id).cloned()
+    pub fn find_similar_in(
+        &self,
+        query_embedding: &[f32],
+        max_results: usize,
+        repo: Option<&str>,
+    ) -> Vec<SimilarityResult> {
+        self.inner
+            .read()
+            .find_similar_in(query_embedding, max_results, repo)
+    }
+
+    pub fn get(&self, repo: &str, id: &str) -> Option<EmbeddedDocument> {
+        self.inner.read().get(repo, id).cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -411,12 +448,13 @@ impl EmbeddingEngine {
     pub fn index_snippet(
         &self,
         id: String,
+        repo: Arc<str>,
         file_path: String,
         content: String,
         start_line: usize,
         end_line: usize,
     ) {
-        self.index_snippet_inner(id, file_path, content, start_line, end_line, true);
+        self.index_snippet_inner(id, repo, file_path, content, start_line, end_line, true);
     }
 
     /// Index a snippet but do NOT retain its raw text (persistent-index path).
@@ -426,17 +464,20 @@ impl EmbeddingEngine {
     pub fn index_snippet_embed_only(
         &self,
         id: String,
+        repo: Arc<str>,
         file_path: String,
         content: String,
         start_line: usize,
         end_line: usize,
     ) {
-        self.index_snippet_inner(id, file_path, content, start_line, end_line, false);
+        self.index_snippet_inner(id, repo, file_path, content, start_line, end_line, false);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index_snippet_inner(
         &self,
         id: String,
+        repo: Arc<str>,
         file_path: String,
         content: String,
         start_line: usize,
@@ -454,6 +495,7 @@ impl EmbeddingEngine {
         // Store the embedded document
         self.store.add(EmbeddedDocument {
             id,
+            repo,
             file_path,
             content: stored_text,
             start_line,
@@ -462,17 +504,35 @@ impl EmbeddingEngine {
         });
     }
 
-    /// Find similar code to a query string
+    /// Find similar code to a query string across every repository
     pub fn find_similar_code(&self, query: &str, max_results: usize) -> Vec<SimilarityResult> {
-        let query_embedding = self.provider.read().embed(query);
-        self.store.find_similar(&query_embedding, max_results)
+        self.find_similar_code_in(query, max_results, None)
     }
 
-    /// Find code similar to a specific document
-    pub fn find_similar_to_doc(&self, doc_id: &str, max_results: usize) -> Vec<SimilarityResult> {
-        if let Some(doc) = self.store.get(doc_id) {
+    /// Find similar code to a query string, optionally scoped to one repository
+    pub fn find_similar_code_in(
+        &self,
+        query: &str,
+        max_results: usize,
+        repo: Option<&str>,
+    ) -> Vec<SimilarityResult> {
+        let query_embedding = self.provider.read().embed(query);
+        self.store
+            .find_similar_in(&query_embedding, max_results, repo)
+    }
+
+    /// Find code similar to a specific document of a repository. Results are
+    /// restricted to that repository — a "what else looks like this symbol"
+    /// answer from an unrelated codebase is noise, not a match.
+    pub fn find_similar_to_doc(
+        &self,
+        repo: &str,
+        doc_id: &str,
+        max_results: usize,
+    ) -> Vec<SimilarityResult> {
+        if let Some(doc) = self.store.get(repo, doc_id) {
             let query = to_dense(&doc.embedding, self.provider.read().dimension());
-            self.store.find_similar(&query, max_results)
+            self.store.find_similar_in(&query, max_results, Some(repo))
         } else {
             Vec::new()
         }
@@ -492,15 +552,22 @@ impl EmbeddingEngine {
         let p = self.provider.read();
         let vocab_bytes: usize = p
             .vocabulary
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
         let df_bytes: usize = p
             .document_freq
-            .iter()
-            .map(|(k, _)| k.len() + std::mem::size_of::<usize>())
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
-        (docs, content_bytes, embedding_bytes, index_bytes, vocab_bytes, df_bytes)
+        (
+            docs,
+            content_bytes,
+            embedding_bytes,
+            index_bytes,
+            vocab_bytes,
+            df_bytes,
+        )
     }
 
     /// Clear all data
@@ -590,6 +657,7 @@ mod tests {
 
         let doc1 = EmbeddedDocument {
             id: "doc1".to_string(),
+            repo: Arc::from("demo"),
             file_path: "test.rs".to_string(),
             content: "fn hello()".to_string(),
             start_line: 1,
@@ -599,6 +667,7 @@ mod tests {
 
         let doc2 = EmbeddedDocument {
             id: "doc2".to_string(),
+            repo: Arc::from("demo"),
             file_path: "test2.rs".to_string(),
             content: "fn goodbye()".to_string(),
             start_line: 10,
@@ -626,6 +695,7 @@ mod tests {
 
         engine.index_snippet(
             "test1".to_string(),
+            Arc::from("demo"),
             "test.rs".to_string(),
             "fn calculate_sum(a: i32, b: i32) -> i32 { a + b }".to_string(),
             1,
@@ -634,6 +704,7 @@ mod tests {
 
         engine.index_snippet(
             "test2".to_string(),
+            Arc::from("demo"),
             "test.rs".to_string(),
             "fn calculate_product(x: i32, y: i32) -> i32 { x * y }".to_string(),
             3,
@@ -642,6 +713,7 @@ mod tests {
 
         engine.index_snippet(
             "test3".to_string(),
+            Arc::from("demo"),
             "test.rs".to_string(),
             "fn print_hello() { println!(\"Hello\"); }".to_string(),
             5,
@@ -674,6 +746,7 @@ mod tests {
 
         engine.index_snippet(
             "doc1".to_string(),
+            Arc::from("demo"),
             "test.rs".to_string(),
             "fn fibonacci(n: u32) -> u32 { if n <= 1 { n } else { fibonacci(n-1) + fibonacci(n-2) } }".to_string(),
             1,
@@ -682,6 +755,7 @@ mod tests {
 
         engine.index_snippet(
             "doc2".to_string(),
+            Arc::from("demo"),
             "test.rs".to_string(),
             "fn factorial(n: u32) -> u32 { if n <= 1 { 1 } else { n * factorial(n-1) } }"
                 .to_string(),
@@ -691,6 +765,7 @@ mod tests {
 
         engine.index_snippet(
             "doc3".to_string(),
+            Arc::from("demo"),
             "test.rs".to_string(),
             "fn print_message(msg: &str) { println!(\"{}\", msg); }".to_string(),
             13,
@@ -698,7 +773,7 @@ mod tests {
         );
 
         // Find similar to fibonacci
-        let results = engine.find_similar_to_doc("doc1", 3);
+        let results = engine.find_similar_to_doc("demo", "doc1", 3);
         assert!(results.len() >= 2);
 
         // First result should be itself (doc1)
@@ -741,11 +816,79 @@ mod tests {
         );
     }
 
+    /// Two repositories share the id `src/lib.rs::main`. Keyed by bare id, the
+    /// second insert shadowed the first and `find_similar_to_doc` answered from
+    /// whichever repository happened to be indexed last.
+    #[test]
+    fn test_colliding_ids_across_repos_stay_separate() {
+        let engine = EmbeddingEngine::new(100);
+
+        engine.index_snippet(
+            "src/lib.rs::main".to_string(),
+            Arc::from("alpha"),
+            "src/lib.rs".to_string(),
+            "fn main() { alpha_specific_marker(); }".to_string(),
+            1,
+            3,
+        );
+        engine.index_snippet(
+            "src/lib.rs::main".to_string(),
+            Arc::from("beta"),
+            "src/lib.rs".to_string(),
+            "fn main() { beta_specific_marker(); }".to_string(),
+            1,
+            3,
+        );
+
+        for repo in ["alpha", "beta"] {
+            let results = engine.find_similar_to_doc(repo, "src/lib.rs::main", 5);
+            assert!(!results.is_empty(), "{repo}: document was shadowed");
+            assert!(
+                results.iter().all(|r| &*r.document.repo == repo),
+                "{repo}: results leaked from another repository"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_similar_code_in_scopes_to_repo() {
+        let engine = EmbeddingEngine::new(100);
+
+        engine.index_snippet(
+            "alpha.rs::sum".to_string(),
+            Arc::from("alpha"),
+            "alpha.rs".to_string(),
+            "fn calculate_sum(a: i32, b: i32) -> i32 { a + b }".to_string(),
+            1,
+            1,
+        );
+        engine.index_snippet(
+            "beta.rs::sum".to_string(),
+            Arc::from("beta"),
+            "beta.rs".to_string(),
+            "fn calculate_sum(a: i32, b: i32) -> i32 { a + b }".to_string(),
+            1,
+            1,
+        );
+
+        let all = engine.find_similar_code("calculate sum", 10);
+        assert_eq!(all.len(), 2);
+
+        let scoped = engine.find_similar_code_in("calculate sum", 10, Some("beta"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(&*scoped[0].document.repo, "beta");
+
+        assert!(engine
+            .find_similar_code_in("calculate sum", 10, Some("gamma"))
+            .is_empty());
+    }
+
     #[test]
     fn test_embedding_sort_handles_nan() {
         let mut store = VectorStore::new();
         store.add(EmbeddedDocument {
             id: "a".to_string(),
+            repo: Arc::from("demo"),
             file_path: "a.rs".to_string(),
             content: "fn a()".to_string(),
             start_line: 1,
@@ -754,6 +897,7 @@ mod tests {
         });
         store.add(EmbeddedDocument {
             id: "c".to_string(),
+            repo: Arc::from("demo"),
             file_path: "c.rs".to_string(),
             content: "fn c()".to_string(),
             start_line: 1,
@@ -771,6 +915,7 @@ mod tests {
         let make_result = |id: &str, sim: f32| SimilarityResult {
             document: EmbeddedDocument {
                 id: id.to_string(),
+                repo: Arc::from("demo"),
                 file_path: format!("{}.rs", id),
                 content: format!("fn {}()", id),
                 start_line: 1,

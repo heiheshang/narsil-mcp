@@ -51,7 +51,10 @@ impl ToolHandler for GetFileHandler {
         let path = args.get_str("path").unwrap_or("");
         let start_line = args.get_u64("start_line").map(|v| v as usize);
         let end_line = args.get_u64("end_line").map(|v| v as usize);
-        engine.get_file(repo, path, start_line, end_line).await
+        let git_ref = args.get_str_any(&["ref", "revision"]);
+        engine
+            .get_file(repo, path, start_line, end_line, git_ref)
+            .await
     }
 }
 
@@ -66,8 +69,9 @@ impl ToolHandler for GetExcerptHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
-        let lines: Vec<usize> = args
+        let path = args.get_str_any(&["path", "file"]).unwrap_or("");
+
+        let mut lines: Vec<usize> = args
             .get_array("lines")
             .map(|arr| {
                 arr.iter()
@@ -75,11 +79,49 @@ impl ToolHandler for GetExcerptHandler {
                     .collect()
             })
             .unwrap_or_default();
+
+        // Range form: start_line/end_line (or a single `line`) as an
+        // alternative to the `lines` anchor array.
+        let start_line = args.get_u64("start_line").map(|v| v as usize);
+        let end_line = args.get_u64("end_line").map(|v| v as usize);
+        let mut explicit_range = None;
+        if lines.is_empty() {
+            if let Some(start) = start_line {
+                let end = end_line.unwrap_or(start).max(start);
+                const MAX_RANGE: usize = 10_000;
+                if end - start >= MAX_RANGE {
+                    anyhow::bail!(
+                        "Line range {}-{} is too large (max {} lines per request); use get_file or narrow the range",
+                        start,
+                        end,
+                        MAX_RANGE
+                    );
+                }
+                lines = (start..=end).collect();
+                explicit_range = Some((start, end));
+            } else if end_line.is_some() {
+                anyhow::bail!("'end_line' requires 'start_line'");
+            } else if let Some(line) = args.get_u64("line").map(|v| v as usize) {
+                lines = vec![line];
+            }
+        }
+
+        if lines.is_empty() {
+            anyhow::bail!(
+                "No lines specified. Pass 'lines' (array of 1-indexed line numbers), a single 'line', or 'start_line' + 'end_line'."
+            );
+        }
+
+        // An explicit range means the caller wants exactly those lines:
+        // no context padding, no scope expansion, no silent clamping.
+        let range_len = explicit_range.map(|(s, e)| e - s + 1);
+        let default_context = if explicit_range.is_some() { 0 } else { 5 };
         let config = ExcerptConfig {
-            context_before: args.get_u64_or("context_before", 5) as usize,
-            context_after: args.get_u64_or("context_after", 5) as usize,
-            max_lines: args.get_u64_or("max_lines", 50) as usize,
-            expand_to_scope: args.get_bool_or("expand_to_scope", true),
+            context_before: args.get_u64_or("context_before", default_context) as usize,
+            context_after: args.get_u64_or("context_after", default_context) as usize,
+            max_lines: args.get_u64_or("max_lines", range_len.map_or(50, |n| n.max(50)) as u64)
+                as usize,
+            expand_to_scope: args.get_bool_or("expand_to_scope", explicit_range.is_none()),
             ..Default::default()
         };
 

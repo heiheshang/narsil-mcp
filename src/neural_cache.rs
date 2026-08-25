@@ -83,6 +83,11 @@ impl EmbeddingCache {
             .create(true)
             .read(true)
             .write(true)
+            // Never truncate on open: an existing cache is either kept (with a
+            // torn tail cut back to the last complete record) or reset with an
+            // explicit `set_len(0)` below. Truncating here would discard every
+            // cached vector on every start.
+            .truncate(false)
             .open(&path)
             .with_context(|| format!("Failed to open embedding cache {:?}", path))?;
 
@@ -103,11 +108,7 @@ impl EmbeddingCache {
             write_header(&mut file, model, dimension)?;
         }
 
-        info!(
-            "Embedding cache: {} vectors at {:?}",
-            entries.len(),
-            path
-        );
+        info!("Embedding cache: {} vectors at {:?}", entries.len(), path);
 
         Ok(Self {
             path,
@@ -254,8 +255,10 @@ fn read_existing(
         let mut key = [0u8; KEY_LEN];
         key.copy_from_slice(&record[..KEY_LEN]);
         let mut vector = Vec::with_capacity(dimension);
-        for chunk in record[KEY_LEN..].chunks_exact(4) {
-            vector.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        // `.0` — только целые четвёрки, хвост отбрасывается ровно как у
+        // chunks_exact(4), который здесь был раньше.
+        for chunk in record[KEY_LEN..].as_chunks::<4>().0 {
+            vector.push(f32::from_le_bytes(*chunk));
         }
         entries.insert(key, vector);
         offset += record_len as u64;
@@ -416,7 +419,8 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("narsil-emb-cache-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("narsil-emb-cache-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -433,7 +437,11 @@ mod tests {
         let second = backend.embed_batch(&texts).unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(*inner.calls.lock().unwrap(), 1, "second batch must be served from cache");
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            1,
+            "second batch must be served from cache"
+        );
     }
 
     #[test]
@@ -484,7 +492,11 @@ mod tests {
         let inner = Arc::new(CountingBackend::new(4));
         let backend = CachedBackend::new(inner.clone(), cache);
         backend.embed_batch(&["alpha".to_string()]).unwrap();
-        assert_eq!(*inner.calls.lock().unwrap(), 0, "reopened cache must serve the hit");
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            0,
+            "reopened cache must serve the hit"
+        );
     }
 
     #[test]
@@ -517,10 +529,16 @@ mod tests {
 
         let cache = EmbeddingCache::open(&dir, "test-model", 4).unwrap();
         assert_eq!(cache.len(), 2, "complete records must survive");
+
+        // The 7 stray bytes must be gone: what is left is the header plus a
+        // whole number of records.
+        let header_len = (8 + 2 + 4 + 2 + "test-model".len()) as u64;
+        let record_len = (KEY_LEN + 4 * 4) as u64;
+        let len = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
-            std::fs::metadata(&path).unwrap().len() % 1,
-            0,
-            "file must be truncated to a record boundary"
+            len,
+            header_len + 2 * record_len,
+            "file must be truncated back to the last complete record"
         );
 
         // And the truncated file must still accept new writes.

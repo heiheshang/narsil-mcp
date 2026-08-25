@@ -18,25 +18,28 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::index::CodeIntelEngine;
 use crate::mcp::McpServer;
-use crate::tool_metadata::TOOL_METADATA;
 use crate::tool_handlers::ToolRegistry;
+use crate::tool_metadata::TOOL_METADATA;
 
 /// Maximum HTTP request body size (2 MB).
 const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
 
-// Embedded frontend assets (only when frontend feature is enabled)
+// Embedded frontend assets (only when frontend feature is enabled).
+// `header` и `Response` уже приходят из безусловного блока выше; повторный
+// импорт `axum::http::{header, Response}` конфликтовал с ним, из-за чего фича
+// frontend не собиралась вовсе.
 #[cfg(feature = "frontend")]
-use axum::{
-    body::Body,
-    http::{header, Response},
-};
+use axum::body::Body;
 
 #[cfg(feature = "frontend")]
 use rust_embed::Embed;
@@ -68,15 +71,26 @@ pub struct AppState {
     mcp: Arc<McpServer>,
     /// Active MCP streamable-http sessions.
     sessions: Arc<Mutex<HashSet<String>>>,
+    /// Path for persistent session storage
+    sessions_file: PathBuf,
 }
 
 /// Request body for tool calls
+///
+/// Accepts the MCP wire shape (`name`/`arguments`) as aliases for
+/// `tool`/`args`. Before that, `{"name": ..., "arguments": {...}}` was
+/// accepted but its arguments were silently dropped, so the call failed with
+/// "missing required parameter X" for a parameter the caller had passed.
+/// `deny_unknown_fields` makes any other envelope key a loud error rather
+/// than a silently empty argument set.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCallRequest {
     /// The tool name to execute
+    #[serde(alias = "name")]
     tool: String,
     /// Arguments as JSON object
-    #[serde(default)]
+    #[serde(default, alias = "arguments")]
     args: Value,
 }
 
@@ -127,11 +141,57 @@ impl HttpServer {
 
     /// Run the HTTP server
     pub async fn run(self) -> Result<()> {
+        // Create sessions file path in config directory
+        let config_dir = env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|h| h.join(".config")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+        let sessions_dir = config_dir.join("narsil-mcp");
+        if let Err(e) = fs::create_dir_all(&sessions_dir) {
+            warn!(
+                "Failed to create sessions directory {}: {}",
+                sessions_dir.display(),
+                e
+            );
+        }
+
+        let sessions_file = sessions_dir.join(format!("sessions-{}.json", self.port));
+
+        // Load existing sessions or create empty set
+        let sessions = if sessions_file.exists() {
+            match fs::read_to_string(&sessions_file) {
+                Ok(content) => match serde_json::from_str::<HashSet<String>>(&content) {
+                    Ok(sessions) => sessions,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse sessions file {}: {}",
+                            sessions_file.display(),
+                            e
+                        );
+                        HashSet::new()
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to read sessions file {}: {}",
+                        sessions_file.display(),
+                        e
+                    );
+                    HashSet::new()
+                }
+            }
+        } else {
+            HashSet::new()
+        };
+
         let state = AppState {
             engine: self.engine,
             tool_registry: Arc::new(self.tool_registry),
             mcp: self.mcp,
-            sessions: Arc::new(Mutex::new(HashSet::new())),
+            sessions: Arc::new(Mutex::new(sessions)),
+            sessions_file,
         };
 
         // Configure CORS to allow frontend access (needed for development mode)
@@ -447,6 +507,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
         (None, true) => {
             let sid = Uuid::new_v4().to_string();
             state.sessions.lock().unwrap().insert(sid.clone());
+            save_sessions(&state);
             info!("MCP streamable-http session started: {}", sid);
             session_to_issue = Some(sid);
         }
@@ -516,11 +577,9 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
 
 /// MCP streamable-http session termination (`DELETE /mcp`).
 async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
-    if let Some(sid) = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.sessions.lock().unwrap().remove(sid) {
+            save_sessions(&state);
             info!("MCP streamable-http session terminated: {}", sid);
         }
     }
@@ -532,6 +591,32 @@ fn is_initialize(body: &str) -> bool {
     serde_json::from_str::<Value>(body)
         .map(|v| v.get("method").and_then(|m| m.as_str()) == Some("initialize"))
         .unwrap_or(false)
+}
+
+/// Save active sessions to disk for persistence across restarts
+fn save_sessions(state: &AppState) {
+    let sessions = state.sessions.lock().unwrap();
+    match serde_json::to_string(&*sessions) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&state.sessions_file, json) {
+                error!(
+                    "Failed to save sessions to {}: {}",
+                    state.sessions_file.display(),
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            error!("Failed to serialize sessions: {}", e);
+        }
+    }
+}
+
+/// Get home directory, with fallback
+fn dirs_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 #[cfg(test)]
@@ -559,6 +644,63 @@ mod tests {
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"test\":\"value\""));
         assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn tool_call_request_accepts_canonical_envelope() {
+        let req: ToolCallRequest =
+            serde_json::from_str(r#"{"tool":"find_symbols","args":{"repo":"R","pattern":"P"}}"#)
+                .expect("canonical envelope must parse");
+        assert_eq!(req.tool, "find_symbols");
+        assert_eq!(req.args["repo"], json!("R"));
+        assert_eq!(req.args["pattern"], json!("P"));
+    }
+
+    /// The MCP wire shape used to parse but lose its arguments, so the call
+    /// failed with "missing required parameter" for a parameter that was sent.
+    #[test]
+    fn tool_call_request_accepts_mcp_envelope() {
+        let req: ToolCallRequest = serde_json::from_str(
+            r#"{"name":"find_symbols","arguments":{"repo":"R","pattern":"P"}}"#,
+        )
+        .expect("MCP-shaped envelope must parse");
+        assert_eq!(req.tool, "find_symbols");
+        assert_eq!(req.args["repo"], json!("R"));
+        assert_eq!(req.args["pattern"], json!("P"));
+    }
+
+    #[test]
+    fn tool_call_request_allows_mixed_aliases_and_omitted_args() {
+        let req: ToolCallRequest =
+            serde_json::from_str(r#"{"tool":"list_repos","arguments":{"a":1}}"#)
+                .expect("aliases must be interchangeable");
+        assert_eq!(req.args["a"], json!(1));
+
+        let req: ToolCallRequest =
+            serde_json::from_str(r#"{"tool":"list_repos"}"#).expect("args must be optional");
+        assert!(req.args.is_null());
+    }
+
+    /// A mistyped argument key must fail loudly instead of dispatching with an
+    /// empty argument set, which reads as "the tool ignored my parameters".
+    #[test]
+    fn tool_call_request_rejects_unknown_envelope_keys() {
+        let err = serde_json::from_str::<ToolCallRequest>(
+            r#"{"tool":"find_symbols","arg":{"repo":"R"}}"#,
+        )
+        .expect_err("unknown envelope key must be rejected");
+        assert!(
+            err.to_string().contains("arg"),
+            "error should name the offending key, got: {err}"
+        );
+
+        assert!(
+            serde_json::from_str::<ToolCallRequest>(
+                r#"{"tool":"find_symbols","params":{"repo":"R"}}"#
+            )
+            .is_err(),
+            "'params' is not an accepted alias"
+        );
     }
 
     #[test]

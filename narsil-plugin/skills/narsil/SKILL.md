@@ -6,7 +6,20 @@ allowed-tools: mcp__narsil-mcp__*
 
 # Narsil Code Intelligence
 
-Narsil is an MCP server providing **90 code intelligence tools** (plus 2 prompts: `explain_codebase`, `find_implementation`). This skill helps you use them effectively.
+Narsil is an MCP server providing **90 code intelligence tools** (plus 2 prompts: `explain_codebase`, `find_implementation`). This skill is the catalogue: what exists and which tool covers which task.
+
+## Focused skills
+
+The catalogue tells you *what* to call. These tell you *when*, and how to report
+the result without overstating it - load the one that matches the question:
+
+| Skill | Use for |
+|-------|---------|
+| `narsil-search` | Locating code by name, string, or description; choosing between `search_code`, `hybrid_search`, `neural_search` and friends |
+| `narsil-callgraph` | Who calls what, impact analysis, reachability - and how to read the resolution markers the answers carry |
+| `narsil-static-analysis` | Control/data flow, dead code, unused exports, type inference, import cycles |
+| `narsil-security` | Vulnerability scans, taint tracing, dependency CVEs, licences, SBOM |
+| `narsil-repo-state` | Git history questions, and diagnosing empty or missing tools (flags, presets, index freshness) |
 
 ## Critical: Parameter Naming
 
@@ -20,6 +33,13 @@ Use **short parameter names**. These are the most common mistakes:
 | `function_name` | `function` |
 
 The `repo` parameter expects the **repository name** from `list_repos`, not the full filesystem path.
+
+When several repositories are indexed, every search tool — `search_code`,
+`semantic_search`, `hybrid_search`, `neural_search`, `search_chunks`,
+`find_similar_code` — searches **all** of them unless you pass `repo`. Pass it whenever you mean one codebase:
+the filter is applied during ranking, so `max_results` is spent on hits from
+that repository instead of on a corpus-wide top-k. An unknown `repo` name is
+reported as an error rather than as "no results".
 
 ## Getting Started
 
@@ -62,9 +82,10 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Find files by name | `find_symbols` with `file_pattern` | Know filename pattern |
 | Find function/class definitions | `find_symbols` | Know symbol type |
 | Search by content | `search_code` | Keyword search |
-| BM25-ranked search | `semantic_search` | Better ranking than search_code |
+| BM25-ranked search | `semantic_search` | Better ranking than search_code; `repo` scopes it to one repository |
 | Semantic code search | `hybrid_search` | Natural language queries (combines BM25 + TF-IDF) |
-| Find similar code | `find_similar_code` | Have a code snippet |
+| Neural (embedding) search | `neural_search` | Different naming, same meaning; `repo` scopes it to one repository (requires `--neural`) |
+| Find similar code | `find_similar_code` | Have a code snippet; `repo` scopes it to one repository |
 | Find code like a symbol | `find_similar_to_symbol` | Find patterns similar to existing function |
 | Find code clones | `find_semantic_clones` | Detect duplicate/similar code (Type-3/4 clones) |
 | Search AST chunks | `search_chunks` | Want function/class boundaries |
@@ -85,8 +106,8 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Find all usages (cross-file) | `find_symbol_usages` |
 | See what exports a module has | `get_export_map` |
 | Analyze imports/dependencies | `get_dependencies` |
-| See what calls a function | `get_callers` |
-| See what a function calls | `get_callees` |
+| See what calls a function | `get_callers` (methods are keyed `file::Type::name`; query `Type.method`) |
+| See what a function calls | `get_callees` (entries marked `name match only` / `not in graph` are candidates, not facts) |
 | Full call graph | `get_call_graph` |
 | Find path between functions | `find_call_path` |
 | Function complexity | `get_complexity` |
@@ -239,9 +260,15 @@ For large codebases, use pagination and filtering:
 
 **"No repository found"** → Run `list_repos` and use exact repo name
 
+**Results from the wrong codebase** → You omitted `repo`; searches span every indexed repository by default
+
 **Empty results from git tools** → Check `get_index_status` shows git enabled
 
-**Empty results from call graph** → Check `get_index_status` shows call-graph enabled
+**Empty results from call graph** → Check `get_index_status` shows call-graph enabled. `*Function ... is not in the call graph.*` means the query never resolved - re-ask with `Type.method` or the full `file::Type::name` key, not that nothing calls it
+
+**A tool is missing from the list entirely** → The preset filters it. The server maps the MCP client name to a preset, and `cursor` maps to *balanced*, which blacklists `neural_search` and `find_semantic_clones`. Force `--preset full` / `NARSIL_PRESET=full` on the server and restart
+
+**`exclude_tests` seems ignored on call-graph tools** → It is. `get_call_graph`, `get_callers`, `get_callees` and `get_function_hotspots` accept the parameter but do not filter; exclude test paths yourself
 
 **Slow searches** → Use `file_pattern` to narrow scope
 

@@ -20,7 +20,17 @@ use std::path::Path;
 
 // Security constants for input validation
 const MAX_EMBEDDING_BATCH_SIZE: usize = 100; // Maximum texts per API request
-const MAX_TEXT_LENGTH: usize = 32_000; // Maximum characters per text (~8k tokens for most models)
+
+// Oversized inputs are truncated, not rejected: embedding servers fail the
+// *whole* request when one input exceeds their context, so a single huge symbol
+// used to cost the embeddings of every other text batched with it.
+//
+// 23_000 chars ≈ 8192 tokens, the context of bge-m3 and most current encoders,
+// at the worst-case ~2.85 chars/token measured on Cyrillic source (1C/BSL).
+// Latin-script text tokenises at ~4 chars/token, so it truncates earlier than
+// strictly necessary — deliberately, since embedding a prefix always beats
+// losing the batch.
+const MAX_TEXT_LENGTH: usize = 23_000;
 const MAX_DIMENSION: usize = 8192; // Maximum embedding dimension (larger than any known model)
 const MIN_DIMENSION: usize = 64; // Minimum reasonable embedding dimension
 const MAX_MODEL_NAME_LENGTH: usize = 256; // Maximum model name length
@@ -76,24 +86,48 @@ impl Default for NeuralConfig {
 /// specify a model like `text-embedding-3-large` (3072-dim), the config
 /// automatically picks the right dimension without requiring `--neural-dimension`.
 ///
+/// Ollama-style tags (`bge-m3:567m`) are stripped before matching, so the name
+/// as passed to `--neural-model` resolves the same way it is written on the
+/// serving side. Matching stays case-sensitive.
+///
+/// A model that is not listed here falls back to 1536. That fallback is only a
+/// guess: if the endpoint returns a different width, every batch is rejected and
+/// semantic search silently degrades to TF-IDF, so an unlisted model should be
+/// given an explicit `--neural-dimension`.
+///
 /// # Examples
 ///
 /// ```
 /// use narsil_mcp::neural::default_dimension_for_model;
 /// assert_eq!(default_dimension_for_model(Some("text-embedding-3-large")), 3072);
 /// assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("bge-m3")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("bge-m3:567m")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("nomic-embed-text")), 768);
 /// assert_eq!(default_dimension_for_model(None), 1536);
 /// ```
 #[must_use]
 pub fn default_dimension_for_model(model: Option<&str>) -> usize {
-    match model {
+    // Ollama reports models as `name:tag`; the tag never changes the width.
+    let normalized = model.map(|m| m.split(':').next().unwrap_or(m).trim());
+
+    match normalized {
         Some("text-embedding-3-large") => 3072,
         Some("text-embedding-3-small") => 1536,
         Some("text-embedding-ada-002") => 1536,
-        Some(m) if m.starts_with("voyage-code-3") => 1024,
-        Some(m) if m.starts_with("voyage-code-2") => 1024,
-        Some(m) if m.starts_with("voyage-3") => 1024,
         Some(m) if m.starts_with("voyage-") => 1024,
+
+        // Locally served models, typically through Ollama or another
+        // OpenAI-compatible endpoint. bge-m3 in particular is 1024, not the
+        // 1536 fallback, and the mismatch is only visible as a single warning.
+        Some("bge-m3") => 1024,
+        Some(m) if m.starts_with("bge-large") => 1024,
+        Some(m) if m.starts_with("bge-base") => 768,
+        Some(m) if m.starts_with("bge-small") => 384,
+        Some(m) if m.starts_with("mxbai-embed-large") => 1024,
+        Some(m) if m.starts_with("nomic-embed-text") => 768,
+        Some(m) if m.starts_with("all-minilm") => 384,
+
         _ => 1536,
     }
 }
@@ -384,6 +418,31 @@ impl ApiEmbedder {
     }
 }
 
+/// Clamp over-long inputs to `MAX_TEXT_LENGTH`, reporting how many were cut.
+///
+/// Embedding servers reject the *whole* request when one input exceeds their
+/// context, so a single huge symbol used to cost the embeddings of every other
+/// text batched with it. Nothing is copied: every element borrows from `texts`,
+/// truncated or not.
+///
+/// The count comes from the *input* length. The cut lands on a character
+/// boundary, so a clamped Cyrillic text is typically `MAX_TEXT_LENGTH - 1`
+/// bytes — measuring the output against the cap reports zero truncations on
+/// exactly the corpus that needs them.
+fn clamp_embedding_inputs(texts: &[String]) -> (Vec<&str>, usize) {
+    let mut truncated = 0usize;
+    let clamped = texts
+        .iter()
+        .map(|text| {
+            if crate::text::is_truncated(text, MAX_TEXT_LENGTH) {
+                truncated += 1;
+            }
+            crate::text::truncate(text, MAX_TEXT_LENGTH)
+        })
+        .collect();
+    (clamped, truncated)
+}
+
 impl EmbeddingBackend for ApiEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed_batch(&[text.to_string()])?;
@@ -403,22 +462,20 @@ impl EmbeddingBackend for ApiEmbedder {
             );
         }
 
-        // Input validation - text length
-        for (i, text) in texts.iter().enumerate() {
-            if text.len() > MAX_TEXT_LENGTH {
-                bail!(
-                    "Text at index {} is {} characters, exceeds maximum of {}",
-                    i,
-                    text.len(),
-                    MAX_TEXT_LENGTH
-                );
-            }
+        let (texts, truncated) = clamp_embedding_inputs(texts);
+        if truncated > 0 {
+            tracing::debug!(
+                "Truncated {} of {} texts to {} bytes before embedding",
+                truncated,
+                texts.len(),
+                MAX_TEXT_LENGTH
+            );
         }
 
         #[derive(Serialize)]
         struct Request<'a> {
             model: &'a str,
-            input: &'a [String],
+            input: &'a [&'a str],
             #[serde(skip_serializing_if = "Option::is_none")]
             dimensions: Option<usize>,
         }
@@ -448,14 +505,18 @@ impl EmbeddingBackend for ApiEmbedder {
             .header("Content-Type", "application/json")
             .json(&Request {
                 model: &self.model,
-                input: texts,
+                input: &texts,
                 dimensions,
             });
 
         if let Some(key) = &self.api_key {
             // Redact API key in logs - only show first/last 4 chars
             let redacted = if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len() - 4..])
+                format!(
+                    "{}...{}",
+                    crate::text::truncate(key, 4),
+                    crate::text::truncate_start(key, 4)
+                )
             } else {
                 "****".to_string()
             };
@@ -493,8 +554,8 @@ impl EmbeddingBackend for ApiEmbedder {
 
         if !status.is_success() {
             // Redact potential sensitive info from error messages
-            let safe_text = if text.len() > 500 {
-                format!("{}... (truncated)", &text[..text.floor_char_boundary(500)])
+            let safe_text = if crate::text::is_truncated(&text, 500) {
+                format!("{}... (truncated)", crate::text::truncate(&text, 500))
             } else {
                 text.clone()
             };
@@ -508,14 +569,25 @@ impl EmbeddingBackend for ApiEmbedder {
             )
         })?;
 
-        // Validate response embedding dimensions
+        // Validate response embedding dimensions.
+        //
+        // A mismatch here is a configuration error that never heals: every
+        // later batch fails the same way, and the only symptom upstream is a
+        // warning, after which semantic search quietly runs on TF-IDF. So say
+        // outright what to change.
         for (i, emb_data) in response.data.iter().enumerate() {
             if emb_data.embedding.len() != self.dimension {
                 bail!(
-                    "Embedding at index {} has dimension {}, expected {}",
-                    i,
+                    "Model '{}' returns {}-dimensional embeddings but narsil is configured for {}. \
+                     Every batch will be rejected and semantic search will fall back to TF-IDF. \
+                     Pass --neural-dimension {} (or NARSIL_NEURAL_DIMENSION={}) to fix this. \
+                     (first mismatch at index {})",
+                    self.model,
                     emb_data.embedding.len(),
-                    self.dimension
+                    self.dimension,
+                    emb_data.embedding.len(),
+                    emb_data.embedding.len(),
+                    i
                 );
             }
         }
@@ -681,9 +753,18 @@ impl SimpleVectorStore {
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+        self.search_filtered(query, k, |_| true)
+    }
+
+    /// Rank only the vectors whose document id passes `allow`.
+    pub fn search_filtered<F>(&self, query: &[f32], k: usize, allow: F) -> Vec<(String, f32)>
+    where
+        F: Fn(&str) -> bool,
+    {
         let embeddings = self.embeddings.read();
         let mut results: Vec<(String, f32)> = embeddings
             .iter()
+            .filter(|(id, _)| allow(id))
             .map(|(id, emb)| (id.clone(), cosine_similarity(query, emb)))
             .collect();
 
@@ -730,10 +811,18 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Neural Engine
 // ============================================================================
 
+/// Repository tag for documents indexed without repository context.
+fn unknown_repo() -> Arc<str> {
+    Arc::from("")
+}
+
 /// A document indexed for neural search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeuralDocument {
     pub id: String,
+    /// Repository this document belongs to (interned; empty when unknown).
+    #[serde(default = "unknown_repo")]
+    pub repo: Arc<str>,
     pub file_path: String,
     pub content: String,
     pub start_line: usize,
@@ -936,9 +1025,11 @@ impl NeuralEngine {
     }
 
     /// Index a code snippet
+    #[allow(clippy::too_many_arguments)]
     pub fn index_snippet(
         &self,
         id: String,
+        repo: Arc<str>,
         file_path: String,
         content: String,
         start_line: usize,
@@ -946,17 +1037,19 @@ impl NeuralEngine {
         symbol_name: Option<String>,
     ) -> Result<()> {
         let embedding = self.backend.embed(&content)?;
-        self.store.add(&id, &embedding);
+        let key = crate::search::scoped_doc_id(&repo, &id);
+        self.store.add(&key, &embedding);
 
         let doc = NeuralDocument {
-            id: id.clone(),
+            id,
+            repo,
             file_path,
             content,
             start_line,
             end_line,
             symbol_name,
         };
-        self.documents.write().insert(id, doc);
+        self.documents.write().insert(key, doc);
 
         Ok(())
     }
@@ -970,24 +1063,46 @@ impl NeuralEngine {
 
         use rayon::prelude::*;
         items.par_chunks(BATCH_SIZE).try_for_each(|chunk| {
-            let contents: Vec<String> =
-                chunk.iter().map(|(doc,)| doc.content.clone()).collect();
+            let contents: Vec<String> = chunk.iter().map(|(doc,)| doc.content.clone()).collect();
             let embeddings = self.backend.embed_batch(&contents)?;
 
             for ((doc,), embedding) in chunk.iter().zip(embeddings.iter()) {
-                self.store.add(&doc.id, embedding);
-                self.documents.write().insert(doc.id.clone(), doc.clone());
+                // Repository-scoped key: ids are repo-relative and collide
+                // across repositories (every repo has a `src/lib.rs::main`).
+                let key = crate::search::scoped_doc_id(&doc.repo, &doc.id);
+                self.store.add(&key, embedding);
+                self.documents.write().insert(key, doc.clone());
             }
             Ok(())
         })
     }
 
-    /// Search for similar code
+    /// Search for similar code across every indexed repository
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<NeuralSearchResult>> {
+        self.search_in(query, k, None)
+    }
+
+    /// Search for similar code, optionally restricted to one repository.
+    ///
+    /// The filter is applied while ranking vectors, not after: asking for `k`
+    /// hits in a repository returns `k` hits from that repository instead of
+    /// whatever survives a global top-`k`.
+    pub fn search_in(
+        &self,
+        query: &str,
+        k: usize,
+        repo: Option<&str>,
+    ) -> Result<Vec<NeuralSearchResult>> {
         let query_embedding = self.backend.embed(query)?;
-        let results = self.store.search(&query_embedding, k);
 
         let documents = self.documents.read();
+        let results = match repo {
+            None => self.store.search(&query_embedding, k),
+            Some(repo) => self.store.search_filtered(&query_embedding, k, |id| {
+                documents.get(id).is_some_and(|doc| &*doc.repo == repo)
+            }),
+        };
+
         Ok(results
             .into_iter()
             .filter_map(|(id, similarity)| {
@@ -999,20 +1114,46 @@ impl NeuralEngine {
             .collect())
     }
 
-    /// Find code similar to a specific document
-    pub fn find_similar(&self, doc_id: &str, k: usize) -> Result<Vec<NeuralSearchResult>> {
+    /// Repositories that currently have indexed vectors.
+    pub fn indexed_repos(&self) -> Vec<String> {
+        let mut repos: Vec<String> = self
+            .documents
+            .read()
+            .values()
+            .map(|doc| doc.repo.to_string())
+            .filter(|repo| !repo.is_empty())
+            .collect();
+        repos.sort();
+        repos.dedup();
+        repos
+    }
+
+    /// Find code similar to a specific document of a repository. Matches are
+    /// restricted to that repository: "what else looks like this" is about the
+    /// codebase the document lives in.
+    pub fn find_similar(
+        &self,
+        repo: &str,
+        doc_id: &str,
+        k: usize,
+    ) -> Result<Vec<NeuralSearchResult>> {
+        let key = crate::search::scoped_doc_id(repo, doc_id);
+
         let documents = self.documents.read();
-        let doc = documents.get(doc_id).context("Document not found")?.clone();
+        let doc = documents.get(&key).context("Document not found")?.clone();
         drop(documents);
 
         // Re-embed the document content to get its embedding
         let embedding = self.backend.embed(&doc.content)?;
-        let results = self.store.search(&embedding, k + 1);
 
         let documents = self.documents.read();
+        let results = self.store.search_filtered(&embedding, k + 1, |id| {
+            documents.get(id).is_some_and(|doc| &*doc.repo == repo)
+        });
+
         Ok(results
             .into_iter()
-            .filter(|(id, _)| id != doc_id) // Exclude self
+            .filter(|(id, _)| id != &key) // Exclude self
             .take(k)
             .filter_map(|(id, similarity)| {
                 documents.get(&id).map(|doc| NeuralSearchResult {
@@ -1670,21 +1811,214 @@ mod tests {
                 768,
             );
 
-            // Text too long
+            // An over-long text must NOT be rejected: the request is attempted
+            // with the text clamped. It still fails here, but on the network
+            // (api.example.com does not resolve), never on length validation.
             let long_text = "a".repeat(40_000);
-            let result = embedder.embed_batch(&[long_text]);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+            let err = embedder
+                .embed_batch(&[long_text])
+                .expect_err("no server behind the test endpoint");
+            assert!(
+                !err.to_string().contains("exceeds maximum"),
+                "over-long text must be truncated, not rejected: {err}"
+            );
 
-            // Multiple texts, one too long
+            // One over-long text must not take its batch neighbours down with it.
             let texts = vec![
                 "normal text".to_string(),
                 "a".repeat(40_000),
                 "another normal text".to_string(),
             ];
-            let result = embedder.embed_batch(&texts);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("index 1"));
+            let err = embedder.embed_batch(&texts).expect_err("no server");
+            assert!(!err.to_string().contains("index 1"), "got: {err}");
+        }
+
+        /// The point of the fix is what actually goes on the wire, so assert on
+        /// the request body rather than on the absence of an error.
+        #[test]
+        fn test_oversized_input_is_clamped_on_the_wire() {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().unwrap().port();
+
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(&stream);
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().expect("content-length");
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).expect("body");
+
+                let mut stream = &stream;
+                let payload = br#"{"data":[{"embedding":[0.0,0.0,0.0]}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                stream.write_all(payload).unwrap();
+                stream.flush().unwrap();
+                String::from_utf8(body).expect("utf8 body")
+            });
+
+            let embedder = ApiEmbedder::custom(
+                &format!("http://127.0.0.1:{port}/v1/embeddings"),
+                "test-model",
+                None,
+                3,
+            );
+            // 40k chars of Cyrillic: over the cap, and its byte length makes a
+            // naive slice land mid-codepoint.
+            let huge = "Процедура ".repeat(4_000);
+            assert!(huge.len() > MAX_TEXT_LENGTH);
+            embedder.embed_batch(&[huge]).expect("embed");
+
+            let body = server.join().expect("server thread");
+            let sent: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let sent = sent["input"][0].as_str().expect("input[0]");
+            assert!(
+                sent.len() <= MAX_TEXT_LENGTH,
+                "sent {} bytes, cap is {MAX_TEXT_LENGTH}",
+                sent.len()
+            );
+            assert!(
+                sent.len() > MAX_TEXT_LENGTH - 4,
+                "should clamp at the cap, not far below it: {}",
+                sent.len()
+            );
+            assert!(sent.starts_with("Процедура "), "prefix must be preserved");
+        }
+
+        /// A width mismatch is a configuration error that never heals: every
+        /// later batch fails identically while semantic search quietly runs on
+        /// TF-IDF. The message has to carry the remedy, not just an index.
+        #[test]
+        fn dimension_mismatch_error_names_model_widths_and_the_flag() {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().unwrap().port();
+
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(&stream);
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().expect("content-length");
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).expect("body");
+
+                // Three values where the caller expects five.
+                let payload = br#"{"data":[{"embedding":[0.0,0.1,0.2]}]}"#;
+                let mut stream = &stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                stream.write_all(payload).unwrap();
+                stream.flush().unwrap();
+            });
+
+            let embedder = ApiEmbedder::custom(
+                &format!("http://127.0.0.1:{port}/v1/embeddings"),
+                "pretend-bge-m3",
+                None,
+                5,
+            );
+            let err = embedder
+                .embed_batch(&["anything".to_string()])
+                .expect_err("width mismatch must be an error");
+            let msg = err.to_string();
+
+            assert!(msg.contains("pretend-bge-m3"), "must name the model: {msg}");
+            assert!(
+                msg.contains('3') && msg.contains('5'),
+                "must give both widths: {msg}"
+            );
+            assert!(
+                msg.contains("--neural-dimension 3"),
+                "must state the flag and the value to use: {msg}"
+            );
+            assert!(
+                msg.contains("TF-IDF"),
+                "must say what silently happens instead: {msg}"
+            );
+        }
+
+        /// The truncation counter feeds the only diagnostic this clamp has.
+        /// Counting clamped texts whose length equals the cap reported zero on
+        /// Cyrillic input, where the boundary pulls the cut a byte short.
+        #[test]
+        fn test_clamp_counts_truncations_on_multibyte_input() {
+            let huge = "Процедура ОбработкаПроведения() ".repeat(2_000);
+            assert!(huge.len() > MAX_TEXT_LENGTH);
+
+            let inputs = vec!["short".to_string(), huge, "also short".to_string()];
+            let (clamped, truncated) = clamp_embedding_inputs(&inputs);
+
+            assert_eq!(truncated, 1, "the over-long text was not counted");
+            assert_eq!(clamped.len(), 3);
+            assert_eq!(clamped[0], "short");
+            assert_eq!(clamped[2], "also short");
+            assert!(clamped[1].len() <= MAX_TEXT_LENGTH);
+            assert_eq!(
+                clamped[1].len(),
+                MAX_TEXT_LENGTH - 1,
+                "this input is the case a cap-equality check misses"
+            );
+        }
+
+        #[test]
+        fn test_clamp_leaves_short_inputs_alone() {
+            let inputs = vec!["fn main() {}".to_string()];
+            let (clamped, truncated) = clamp_embedding_inputs(&inputs);
+            assert_eq!(truncated, 0);
+            assert_eq!(clamped, vec!["fn main() {}"]);
+        }
+
+        #[test]
+        fn test_truncation_lands_on_char_boundary() {
+            // MAX_TEXT_LENGTH bytes can fall mid-codepoint in Cyrillic (2 bytes
+            // per char), where naive byte slicing panics.
+            let cyrillic = "Процедура".repeat(10_000);
+            assert!(cyrillic.len() > MAX_TEXT_LENGTH);
+            let cut = cyrillic.floor_char_boundary(MAX_TEXT_LENGTH);
+            assert!(cyrillic.is_char_boundary(cut));
+            assert!(cut <= MAX_TEXT_LENGTH);
+            // The slice itself must not panic.
+            let _ = &cyrillic[..cut];
+
+            let embedder = ApiEmbedder::custom(
+                "https://api.example.com/embeddings",
+                "test-model",
+                Some("test-key"),
+                768,
+            );
+            let err = embedder.embed_batch(&[cyrillic]).expect_err("no server");
+            assert!(!err.to_string().contains("exceeds maximum"), "got: {err}");
         }
 
         #[test]
@@ -1756,6 +2090,37 @@ mod tests {
         assert_eq!(default_dimension_for_model(Some("my-voyage-model")), 1536);
     }
 
+    /// bge-m3 is 1024-dimensional. Resolving it to the 1536 fallback made every
+    /// embedding batch fail with a single warning while semantic search quietly
+    /// ran on TF-IDF instead.
+    #[test]
+    fn locally_served_models_resolve_to_their_native_dimension() {
+        assert_eq!(default_dimension_for_model(Some("bge-m3")), 1024);
+        assert_eq!(default_dimension_for_model(Some("bge-large-en-v1.5")), 1024);
+        assert_eq!(default_dimension_for_model(Some("bge-base-en-v1.5")), 768);
+        assert_eq!(default_dimension_for_model(Some("bge-small-en-v1.5")), 384);
+        assert_eq!(default_dimension_for_model(Some("mxbai-embed-large")), 1024);
+        assert_eq!(default_dimension_for_model(Some("nomic-embed-text")), 768);
+        assert_eq!(default_dimension_for_model(Some("all-minilm")), 384);
+    }
+
+    /// Ollama names models `name:tag`; the tag does not change the width.
+    #[test]
+    fn ollama_model_tags_are_ignored_when_resolving_dimension() {
+        assert_eq!(default_dimension_for_model(Some("bge-m3:latest")), 1024);
+        assert_eq!(default_dimension_for_model(Some("bge-m3:567m")), 1024);
+        assert_eq!(
+            default_dimension_for_model(Some("nomic-embed-text:v1.5")),
+            768
+        );
+        assert_eq!(
+            default_dimension_for_model(Some("text-embedding-3-large:latest")),
+            3072
+        );
+        // An unknown model still falls back, tag or not.
+        assert_eq!(default_dimension_for_model(Some("mystery-model:7b")), 1536);
+    }
+
     #[test]
     fn test_dimensions_field_in_embed_batch_request() {
         // Verify that only OpenAI text-embedding-3-* models get the dimensions field
@@ -1777,6 +2142,28 @@ mod tests {
         // Voyage should NOT get dimensions field
         let voyage = ApiEmbedder::voyage("key");
         assert!(!voyage.model.starts_with("text-embedding-3-"));
+    }
+
+    /// `search_filtered` backs repo-scoped `neural_search`: the filter is
+    /// applied before the top-k cut, so a repository's own best hits are not
+    /// crowded out by higher-scoring documents from other repositories.
+    #[test]
+    fn test_vector_store_search_filtered_applies_before_top_k() {
+        let store = SimpleVectorStore::new(2);
+        store.add("alpha::wanted", &[1.0, 0.0]);
+        store.add("beta::noise_a", &[1.0, 0.0]);
+        store.add("beta::noise_b", &[1.0, 0.0]);
+
+        let unfiltered = store.search(&[1.0, 0.0], 2);
+        assert_eq!(unfiltered.len(), 2);
+
+        let scoped = store.search_filtered(&[1.0, 0.0], 2, |id| id.starts_with("alpha::"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].0, "alpha::wanted");
+
+        assert!(store
+            .search_filtered(&[1.0, 0.0], 2, |id| id.starts_with("gamma::"))
+            .is_empty());
     }
 
     #[test]

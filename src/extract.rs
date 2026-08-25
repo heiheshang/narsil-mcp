@@ -71,10 +71,13 @@ pub fn extract_excerpts(
         return vec![];
     }
 
-    // Calculate ranges for each match
+    // Calculate ranges for each match. Anchors are clamped to the file's
+    // real line count: an out-of-range anchor must degrade gracefully, not
+    // index past the end of `lines` during scope expansion.
     let mut ranges: Vec<(usize, usize, Vec<usize>)> = match_lines
         .iter()
         .map(|&line| {
+            let line = line.clamp(1, total_lines);
             let start = line.saturating_sub(config.context_before + 1);
             let end = (line + config.context_after).min(total_lines);
             (start, end, vec![line])
@@ -296,13 +299,13 @@ fn format_excerpt(
         .map(|(i, line)| {
             let line_num = start_offset + i + 1;
             let marker = if match_set.contains(&line_num) {
-                "â†’"
+                "→"
             } else {
                 " "
             };
 
             if include_line_numbers {
-                format!("{} {:4} â”‚ {}", marker, line_num, line)
+                format!("{} {:4} │ {}", marker, line_num, line)
             } else {
                 format!("{} {}", marker, line)
             }

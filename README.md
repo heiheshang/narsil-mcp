@@ -254,7 +254,7 @@ narsil-mcp \
   --repos ~/projects/my-app \
   --git \           # Enable git blame, history, contributors
   --call-graph \    # Enable function call analysis
-  --persist \       # Save index to disk for fast startup
+  --persist \       # Cache symbols on disk: a restart skips re-parsing unchanged files
   --watch \         # Auto-reindex on file changes
   --lsp \           # Enable LSP for hover, go-to-definition
   --streaming \     # Stream large result sets
@@ -563,7 +563,9 @@ claude
 
 Using `.` for `--repos` automatically indexes the current directory. Claude now has access to 90 code intelligence tools.
 
-> **Tip**: Add `--persist --index-path .claude/cache` for faster startup on subsequent runs.
+> **Tip**: Add `--persist --index-path .claude/cache` for faster startup on subsequent
+> runs — the cached symbols let a restart skip tree-sitter parsing for files that have
+> not changed. (Skipped when `--call-graph` is on: the call graph needs the parse trees.)
 
 For global configuration, edit `~/.claude/settings.json` instead. See [Claude Code Integration](docs/playbooks/integrations/claude-code.md) for advanced setups.
 
@@ -752,7 +754,7 @@ const symbols = client.findSymbols('Handler');
 | Tool | Description |
 |------|-------------|
 | `search_code` | Keyword search with relevance ranking |
-| `semantic_search` | BM25-ranked semantic search |
+| `semantic_search` | BM25-ranked semantic search (pass `repo` to scope to one repository) |
 | `hybrid_search` | Combined BM25 + TF-IDF with rank fusion |
 | `search_chunks` | Search over AST-aware code chunks |
 | `find_similar_code` | Find code similar to a snippet (TF-IDF) |
@@ -770,7 +772,7 @@ const symbols = client.findSymbols('Handler');
 
 | Tool | Description |
 |------|-------------|
-| `neural_search` | Semantic search using neural embeddings (finds similar code even with different names) |
+| `neural_search` | Semantic search using neural embeddings (finds similar code even with different names; pass `repo` to scope to one repository) |
 | `find_semantic_clones` | Find Type-3/4 semantic clones of a function |
 | `get_neural_stats` | Neural embedding index statistics |
 
@@ -784,6 +786,25 @@ const symbols = client.findSymbols('Handler');
 | `find_call_path` | Find path between two functions |
 | `get_complexity` | Get cyclomatic/cognitive complexity |
 | `get_function_hotspots` | Find highly connected functions |
+
+Function arguments accept a bare name (`Handle`), a qualified method
+(`Server.Handle`, `Server::Handle`) or a graph key. Methods are keyed
+`file::Type::name` (`internal/api/api.go::Server::Handle`), free functions
+`file::name`, so two same-named methods on different types are distinct nodes.
+
+**Resolution limits.** A call is still resolved by name: an unqualified
+`x.Handle()` cannot be tied to the type of `x` without type inference, so it
+is attributed to a receiver type named by the qualifier (`Server::Handle()`),
+else to a same-named function in the caller's own file, else to a module
+matching the qualifier, else — deterministically — to the first candidate
+alphabetically. When a name is ambiguous, `get_callers` / `get_callees` say
+so and list the other candidates with their types instead of silently picking
+one; query by `Type.name` to pin down the one you mean.
+
+Every edge records what it was matched on, and the listings mark the weak
+ones: `name match only` (several namesakes, nothing to choose between them),
+`same-file match`, `not in graph` (third-party or standard library), plus a
+count of each below the list.
 
 ### Control Flow Analysis
 

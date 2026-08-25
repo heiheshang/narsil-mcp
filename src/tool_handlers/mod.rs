@@ -197,11 +197,12 @@ impl ToolRegistry {
         engine: &CodeIntelEngine,
         args: Value,
     ) -> Result<String> {
-        self.handlers
+        let handler = self
+            .handlers
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?
-            .execute(engine, args)
-            .await
+            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
+        validate_tool_args(name, &args, ArgValidationMode::from_env())?;
+        handler.execute(engine, args).await
     }
 
     /// Check if a tool exists
@@ -221,11 +222,137 @@ impl Default for ToolRegistry {
     }
 }
 
+/// How strictly tool arguments are checked against the tool's `input_schema`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgValidationMode {
+    /// Unknown or missing-required arguments fail the call (default)
+    Strict,
+    /// Problems are logged as warnings; the call proceeds
+    Warn,
+    /// No validation
+    Off,
+}
+
+impl ArgValidationMode {
+    /// Resolved once from `NARSIL_ARG_VALIDATION` (strict | warn | off).
+    pub fn from_env() -> Self {
+        static MODE: std::sync::OnceLock<ArgValidationMode> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            match std::env::var("NARSIL_ARG_VALIDATION")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str()
+            {
+                "off" => ArgValidationMode::Off,
+                "warn" => ArgValidationMode::Warn,
+                _ => ArgValidationMode::Strict,
+            }
+        })
+    }
+}
+
+/// Validate tool-call arguments against the tool's declared `input_schema`.
+///
+/// Historically unknown argument keys were silently dropped, so a call like
+/// `search_code(path=...)` "succeeded" with the filter ignored. This rejects
+/// unknown keys (listing the accepted ones) and enforces `required` keys.
+/// A `required` key is also satisfied by any property whose description is
+/// `"Alias for '<key>'"`. Keys starting with `_` are reserved and ignored.
+/// Tools without registered metadata are not validated.
+pub fn validate_tool_args(tool: &str, args: &Value, mode: ArgValidationMode) -> Result<()> {
+    if mode == ArgValidationMode::Off {
+        return Ok(());
+    }
+    let Some(meta) = crate::tool_metadata::get_tool_metadata(tool) else {
+        return Ok(());
+    };
+    let Some(props) = meta
+        .input_schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+    else {
+        return Ok(());
+    };
+
+    let mut problems: Vec<String> = Vec::new();
+
+    let empty = serde_json::Map::new();
+    let obj = match args {
+        Value::Null => &empty,
+        Value::Object(o) => o,
+        other => {
+            problems.push(format!(
+                "arguments must be a JSON object, got {}",
+                match other {
+                    Value::Array(_) => "an array",
+                    Value::String(_) => "a string",
+                    Value::Number(_) => "a number",
+                    Value::Bool(_) => "a boolean",
+                    _ => "an unexpected value",
+                }
+            ));
+            &empty
+        }
+    };
+
+    for key in obj.keys() {
+        if !key.starts_with('_') && !props.contains_key(key) {
+            problems.push(format!("unknown parameter '{}'", key));
+        }
+    }
+
+    // alias property -> canonical key, from "Alias for 'X'" descriptions
+    fn alias_of(prop: &Value) -> Option<&str> {
+        prop.get("description")
+            .and_then(|d| d.as_str())
+            .and_then(|d| d.strip_prefix("Alias for '"))
+            .and_then(|rest| rest.split('\'').next())
+    }
+    let present = |k: &str| obj.get(k).is_some_and(|v| !v.is_null());
+
+    if let Some(required) = meta.input_schema.get("required").and_then(|r| r.as_array()) {
+        for req in required.iter().filter_map(|v| v.as_str()) {
+            let satisfied = present(req)
+                || props
+                    .iter()
+                    .any(|(k, v)| alias_of(v) == Some(req) && present(k));
+            if !satisfied {
+                problems.push(format!("missing required parameter '{}'", req));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+
+    let mut accepted: Vec<&str> = props.keys().map(|k| k.as_str()).collect();
+    accepted.sort_unstable();
+    let msg = format!(
+        "Invalid arguments for tool '{}': {}. Accepted parameters: {}",
+        tool,
+        problems.join("; "),
+        accepted.join(", ")
+    );
+    match mode {
+        ArgValidationMode::Strict => Err(anyhow::anyhow!(msg)),
+        ArgValidationMode::Warn => {
+            tracing::warn!("{}", msg);
+            Ok(())
+        }
+        ArgValidationMode::Off => Ok(()),
+    }
+}
+
 /// Helper trait for extracting arguments from JSON
 pub trait ArgExtractor {
     fn get_str(&self, key: &str) -> Option<&str>;
+    /// First present string value among several accepted key spellings
+    fn get_str_any(&self, keys: &[&str]) -> Option<&str>;
     fn get_str_or(&self, key: &str, default: &str) -> String;
     fn get_u64(&self, key: &str) -> Option<u64>;
+    /// First present integer value among several accepted key spellings
+    fn get_u64_any(&self, keys: &[&str]) -> Option<u64>;
     fn get_u64_or(&self, key: &str, default: u64) -> u64;
     fn get_bool(&self, key: &str) -> Option<bool>;
     fn get_bool_or(&self, key: &str, default: bool) -> bool;
@@ -237,12 +364,20 @@ impl ArgExtractor for Value {
         self.get(key).and_then(|v| v.as_str())
     }
 
+    fn get_str_any(&self, keys: &[&str]) -> Option<&str> {
+        keys.iter().find_map(|k| self.get_str(k))
+    }
+
     fn get_str_or(&self, key: &str, default: &str) -> String {
         self.get_str(key).unwrap_or(default).to_string()
     }
 
     fn get_u64(&self, key: &str) -> Option<u64> {
         self.get(key).and_then(|v| v.as_u64())
+    }
+
+    fn get_u64_any(&self, keys: &[&str]) -> Option<u64> {
+        keys.iter().find_map(|k| self.get_u64(k))
     }
 
     fn get_u64_or(&self, key: &str, default: u64) -> u64 {
