@@ -6,7 +6,20 @@ allowed-tools: mcp__narsil-mcp__*
 
 # Narsil Code Intelligence
 
-Narsil is an MCP server providing **90 code intelligence tools** (plus 2 prompts: `explain_codebase`, `find_implementation`). This skill helps you use them effectively.
+Narsil is an MCP server providing **90 code intelligence tools** (plus 2 prompts: `explain_codebase`, `find_implementation`). This skill is the catalogue: what exists and which tool covers which task.
+
+## Focused skills
+
+The catalogue tells you *what* to call. These tell you *when*, and how to report
+the result without overstating it - load the one that matches the question:
+
+| Skill | Use for |
+|-------|---------|
+| `narsil-search` | Locating code by name, string, or description; choosing between `search_code`, `hybrid_search`, `neural_search` and friends |
+| `narsil-callgraph` | Who calls what, impact analysis, reachability - and how to read the resolution markers the answers carry |
+| `narsil-static-analysis` | Control/data flow, dead code, unused exports, type inference, import cycles |
+| `narsil-security` | Vulnerability scans, taint tracing, dependency CVEs, licences, SBOM |
+| `narsil-repo-state` | Git history questions, and diagnosing empty or missing tools (flags, presets, index freshness) |
 
 ## Critical: Parameter Naming
 
@@ -93,8 +106,8 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Find all usages (cross-file) | `find_symbol_usages` |
 | See what exports a module has | `get_export_map` |
 | Analyze imports/dependencies | `get_dependencies` |
-| See what calls a function | `get_callers` |
-| See what a function calls | `get_callees` |
+| See what calls a function | `get_callers` (methods are keyed `file::Type::name`; query `Type.method`) |
+| See what a function calls | `get_callees` (entries marked `name match only` / `not in graph` are candidates, not facts) |
 | Full call graph | `get_call_graph` |
 | Find path between functions | `find_call_path` |
 | Function complexity | `get_complexity` |
@@ -251,7 +264,11 @@ For large codebases, use pagination and filtering:
 
 **Empty results from git tools** → Check `get_index_status` shows git enabled
 
-**Empty results from call graph** → Check `get_index_status` shows call-graph enabled
+**Empty results from call graph** → Check `get_index_status` shows call-graph enabled. `*Function ... is not in the call graph.*` means the query never resolved - re-ask with `Type.method` or the full `file::Type::name` key, not that nothing calls it
+
+**A tool is missing from the list entirely** → The preset filters it. The server maps the MCP client name to a preset, and `cursor` maps to *balanced*, which blacklists `neural_search` and `find_semantic_clones`. Force `--preset full` / `NARSIL_PRESET=full` on the server and restart
+
+**`exclude_tests` seems ignored on call-graph tools** → It is. `get_call_graph`, `get_callers`, `get_callees` and `get_function_hotspots` accept the parameter but do not filter; exclude test paths yourself
 
 **Slow searches** → Use `file_pattern` to narrow scope
 

@@ -1052,7 +1052,10 @@ impl CodeIntelEngine {
                 let neural = Arc::clone(neural);
                 match tokio::task::spawn_blocking(move || neural.index_batch(&items)).await {
                     Ok(Ok(())) => info!("Neural embeddings indexed successfully"),
-                    Ok(Err(e)) => warn!("Failed to batch index neural embeddings: {e}"),
+                    Ok(Err(e)) => warn!(
+                        "Failed to batch index neural embeddings — semantic search falls back \
+                         to TF-IDF for these symbols: {e}"
+                    ),
                     Err(e) => warn!("Neural embedding task panicked: {e}"),
                 }
             }

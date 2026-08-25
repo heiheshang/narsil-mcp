@@ -14,14 +14,22 @@ A Claude Code plugin that provides code intelligence capabilities through the na
 | `/narsil:find-feature <description>` | Find where a feature is implemented |
 | `/narsil:supply-chain [repo]` | Analyze supply chain security |
 
-### Skill
+### Skills
 
-The plugin includes a skill that helps Claude effectively use narsil-mcp's 90 tools:
+`narsil` is the catalogue - parameter naming, the task-to-tool tables for all 90
+tools, feature-flag awareness and multi-step patterns.
 
-- **Parameter naming** - Corrects common mistakes (use `repo`, not `repo_path`)
-- **Tool selection** - Picks the right tool for each task
-- **Feature awareness** - Knows which tools require `--git`, `--call-graph`, etc.
-- **Workflow patterns** - Common multi-step analysis patterns
+Five focused skills sit on top of it. Each covers one kind of question, says
+which tool to reach for first, how to read the output without overstating it, and
+where to stop:
+
+| Skill | Covers |
+|-------|--------|
+| `narsil-search` | Locating code by name, string or description; choosing between `search_code`, `hybrid_search`, `neural_search` |
+| `narsil-callgraph` | Callers/callees/reachability, qualified method queries, reading the per-edge resolution markers |
+| `narsil-static-analysis` | Control/data flow, dead code, unused exports, type inference, import cycles |
+| `narsil-security` | Vulnerability scans, taint tracing, dependency CVEs, licences, SBOM |
+| `narsil-repo-state` | Git history, and diagnosing empty or missing tools (flags, presets, index freshness) |
 
 ### MCP Server Configuration
 
@@ -243,9 +251,14 @@ narsil-plugin/
 │   ├── find-feature.md     # /narsil:find-feature
 │   └── supply-chain.md     # /narsil:supply-chain
 ├── skills/
-│   └── narsil/
-│       ├── SKILL.md        # Main skill
-│       └── WORKFLOWS.md    # Detailed workflows
+│   ├── narsil/
+│   │   ├── SKILL.md        # Catalogue: every tool, by task
+│   │   └── WORKFLOWS.md    # Detailed workflows
+│   ├── narsil-search/      # Which search tool, and how to read hits
+│   ├── narsil-callgraph/   # Callers/callees and their confidence markers
+│   ├── narsil-static-analysis/
+│   ├── narsil-security/
+│   └── narsil-repo-state/  # Git history + why a tool is empty or missing
 ├── .mcp.json               # MCP server config
 └── README.md
 ```
