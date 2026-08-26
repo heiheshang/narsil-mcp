@@ -130,7 +130,11 @@ impl GitRepo {
         for line in output.lines() {
             // Commit hash lines start with 40 hex characters followed by space and line numbers
             // Format: "370b2e005d0eb2922ede57d85ddac0a9fab67e07 1 1 5"
-            if line.len() >= 40 && line[..40].chars().all(|c| c.is_ascii_hexdigit()) {
+            // Сравниваем байты, а не срез строки: `line[..40]` паникует, когда
+            // 40-й байт попадает внутрь многобайтового символа. Порционный вывод
+            // `git blame` содержит строку `summary <сообщение коммита>`, и в мелком
+            // клоне (fetch-depth: 1) она достаётся каждой строке файла.
+            if line.len() >= 40 && line.as_bytes()[..40].iter().all(u8::is_ascii_hexdigit) {
                 // This is a commit hash line
                 if !current.commit.is_empty() {
                     results.push(current.clone());
@@ -720,5 +724,43 @@ mod tests {
     fn test_git_valid_file_paths_pass() {
         assert!(GitRepo::validate_input("src/main.rs", "file_path").is_ok());
         assert!(GitRepo::validate_input("tests/integration/test.rs", "file_path").is_ok());
+    }
+
+    /// `git blame --line-porcelain` печатает строку `summary <сообщение коммита>`.
+    /// В мелком клоне (CI использует `actions/checkout` с `fetch-depth: 1`) она
+    /// достаётся каждой строке файла, поэтому сообщение с кириллицей роняло разбор:
+    /// `line[..40]` резал строку по байту, попадавшему внутрь символа.
+    #[test]
+    fn test_parse_blame_porcelain_handles_multibyte_summary() {
+        let repo = GitRepo {
+            root: std::path::PathBuf::from("."),
+        };
+
+        let summary = "summary chore(security): игнорировать .claude/ целиком";
+        // Регрессия воспроизводится, только если 40-й байт внутри символа.
+        assert!(!summary.is_char_boundary(40));
+
+        let porcelain = format!(
+            "0123456789abcdef0123456789abcdef01234567 1 1 1\n\
+             author Test Author\n\
+             author-mail <test@example.com>\n\
+             author-time 1700000000\n\
+             {summary}\n\
+             filename Cargo.toml\n\
+             \t[package]\n"
+        );
+
+        let blame = repo
+            .parse_blame_porcelain(&porcelain)
+            .expect("разбор не должен падать на многобайтовой summary");
+
+        assert_eq!(blame.len(), 1);
+        assert_eq!(blame[0].commit, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(blame[0].author, "Test Author");
+        assert_eq!(blame[0].line_number, 1);
+        assert_eq!(
+            blame[0].summary,
+            "chore(security): игнорировать .claude/ целиком"
+        );
     }
 }
