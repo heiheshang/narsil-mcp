@@ -1669,8 +1669,14 @@ impl CodeIntelEngine {
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = symbol.start_line.saturating_sub(context_lines + 1);
-        let end = (symbol.end_line + context_lines).min(lines.len());
+        // The file on disk may be shorter than it was when the symbol was
+        // indexed, which puts start_line past EOF; clamp instead of aborting.
+        let range = crate::text::clamp_line_range(
+            symbol.start_line.saturating_sub(context_lines + 1),
+            symbol.end_line + context_lines,
+            lines.len(),
+        );
+        let (start, end) = (range.start, range.end);
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", symbol.name));
@@ -1922,8 +1928,14 @@ impl CodeIntelEngine {
         };
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = start_line.unwrap_or(1).saturating_sub(1);
-        let end = end_line.unwrap_or(lines.len()).min(lines.len());
+        // start_line/end_line are caller-supplied and frequently come from an
+        // index built against a different revision than `git_ref` renders.
+        let range = crate::text::clamp_line_range(
+            start_line.unwrap_or(1).saturating_sub(1),
+            end_line.unwrap_or(lines.len()),
+            lines.len(),
+        );
+        let (start, end) = (range.start, range.end);
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", path));
@@ -7407,9 +7419,12 @@ impl CodeIntelEngine {
 
         // Extract the symbol's code
         let lines: Vec<&str> = content.lines().collect();
-        let start = symbol.start_line.saturating_sub(1);
-        let end = symbol.end_line.min(lines.len());
-        let symbol_code = lines[start..end].join("\n");
+        let symbol_code = lines[crate::text::clamp_line_range(
+            symbol.start_line.saturating_sub(1),
+            symbol.end_line,
+            lines.len(),
+        )]
+        .join("\n");
 
         // Search for similar code — clones of a function belong to the same
         // codebase, so the search stays inside this repository.
@@ -7922,8 +7937,13 @@ impl CodeIntelEngine {
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = center_line.saturating_sub(context + 1);
-        let end = (center_line + context).min(lines.len());
+        // A centre line past EOF would otherwise invert the range.
+        let range = crate::text::clamp_line_range(
+            center_line.saturating_sub(context + 1),
+            center_line + context,
+            lines.len(),
+        );
+        let (start, end) = (range.start, range.end);
 
         let excerpt: String = lines[start..end]
             .iter()

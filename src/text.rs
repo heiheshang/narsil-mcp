@@ -51,6 +51,26 @@ pub fn is_truncated(s: &str, max_bytes: usize) -> bool {
     s.len() > max_bytes
 }
 
+/// A `start..end` line range clamped to fit `len` lines, in that order.
+///
+/// The sibling of the byte-boundary helpers above, for the other way a slice
+/// panics: `lines[start..end]` aborts the process when `start` runs past the
+/// end of the file or past `end`. Line numbers reaching these call sites are
+/// user input (`get_file`) or indexed positions replayed against content that
+/// has since been edited, checked out at another ref, or truncated — so the
+/// out-of-range case is routine, not defensive padding. With
+/// `panic = "abort"` in the release profile a single such call takes down the
+/// whole server, so every line-range slice goes through here.
+///
+/// `start` is clamped to `len`, then `end` to `start..=len`, which makes the
+/// range always valid and possibly empty.
+#[must_use]
+pub fn clamp_line_range(start: usize, end: usize, len: usize) -> std::ops::Range<usize> {
+    let start = start.min(len);
+    let end = end.clamp(start, len);
+    start..end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +163,36 @@ mod tests {
         assert_eq!(truncate_start(emoji, 5), "🔥");
         assert_eq!(truncate(emoji, 0), "");
         assert_eq!(truncate_start(emoji, 0), "");
+    }
+
+    #[test]
+    fn test_clamp_line_range_never_panics() {
+        let lines: Vec<&str> = "a\nb".lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // The reproduction from the field report: get_file(.., Some(500), Some(600))
+        // on a two-line file used to abort with "range start index 499 out of
+        // range for slice of length 2".
+        let r = clamp_line_range(499, 600, lines.len());
+        assert!(
+            lines.get(r.clone()).is_some(),
+            "range {r:?} is not sliceable"
+        );
+        assert!(lines[r].is_empty());
+
+        // Inverted ranges (centre line past EOF) collapse instead of panicking.
+        for start in 0..6 {
+            for end in 0..6 {
+                let r = clamp_line_range(start, end, lines.len());
+                assert!(
+                    lines.get(r.clone()).is_some(),
+                    "clamp({start}, {end}, 2) produced unsliceable {r:?}"
+                );
+            }
+        }
+
+        // In-range requests are passed through untouched.
+        assert_eq!(clamp_line_range(0, 2, 2), 0..2);
+        assert_eq!(clamp_line_range(1, 2, 2), 1..2);
     }
 }

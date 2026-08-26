@@ -285,14 +285,19 @@ impl WasmCodeIntel {
         let content = self.files.get(path)?;
         let lines: Vec<&str> = content.lines().collect();
 
-        let start = start_line.saturating_sub(1);
-        let end = end_line.min(lines.len());
-
-        if start >= lines.len() {
+        if start_line.saturating_sub(1) >= lines.len() {
             return None;
         }
 
-        Some(lines[start..end].join("\n"))
+        // end_line below start_line would invert the range and panic.
+        Some(
+            lines[crate::text::clamp_line_range(
+                start_line.saturating_sub(1),
+                end_line,
+                lines.len(),
+            )]
+            .join("\n"),
+        )
     }
 
     /// Get symbol at a specific line
@@ -405,14 +410,18 @@ impl WasmCodeIntel {
         let content = self.files.get(path)?;
         let lines: Vec<&str> = content.lines().collect();
 
-        let start = symbol.start_line.saturating_sub(1);
-        let end = symbol.end_line.min(lines.len());
-
-        if start >= lines.len() {
+        if symbol.start_line.saturating_sub(1) >= lines.len() {
             return None;
         }
 
-        Some(lines[start..end].join("\n"))
+        Some(
+            lines[crate::text::clamp_line_range(
+                symbol.start_line.saturating_sub(1),
+                symbol.end_line,
+                lines.len(),
+            )]
+            .join("\n"),
+        )
     }
 }
 

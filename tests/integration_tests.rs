@@ -938,6 +938,47 @@ fn fourth() {}
     Ok(())
 }
 
+/// A line range past the end of the file must come back as an empty range,
+/// not kill the server. `lines[start..end]` used to abort the process here
+/// ("range start index 499 out of range for slice of length 2"), and with
+/// `panic = "abort"` in the release profile that takes every session with it.
+#[test]
+fn test_get_file_line_range_past_eof_does_not_kill_server() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/tiny.rs", "fn a() {}\nfn b() {}\n")?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_file",
+        json!({
+            "repo": repo_name,
+            "path": "src/tiny.rs",
+            "start_line": 500,
+            "end_line": 600
+        }),
+    )?;
+    assert!(response["error"].is_null());
+
+    // The real assertion: the server is still answering afterwards.
+    let alive = server.call_tool(
+        "get_file",
+        json!({
+            "repo": repo_name,
+            "path": "src/tiny.rs"
+        }),
+    )?;
+    assert!(alive["error"].is_null());
+    let content = alive["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(content.contains("fn a"));
+
+    Ok(())
+}
+
 #[test]
 fn test_find_references() -> Result<()> {
     let repo = TestRepo::new()?;
