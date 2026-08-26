@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-08-26
+
+Flow analysis for BSL (1С:Предприятие). `get_control_flow` and
+`get_data_flow` answered `Function 'X' not found` for every 1C function,
+while `find_symbols` located the same function by file and line — an answer
+that reads as *there is no such function* and meant *this language is
+unsupported*.
+
+### Fixed
+
+- Control flow is built for BSL procedures and functions. `Процедура` is a
+  node type of its own that the function walk never listed, so nearly every
+  1C event handler was invisible; and the grammar has no body node at all —
+  statements hang directly off the definition, off `Если`, `Пока` and
+  `Попытка` — so the search for a `block` wrapper found nothing and `Функция`
+  failed too. Conditions live in an unnamed `expression`, which left every
+  branch labelled with an empty condition.
+- `ИначеЕсли` chains are branches of their own. Their statements were dropped
+  from the graph entirely rather than appearing anywhere.
+- `Попытка`/`Исключение` are split on the keyword token, there being no clause
+  wrapper to find. Both halves used to be dropped.
+- BSL statements are recognised: assignment, `Перем`, call, and
+  `ВызватьИсключение`.
+- Data flow no longer requires a lower-case first letter to accept an
+  identifier as a variable. That rule tells a variable from a type in Rust and
+  Python; BSL capitalises everything, so every read in a 1C module was
+  discarded and every assignment then looked like a store nobody read.
+- Numeric literals, words inside string literals and the name of a called
+  function are no longer counted as variables read, and an assignment's own
+  target is no longer counted as a read of itself.
+- A write to a property (`Запрос.Текст = …`, `Элементы.X.Заголовок = …`) is
+  recorded as an effect rather than a store, and a write to a parameter is
+  not reported dead: BSL passes by reference unless a parameter is declared
+  `Знач`, so `Отказ = Истина` is what a validation handler exists to do.
+  `Знач` is not distinguished, so a genuinely dead write to a by-value
+  parameter is missed — a cheaper error than accusing every validation
+  handler in a configuration.
+- A statement's full text is kept and truncated only when rendered. Data flow
+  mines that text for the variables a statement reads, and cutting it at 100
+  characters hid every read past the cut — 1C statements are long and its
+  identifiers are whole words.
+- The iteration variable of `Для Каждого` is bound on entry to the loop body,
+  and the loop header carries its own source rather than a synthetic label
+  that was read back as a variable named `enhanced`.
+
 ## [1.9.1] - 2026-08-26
 
 Follow-up to an adversarial review of 1.9.0 run by three agents over separate
