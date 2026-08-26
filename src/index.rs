@@ -624,7 +624,22 @@ impl CodeIntelEngine {
                     match store.load_call_graph(repo_path) {
                         Ok(Some(json)) => {
                             if let Some(cg) = self.call_graphs.get(&repo_name) {
-                                if let Err(e) = cg.from_json(&json) {
+                                // A graph that was just built from source is
+                                // authoritative and the snapshot is not:
+                                // `--call-graph` forces a full re-walk (symbol
+                                // reuse is disabled because the call graph
+                                // needs the parse trees), so loading on top
+                                // could only resurrect functions the code no
+                                // longer defines. The snapshot is still worth
+                                // having when nothing was built this run — an
+                                // unreadable or unwalked repository.
+                                if cg.node_count() > 0 {
+                                    debug!(
+                                        "Call-graph for {} was rebuilt from source; \
+                                         ignoring the persisted snapshot",
+                                        repo_name
+                                    );
+                                } else if let Err(e) = cg.from_json(&json) {
                                     warn!(
                                         "Failed to load persisted call-graph for {}: {}",
                                         repo_name, e
