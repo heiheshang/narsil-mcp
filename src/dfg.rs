@@ -325,8 +325,15 @@ impl<'a> DfgAnalyzer<'a> {
                         let idx = self.next_def_index(*block_id);
                         let def_id = DefId::new(variable, *block_id, stmt.line, idx);
 
-                        // Extract uses from expression
-                        let uses = self.extract_uses_from_text(&stmt.text, *block_id, stmt.line);
+                        // Only the right-hand side is read. Mining the whole
+                        // statement counted the assignment's own target as a
+                        // read of itself, which both masked dead stores and
+                        // reported the target as used before it was defined.
+                        let uses = self.extract_uses_from_text(
+                            assignment_rhs(&stmt.text),
+                            *block_id,
+                            stmt.line,
+                        );
 
                         self.definitions.push(Definition {
                             id: def_id.clone(),
@@ -397,47 +404,46 @@ impl<'a> DfgAnalyzer<'a> {
 
     fn extract_uses_from_text(&self, text: &str, block: BlockId, line: usize) -> Vec<Use> {
         // Simplified: extract identifiers that look like variable names
+        let capitalised = capitalises_variables(&self.cfg.file_path);
+        let chars: Vec<char> = text.chars().collect();
         let mut uses = Vec::new();
-        let mut current_ident = String::new();
+        let mut start = None;
+        let mut in_string = false;
 
-        for c in text.chars() {
-            if c.is_alphanumeric() || c == '_' {
-                current_ident.push(c);
-            } else {
-                if !current_ident.is_empty()
-                    && current_ident
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_lowercase())
-                    && !is_keyword(&current_ident)
-                    && !is_type_constructor(&current_ident)
-                {
-                    uses.push(Use {
-                        variable: current_ident.clone(),
-                        block,
-                        line,
-                        kind: UseKind::Read,
-                    });
-                }
-                current_ident.clear();
+        for i in 0..=chars.len() {
+            // Words inside a string literal are prose, not variables:
+            // `ВызватьИсключение "нет значения"` was reporting `нет` and
+            // `значения` as variables read before assignment.
+            if chars.get(i) == Some(&'"') {
+                in_string = !in_string;
             }
-        }
-
-        // Don't forget last identifier
-        if !current_ident.is_empty()
-            && current_ident
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase())
-            && !is_keyword(&current_ident)
-            && !is_type_constructor(&current_ident)
-        {
-            uses.push(Use {
-                variable: current_ident,
-                block,
-                line,
-                kind: UseKind::Read,
-            });
+            let is_ident_char = !in_string
+                && chars
+                    .get(i)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_');
+            match (is_ident_char, start) {
+                (true, None) => start = Some(i),
+                (false, Some(from)) => {
+                    let ident: String = chars[from..i].iter().collect();
+                    // A numeric literal is not a name.
+                    let is_number = ident.chars().next().is_some_and(|c| c.is_numeric());
+                    if !is_number
+                        && !is_call_target(&chars, i)
+                        && identifier_may_be_variable(&ident, capitalised)
+                        && !is_keyword(&ident)
+                        && !is_type_constructor(&ident)
+                    {
+                        uses.push(Use {
+                            variable: ident,
+                            block,
+                            line,
+                            kind: UseKind::Read,
+                        });
+                    }
+                    start = None;
+                }
+                _ => {}
+            }
         }
 
         uses
@@ -775,6 +781,67 @@ fn is_copy_type(var_name: &str) -> bool {
         || name_lower == "result" // Often bool or numeric result
 }
 
+/// The right-hand side of an assignment's source text.
+///
+/// Splits on the first `=` that is an assignment rather than part of a
+/// comparison (`==`, `<=`, `>=`, `!=`, `<>`). Returns the whole text when
+/// there is no such `=`, so a statement of another shape is left alone.
+fn assignment_rhs(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        if c != b'=' {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| bytes[p]);
+        let next = bytes.get(i + 1).copied();
+        let is_comparison = matches!(prev, Some(b'=' | b'!' | b'<' | b'>'))
+            || next == Some(b'=')
+            || matches!(
+                prev,
+                Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+            );
+        if !is_comparison {
+            return text[i + 1..].trim_start();
+        }
+    }
+    text
+}
+
+/// Whether the identifier ending at `end` is the callee of a call rather than
+/// a variable being read.
+///
+/// Counting `Сообщить` in `Сообщить(Счетчик)` as a read invented a use of
+/// every function called, and the uninitialised-variable pass then reported
+/// each of those functions as a variable that was never assigned.
+fn is_call_target(chars: &[char], end: usize) -> bool {
+    chars[end..]
+        .iter()
+        .find(|c| !c.is_whitespace())
+        .is_some_and(|c| *c == '(')
+}
+
+/// Whether `ident` can be a variable name under the naming convention of the
+/// language it came from.
+///
+/// Rust, Python, Go and friends spell variables in lower case and types in
+/// upper, which is why an upper-case first letter was taken as "this is a
+/// type, not a variable". BSL capitalises *everything* — `Результат`,
+/// `Счетчик`, `Отказ` — so that rule discarded every variable in a 1C module,
+/// and every assignment then looked like a store nobody ever read.
+fn identifier_may_be_variable(ident: &str, capitalised_variables: bool) -> bool {
+    if capitalised_variables {
+        return !ident.is_empty();
+    }
+    ident.chars().next().is_some_and(char::is_lowercase)
+}
+
+/// Whether the language of `file_path` capitalises variable names.
+fn capitalises_variables(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    // BSL and OneScript; both spell locals with a leading capital.
+    lower.ends_with(".bsl") || lower.ends_with(".os")
+}
+
 /// Check if a string is a keyword in any supported language.
 ///
 /// Covers keywords from: Rust, Python, JavaScript/TypeScript, Go, Java, C#, Kotlin, C/C++
@@ -964,6 +1031,61 @@ fn is_keyword(s: &str) -> bool {
             | "goto"
             | "switch"
             | "do"
+            // BSL keywords. Without these, the words the CFG puts into a
+            // statement's own text — and BSL's own control-flow words — were
+            // read back as variables. Both the Russian and English spellings
+            // are accepted by the language, so both are listed.
+            | "Если"
+            | "Тогда"
+            | "ИначеЕсли"
+            | "Иначе"
+            | "КонецЕсли"
+            | "Пока"
+            | "Цикл"
+            | "КонецЦикла"
+            | "Для"
+            | "Каждого"
+            | "Из"
+            | "По"
+            | "Возврат"
+            | "Прервать"
+            | "Продолжить"
+            | "Попытка"
+            | "Исключение"
+            | "КонецПопытки"
+            | "ВызватьИсключение"
+            | "Перем"
+            | "Процедура"
+            | "КонецПроцедуры"
+            | "Функция"
+            | "КонецФункции"
+            | "Новый"
+            | "Экспорт"
+            | "Знач"
+            | "Истина"
+            | "Ложь"
+            | "Неопределено"
+            | "Не"
+            | "И"
+            | "Или"
+            | "ElsIf"
+            | "EndIf"
+            | "EndDo"
+            | "EndProcedure"
+            | "EndFunction"
+            | "EndTry"
+            | "Then"
+            | "Each"
+            | "Var"
+            | "Val"
+            | "Export"
+            | "New"
+            | "Procedure"
+            | "Function"
+            | "Try"
+            | "Except"
+            | "RaiseError"
+            | "Undefined"
     )
 }
 
@@ -2208,6 +2330,62 @@ def example():
             "Python: Should detect 'unused' as dead store. Found: {:?}",
             dead_stores
         );
+    }
+
+    /// Use extraction required an identifier to start with a lower-case
+    /// letter — the Rust/Python convention that tells a variable from a type.
+    /// BSL capitalises everything, so every read in a 1C module was discarded
+    /// and every assignment then looked like a store nobody ever read.
+    #[test]
+    fn test_bsl_reads_are_not_mistaken_for_types() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bsl::LANGUAGE.into())
+            .unwrap();
+
+        let source = "Функция Сумма(Список)\n\tИтог = 0;\n\tЛишний = 5;\n\tДля Каждого Элемент Из Список Цикл\n\t\tИтог = Итог + Элемент;\n\tКонецЦикла;\n\tВозврат Итог;\nКонецФункции\n";
+
+        let tree = parser.parse(source, None).unwrap();
+        let dead_stores = find_dead_stores(&tree, source, "Module.bsl").unwrap();
+
+        assert!(
+            dead_stores.iter().any(|(_, def)| def.variable == "Лишний"),
+            "a store that really is never read must still be reported, found {dead_stores:?}"
+        );
+        assert!(
+            !dead_stores
+                .iter()
+                .any(|(_, def)| def.variable == "Итог" && def.line == 7),
+            "`Итог` is returned on the next line; reporting it dead is a false positive: {dead_stores:?}"
+        );
+    }
+
+    /// Prose inside a string literal, numeric literals, and the name of a
+    /// called function are not variables. Each used to be mined out of a
+    /// statement's text and then reported as read before assignment.
+    #[test]
+    fn test_literals_and_callees_are_not_variable_uses() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bsl::LANGUAGE.into())
+            .unwrap();
+
+        let source = "Процедура Шум()\n\tСообщить(\"нет значения\");\n\tЧисло = 42;\n\tВозврат;\nКонецПроцедуры\n";
+
+        let tree = parser.parse(source, None).unwrap();
+        let analyses = analyze_file(&tree, source, "Module.bsl").unwrap();
+        let used: Vec<&str> = analyses
+            .iter()
+            .flat_map(|a| a.uses.iter())
+            .map(|u| u.variable.as_str())
+            .collect();
+
+        for noise in ["нет", "значения", "42", "Сообщить"] {
+            assert!(
+                !used.contains(&noise),
+                "{noise:?} is not a variable, yet it was recorded as read: {used:?}"
+            );
+        }
     }
 
     #[test]
