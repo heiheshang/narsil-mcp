@@ -319,6 +319,7 @@ impl McpServer {
                         "name": meta.name,
                         "description": meta.description,
                         "inputSchema": meta.input_schema,
+                        "annotations": meta.mcp_annotations(),
                     })
                 })
             })

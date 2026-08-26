@@ -15,6 +15,13 @@ export interface ToolMetadata {
     properties?: Record<string, { type?: string; description?: string }>;
     required?: string[];
   };
+  annotations: {
+    title?: string;
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
 }
 
 /**

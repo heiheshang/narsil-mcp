@@ -16,7 +16,7 @@
     Custom installation directory (default: $env:LOCALAPPDATA\Programs\narsil-mcp)
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/postrv/narsil-mcp/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/heiheshang/narsil-mcp/main/install.ps1 | iex
 
 .EXAMPLE
     .\install.ps1 -FromSource
@@ -35,7 +35,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Configuration
-$Repo = "postrv/narsil-mcp"
+$Repo = "heiheshang/narsil-mcp"
 $BinaryName = "narsil-mcp.exe"
 
 # Colors for output
