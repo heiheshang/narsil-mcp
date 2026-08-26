@@ -50,6 +50,17 @@ jobs:
       - name: Clippy (CI features)
         run: cargo clippy --all-targets --features "$CI_FEATURES" -- -D warnings
 
+      # The frontend feature is built by no other job: release.yml and
+      # build-binaries.yml ship "native,neural,graph", and verify-nix.yml would
+      # catch it but its paths: filter excludes src/**. Release 1.9.0 shipped a
+      # commit fixing a duplicate import that made the feature entirely
+      # unbuildable, and every job stayed green through it. rust-embed is
+      # declared with allow_missing, so this needs no npm build of
+      # frontend/dist — it reuses this job's warm cache and costs a recompile
+      # of the crate itself.
+      - name: Clippy (frontend feature)
+        run: cargo clippy --all-targets --features "$CI_FEATURES,frontend" -- -D warnings
+
   # Main test suite
   test:
     name: Test (${{ matrix.os }})
