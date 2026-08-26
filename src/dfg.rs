@@ -618,9 +618,26 @@ impl<'a> DfgAnalyzer<'a> {
     }
 
     fn find_dead_stores(&self, chains: &[DefUseChain]) -> Vec<DefId> {
+        // In BSL a parameter is by reference unless declared `Знач`, so
+        // assigning one is how a procedure returns a result: `Отказ = Истина`
+        // is the entire point of every `ОбработкаПроверкиЗаполнения` handler.
+        // Reporting those as stores nobody reads would bury the real findings.
+        //
+        // The `Знач` case is not distinguished — the CFG keeps parameter names
+        // only — so a genuinely dead write to a by-value parameter is missed.
+        // A false negative there costs less than accusing every validation
+        // handler in the configuration.
+        let by_reference_params: std::collections::HashSet<&String> =
+            if parameters_are_by_reference(&self.cfg.file_path) {
+                self.cfg.parameters.iter().collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
         chains
             .iter()
             .filter(|c| !c.is_used)
+            .filter(|c| !by_reference_params.contains(&c.definition.variable))
             .map(|c| c.definition.clone())
             .collect()
     }
@@ -833,6 +850,13 @@ fn identifier_may_be_variable(ident: &str, capitalised_variables: bool) -> bool 
         return !ident.is_empty();
     }
     ident.chars().next().is_some_and(char::is_lowercase)
+}
+
+/// Whether the language of `file_path` passes parameters by reference, making
+/// an assignment to one an output rather than a local store.
+fn parameters_are_by_reference(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    lower.ends_with(".bsl") || lower.ends_with(".os")
 }
 
 /// Whether the language of `file_path` capitalises variable names.

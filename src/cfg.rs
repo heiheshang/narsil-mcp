@@ -405,9 +405,14 @@ impl ControlFlowGraph {
             if !block.statements.is_empty() {
                 md.push_str("```\n");
                 for stmt in &block.statements {
+                    // Statements are stored whole so data flow can read them;
+                    // one line of a report is not the place to print all of a
+                    // 400-character 1C call.
                     md.push_str(&format!(
                         "{:4}: {:?} - {}\n",
-                        stmt.line, stmt.kind, stmt.text
+                        stmt.line,
+                        stmt.kind,
+                        crate::text::truncate_with_ellipsis(stmt.text.trim(), 160)
                     ));
                 }
                 md.push_str("```\n\n");
@@ -744,12 +749,14 @@ impl CfgBuilder {
     ) -> Result<BlockId> {
         let kind = node.kind();
         let line = node.start_position().row + 1;
-        let text = node
-            .utf8_text(source)
-            .unwrap_or("")
-            .chars()
-            .take(100)
-            .collect::<String>();
+        // The whole statement, not a prefix: the data-flow pass mines this
+        // text for the variables the statement reads, so cutting it at 100
+        // characters hid every read past that point. 1C statements are long
+        // and its identifiers are whole words — `ОткрытьФорму(..., ЭтаФорма,
+        // ..., ОписаниеОповещения, ...)` puts its reads well beyond the cut —
+        // so the variables were reported as assigned and never used. Display
+        // truncation belongs in the renderer, and lives there now.
+        let text = node.utf8_text(source).unwrap_or("").to_string();
 
         match kind {
             // Control flow statements
@@ -1026,19 +1033,23 @@ impl CfgBuilder {
             // whole data-flow layer saw a 1C module as a list of opaque
             // statements.
             "assignment_statement" => {
-                let variable = node
-                    .child_by_field_name("left")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| text.split('=').next().unwrap_or("").trim().to_string());
-                self.add_statement(
-                    current,
-                    Statement {
-                        line,
-                        kind: StatementKind::Assignment { variable },
-                        text,
-                    },
-                );
+                let left = node.child_by_field_name("left");
+                // Writing a property — `Запрос.Текст = ...`, `Элементы.X.Заголовок
+                // = ...` — is the effect the code exists for, not a store into a
+                // local that someone might forget to read. Recording it as an
+                // assignment made the dead-store report accuse every form-setup
+                // procedure in the configuration.
+                let writes_property = left.is_some_and(|n| n.kind() == "property_access");
+                let kind = if writes_property {
+                    StatementKind::Expression
+                } else {
+                    let variable = left
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| text.split('=').next().unwrap_or("").trim().to_string());
+                    StatementKind::Assignment { variable }
+                };
+                self.add_statement(current, Statement { line, kind, text });
                 Ok(current)
             }
 
@@ -2046,12 +2057,7 @@ impl CfgBuilder {
         node: Node,
         source: &[u8],
     ) -> Result<BlockId> {
-        let text = node
-            .utf8_text(source)
-            .unwrap_or("")
-            .chars()
-            .take(100)
-            .collect::<String>();
+        let text = node.utf8_text(source).unwrap_or("").to_string();
         let line = node.start_position().row + 1;
 
         // Determine the type of jump
