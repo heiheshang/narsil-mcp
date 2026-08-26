@@ -108,6 +108,9 @@ impl WasmCodeIntel {
                         let doc_id = format!("{}:{}:{}", path, symbol.name, symbol.start_line);
                         self.embeddings.index_snippet(
                             doc_id,
+                            // Single-workspace WASM build: no repository
+                            // dimension, as for `SearchDocument` below.
+                            std::sync::Arc::from(""),
                             path.to_string(),
                             body,
                             symbol.start_line,

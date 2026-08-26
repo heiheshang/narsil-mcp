@@ -14,6 +14,7 @@
 /// 5. Default config (built-in)
 pub mod cli;
 pub mod editor;
+#[cfg(feature = "native")]
 pub mod filter;
 pub mod loader;
 pub mod preset;
@@ -23,6 +24,7 @@ pub mod wizard;
 
 // Re-export main types used by other modules and tests
 pub use cli::{handle_config_command, handle_tools_command, ConfigCommand, ToolsCommand};
+#[cfg(feature = "native")]
 pub use filter::{ClientInfo, ToolFilter};
 pub use loader::ConfigLoader;
 pub use validation::validate_config;
