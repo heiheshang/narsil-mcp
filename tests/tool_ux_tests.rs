@@ -406,7 +406,7 @@ fn validate_enforces_declared_types_and_enums() {
         .expect_err("a string where an integer is declared must be rejected");
     let msg = err.to_string();
     assert!(msg.contains("max_results"), "{msg}");
-    assert!(msg.contains("integer"), "{msg}");
+    assert!(msg.contains("an integer"), "{msg}");
 
     // The correct call still passes, and a whole-valued float counts as an
     // integer — several clients send 50.0 for a schema that says 50.

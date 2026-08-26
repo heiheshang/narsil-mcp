@@ -412,7 +412,16 @@ fn matches_type_name(name: &str, value: &Value) -> bool {
 
 fn describe_expected_type(expected: &Value) -> String {
     match expected {
-        Value::String(name) => format!("a {}", name),
+        // "an integer"/"an array"/"an object"; every other JSON Schema type
+        // name starts with a consonant.
+        Value::String(name) => {
+            let article = if name.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                "an"
+            } else {
+                "a"
+            };
+            format!("{} {}", article, name)
+        }
         Value::Array(names) => {
             let names: Vec<&str> = names.iter().filter_map(|n| n.as_str()).collect();
             format!("one of: {}", names.join(", "))
