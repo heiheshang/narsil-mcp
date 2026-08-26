@@ -1,0 +1,30 @@
+# cargo-audit configuration.
+#
+# The audit job is only worth having if a red run means "something changed".
+# It had been failing continuously on advisories nobody could act on, which
+# trained everyone to skip it — so the unactionable ones are listed here with
+# the reason, and anything else still fails the build.
+#
+# Ignores are by advisory ID, never by crate: a *new* advisory against any of
+# these crates, including quick-xml 0.37, still breaks CI.
+
+[advisories]
+ignore = [
+    # quick-xml 0.37.5, pulled in transitively by oxigraph (oxrdfxml,
+    # sparesults) and only under the `graph` feature. Both advisories are fixed
+    # in >= 0.41; oxigraph 0.5.9, the newest release, still pins 0.37, so there
+    # is no version of this dependency tree without them. The direct dependency
+    # was moved to 0.41 and is not covered by these entries.
+    #
+    # Neither entry point is reachable here. RUSTSEC-2026-0195 is a
+    # memory-exhaustion DoS in `NsReader`, used by oxrdfxml to parse RDF/XML —
+    # src/persistence/graph.rs only ever names `RdfFormat::Turtle` and
+    # `RdfFormat::NQuads`, so no RDF/XML is ever parsed. RUSTSEC-2026-0194 is
+    # quadratic duplicate-attribute checking in the SPARQL results XML reader —
+    # query results are consumed in process as `QueryResults::Solutions` and
+    # are never round-tripped through XML.
+    #
+    # Revisit when oxigraph ships a release on quick-xml >= 0.41.
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
+]

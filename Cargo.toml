@@ -140,7 +140,7 @@ oxigraph = { version = "0.5", optional = true }
 
 # Gzip compression for CCG layers (required by graph feature)
 flate2 = { version = "1.0", optional = true }
-quick-xml = "0.39.2"
+quick-xml = "0.41"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
@@ -184,3 +184,7 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "narsil-mcp"
 path = "src/main.rs"
+# The server binary is the native build by definition: it opens stdio,
+# spawns tokio and drives the MCP loop. Without this, a wasm-only check
+# tries to compile it and fails on every native import.
+required-features = ["native"]

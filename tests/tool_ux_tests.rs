@@ -392,6 +392,51 @@ fn validate_modes_behave_as_documented() {
     .is_ok());
 }
 
+/// Validation used to check names and `required` only, leaving the schema's
+/// own `type` and `enum` unenforced. Handlers read arguments with
+/// `as_u64`/`as_str`, which yield None on a mismatch and fall through to the
+/// default — so `max_results="50"` silently returned 10 results and reported
+/// success.
+#[test]
+fn validate_enforces_declared_types_and_enums() {
+    use narsil_mcp::tool_handlers::{validate_tool_args, ArgValidationMode};
+
+    let stringly_number = json!({"query": "x", "max_results": "50"});
+    let err = validate_tool_args("search_code", &stringly_number, ArgValidationMode::Strict)
+        .expect_err("a string where an integer is declared must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("max_results"), "{msg}");
+    assert!(msg.contains("integer"), "{msg}");
+
+    // The correct call still passes, and a whole-valued float counts as an
+    // integer — several clients send 50.0 for a schema that says 50.
+    for value in [json!(50), json!(50.0)] {
+        assert!(validate_tool_args(
+            "search_code",
+            &json!({"query": "x", "max_results": value}),
+            ArgValidationMode::Strict
+        )
+        .is_ok());
+    }
+
+    // An out-of-range enum names the accepted values rather than falling back.
+    let bad_enum = json!({"format": "yaml"});
+    let err = validate_tool_args("get_metrics", &bad_enum, ArgValidationMode::Strict)
+        .expect_err("a value outside the declared enum must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("markdown") && msg.contains("json"), "{msg}");
+
+    assert!(validate_tool_args(
+        "get_metrics",
+        &json!({"format": "json"}),
+        ArgValidationMode::Strict
+    )
+    .is_ok());
+
+    // Warn mode still only logs, as for every other problem class.
+    assert!(validate_tool_args("get_metrics", &bad_enum, ArgValidationMode::Warn).is_ok());
+}
+
 #[tokio::test]
 async fn vendored_paths_excluded_from_index_by_default() -> Result<()> {
     let repo = TestRepo::new()?;
