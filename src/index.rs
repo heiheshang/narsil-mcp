@@ -2295,11 +2295,10 @@ impl CodeIntelEngine {
         }
 
         {
-            let (docs, content_b, emb_b, idx_b, vocab_b, df_b) =
-                self.embedding_engine.memory_breakdown();
+            let (docs, content_b, emb_b, idx_b, df_b) = self.embedding_engine.memory_breakdown();
             info!(
-                "[mem] embedding_engine: {} docs, content {:.1} MB, embedding {:.1} MB, id_index {:.1} MB, vocab {:.1} MB, doc_freq {:.1} MB",
-                docs, content_b as f64 / 1e6, emb_b as f64 / 1e6, idx_b as f64 / 1e6, vocab_b as f64 / 1e6, df_b as f64 / 1e6
+                "[mem] embedding_engine: {} docs, content {:.1} MB, embedding {:.1} MB, id_index {:.1} MB, doc_freq {:.1} MB",
+                docs, content_b as f64 / 1e6, emb_b as f64 / 1e6, idx_b as f64 / 1e6, df_b as f64 / 1e6
             );
         }
 
