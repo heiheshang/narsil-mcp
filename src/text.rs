@@ -22,6 +22,41 @@ pub fn truncate(s: &str, max_bytes: usize) -> &str {
     &s[..s.floor_char_boundary(max_bytes)]
 }
 
+/// The longest prefix of `s` holding at most `max_chars` characters.
+///
+/// [`truncate`] is the right tool for a *storage* limit, which is measured in
+/// bytes. This is for a *token* budget, which is estimated from a character
+/// count: on Cyrillic — two bytes per character in UTF-8 — a byte cap sized
+/// from a chars-per-token ratio spends half the budget it was meant to, and
+/// the text is cut at roughly the halfway mark with nothing to say so.
+///
+/// # Examples
+/// ```
+/// use narsil_mcp::text::truncate_chars;
+/// assert_eq!(truncate_chars("abcdef", 3), "abc");
+/// // Four Cyrillic characters are eight bytes; the cap counts characters.
+/// assert_eq!(truncate_chars("привет", 4), "прив");
+/// assert_eq!(truncate_chars("short", 99), "short");
+/// ```
+#[must_use]
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    // A string never has fewer bytes than characters, so this settles every
+    // ASCII input without walking it.
+    if s.len() <= max_chars {
+        return s;
+    }
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Whether [`truncate_chars`] would shorten `s`.
+#[must_use]
+pub fn is_truncated_chars(s: &str, max_chars: usize) -> bool {
+    s.len() > max_chars && s.char_indices().nth(max_chars).is_some()
+}
+
 /// The longest *suffix* of `s` that fits in `max_bytes`, cut on a character
 /// boundary. Used for "first 4 … last 4" redaction of secrets, where the tail
 /// is as likely to land mid-character as the head.

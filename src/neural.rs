@@ -30,7 +30,13 @@ const MAX_EMBEDDING_BATCH_SIZE: usize = 100; // Maximum texts per API request
 // Latin-script text tokenises at ~4 chars/token, so it truncates earlier than
 // strictly necessary — deliberately, since embedding a prefix always beats
 // losing the batch.
-const MAX_TEXT_LENGTH: usize = 23_000;
+//
+// Counted in *characters*, and the name says so: the budget is derived from a
+// chars-per-token ratio, but the clamp used the byte-based `text::truncate`.
+// On the very corpus the ratio was measured against — Cyrillic, two bytes per
+// character — that spent 23_000 bytes on 11_500 characters, about 4_035 of the
+// 8_192 tokens available, and silently dropped the rest of every long symbol.
+const MAX_TEXT_CHARS: usize = 23_000;
 const MAX_DIMENSION: usize = 8192; // Maximum embedding dimension (larger than any known model)
 const MIN_DIMENSION: usize = 64; // Minimum reasonable embedding dimension
 const MAX_MODEL_NAME_LENGTH: usize = 256; // Maximum model name length
@@ -418,26 +424,25 @@ impl ApiEmbedder {
     }
 }
 
-/// Clamp over-long inputs to `MAX_TEXT_LENGTH`, reporting how many were cut.
+/// Clamp over-long inputs to `MAX_TEXT_CHARS`, reporting how many were cut.
 ///
 /// Embedding servers reject the *whole* request when one input exceeds their
 /// context, so a single huge symbol used to cost the embeddings of every other
 /// text batched with it. Nothing is copied: every element borrows from `texts`,
 /// truncated or not.
 ///
-/// The count comes from the *input* length. The cut lands on a character
-/// boundary, so a clamped Cyrillic text is typically `MAX_TEXT_LENGTH - 1`
-/// bytes — measuring the output against the cap reports zero truncations on
-/// exactly the corpus that needs them.
+/// The count comes from the *input* length: a clamped text is exactly
+/// `MAX_TEXT_CHARS` characters long, so measuring the output against the cap
+/// would report zero truncations.
 fn clamp_embedding_inputs(texts: &[String]) -> (Vec<&str>, usize) {
     let mut truncated = 0usize;
     let clamped = texts
         .iter()
         .map(|text| {
-            if crate::text::is_truncated(text, MAX_TEXT_LENGTH) {
+            if crate::text::is_truncated_chars(text, MAX_TEXT_CHARS) {
                 truncated += 1;
             }
-            crate::text::truncate(text, MAX_TEXT_LENGTH)
+            crate::text::truncate_chars(text, MAX_TEXT_CHARS)
         })
         .collect();
     (clamped, truncated)
@@ -465,10 +470,10 @@ impl EmbeddingBackend for ApiEmbedder {
         let (texts, truncated) = clamp_embedding_inputs(texts);
         if truncated > 0 {
             tracing::debug!(
-                "Truncated {} of {} texts to {} bytes before embedding",
+                "Truncated {} of {} texts to {} characters before embedding",
                 truncated,
                 texts.len(),
-                MAX_TEXT_LENGTH
+                MAX_TEXT_CHARS
             );
         }
 
@@ -1882,20 +1887,23 @@ mod tests {
             // 40k chars of Cyrillic: over the cap, and its byte length makes a
             // naive slice land mid-codepoint.
             let huge = "Процедура ".repeat(4_000);
-            assert!(huge.len() > MAX_TEXT_LENGTH);
+            assert!(huge.len() > MAX_TEXT_CHARS);
             embedder.embed_batch(&[huge]).expect("embed");
 
             let body = server.join().expect("server thread");
             let sent: serde_json::Value = serde_json::from_str(&body).expect("json");
             let sent = sent["input"][0].as_str().expect("input[0]");
-            assert!(
-                sent.len() <= MAX_TEXT_LENGTH,
-                "sent {} bytes, cap is {MAX_TEXT_LENGTH}",
-                sent.len()
+            assert_eq!(
+                sent.chars().count(),
+                MAX_TEXT_CHARS,
+                "the cap counts characters, and the clamp should spend all of it"
             );
+            // The cap was applied to bytes, so this Cyrillic input used to be
+            // cut at ~11_500 characters — half the token budget it was sized
+            // for, with nothing in the response to say so.
             assert!(
-                sent.len() > MAX_TEXT_LENGTH - 4,
-                "should clamp at the cap, not far below it: {}",
+                sent.len() > MAX_TEXT_CHARS,
+                "a Cyrillic clamp of {MAX_TEXT_CHARS} chars must exceed that many bytes, got {}",
                 sent.len()
             );
             assert!(sent.starts_with("Процедура "), "prefix must be preserved");
@@ -1968,13 +1976,13 @@ mod tests {
             );
         }
 
-        /// The truncation counter feeds the only diagnostic this clamp has.
-        /// Counting clamped texts whose length equals the cap reported zero on
-        /// Cyrillic input, where the boundary pulls the cut a byte short.
+        /// The truncation counter feeds the only diagnostic this clamp has,
+        /// and the clamp must spend the whole character budget on multi-byte
+        /// input rather than the byte budget it used to.
         #[test]
         fn test_clamp_counts_truncations_on_multibyte_input() {
             let huge = "Процедура ОбработкаПроведения() ".repeat(2_000);
-            assert!(huge.len() > MAX_TEXT_LENGTH);
+            assert!(huge.chars().count() > MAX_TEXT_CHARS);
 
             let inputs = vec!["short".to_string(), huge, "also short".to_string()];
             let (clamped, truncated) = clamp_embedding_inputs(&inputs);
@@ -1983,11 +1991,10 @@ mod tests {
             assert_eq!(clamped.len(), 3);
             assert_eq!(clamped[0], "short");
             assert_eq!(clamped[2], "also short");
-            assert!(clamped[1].len() <= MAX_TEXT_LENGTH);
             assert_eq!(
-                clamped[1].len(),
-                MAX_TEXT_LENGTH - 1,
-                "this input is the case a cap-equality check misses"
+                clamped[1].chars().count(),
+                MAX_TEXT_CHARS,
+                "the budget is characters; a byte cap spends half of it here"
             );
         }
 
@@ -2001,15 +2008,14 @@ mod tests {
 
         #[test]
         fn test_truncation_lands_on_char_boundary() {
-            // MAX_TEXT_LENGTH bytes can fall mid-codepoint in Cyrillic (2 bytes
-            // per char), where naive byte slicing panics.
+            // Cyrillic is 2 bytes per character, so a cut chosen by byte
+            // offset lands mid-codepoint about half the time and a naive slice
+            // panics. Cutting by character index cannot.
             let cyrillic = "Процедура".repeat(10_000);
-            assert!(cyrillic.len() > MAX_TEXT_LENGTH);
-            let cut = cyrillic.floor_char_boundary(MAX_TEXT_LENGTH);
-            assert!(cyrillic.is_char_boundary(cut));
-            assert!(cut <= MAX_TEXT_LENGTH);
-            // The slice itself must not panic.
-            let _ = &cyrillic[..cut];
+            assert!(cyrillic.chars().count() > MAX_TEXT_CHARS);
+            let cut = crate::text::truncate_chars(&cyrillic, MAX_TEXT_CHARS);
+            assert_eq!(cut.chars().count(), MAX_TEXT_CHARS);
+            assert!(cyrillic.is_char_boundary(cut.len()));
 
             let embedder = ApiEmbedder::custom(
                 "https://api.example.com/embeddings",
