@@ -208,3 +208,65 @@ async fn test_check_type_errors_accepts_directory_path() {
     assert!(result.contains("**Files analyzed**: 1"));
     assert!(result.contains("**Functions analyzed**: 1"));
 }
+
+/// `scan_security` only ever sees indexed files, and the index skips
+/// `VENDORED_DIRS` by default — a list that includes `env`, `build` and
+/// `dist`, all of which real projects use for source. A repo whose code lives
+/// in one of them used to get a bare "No security issues found", which reads
+/// as *clean* when it means *never looked*.
+#[tokio::test]
+async fn scan_security_names_directories_it_never_opened() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("test-repo");
+    fs::create_dir_all(repo_path.join("src")).unwrap();
+    fs::write(repo_path.join("src/main.py"), "x = 1\n").unwrap();
+
+    // Real source parked under a default-excluded directory name, with a
+    // finding that a scan would certainly report if it looked.
+    fs::create_dir_all(repo_path.join("build/app")).unwrap();
+    fs::write(
+        repo_path.join("build/app/db.py"),
+        "import os\nquery = \"SELECT * FROM t WHERE id = '\" + os.environ['ID'] + \"'\"\n",
+    )
+    .unwrap();
+
+    let engine = CodeIntelEngine::new(temp_dir.path().join("index"), vec![repo_path.clone()])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    let report = engine
+        .scan_security("test-repo", Default::default())
+        .await
+        .unwrap();
+
+    assert!(
+        report.contains("Not Scanned"),
+        "the report must admit to the gap, got:\n{report}"
+    );
+    assert!(
+        report.contains("`build/`"),
+        "the skipped directory must be named so the gap is actionable, got:\n{report}"
+    );
+
+    // A repo with nothing excluded stays quiet: the note is a warning, not
+    // boilerplate on every scan.
+    let clean_dir = TempDir::new().unwrap();
+    let clean_repo = clean_dir.path().join("clean-repo");
+    fs::create_dir_all(clean_repo.join("src")).unwrap();
+    fs::write(clean_repo.join("src/main.py"), "x = 1\n").unwrap();
+
+    let engine = CodeIntelEngine::new(clean_dir.path().join("index"), vec![clean_repo])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    let report = engine
+        .scan_security("clean-repo", Default::default())
+        .await
+        .unwrap();
+    assert!(
+        !report.contains("Not Scanned"),
+        "nothing was excluded, so there is no gap to report, got:\n{report}"
+    );
+}

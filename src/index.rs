@@ -5775,6 +5775,51 @@ impl CodeIntelEngine {
     /// This helps bound output size for large codebases.
     ///
     /// Results are cached when no pagination is used (offset=None, max_findings=None).
+    /// A line naming directories the scan never opened, or an empty string
+    /// when there are none.
+    ///
+    /// `scan_security` reads only what the index holds, and the index skips
+    /// `VENDORED_DIRS` by default — a list that includes `env`, `build` and
+    /// `dist`, all of which real projects use for source. Without this note a
+    /// repository whose code lives in one of them gets "No security issues
+    /// found", which reads as *clean* when it means *not looked at*.
+    fn unscanned_dirs_note(repo_path: &Path, index_exclude: &[String]) -> String {
+        /// Enough to show the shape of what was skipped without burying the
+        /// findings under a directory listing.
+        const MAX_LISTED: usize = 8;
+
+        let Ok(filter) = crate::security_rules::IndexFilter::new(index_exclude) else {
+            // The scan itself could not have run with an unparseable filter;
+            // stay silent rather than reporting a second, confusing error.
+            return String::new();
+        };
+        let dirs = filter.excluded_dirs(repo_path);
+        if dirs.is_empty() {
+            return String::new();
+        }
+
+        let shown: Vec<String> = dirs
+            .iter()
+            .take(MAX_LISTED)
+            .map(|d| format!("`{}/`", d))
+            .collect();
+        let overflow = dirs.len().saturating_sub(shown.len());
+        let listed = if overflow > 0 {
+            format!("{} and {} more", shown.join(", "), overflow)
+        } else {
+            shown.join(", ")
+        };
+
+        format!(
+            "**Not Scanned**: {} excluded director{} — {}. \
+             Findings below say nothing about their contents; re-include one \
+             with a `!`-prefixed `index_exclude` pattern to scan it.\n",
+            dirs.len(),
+            if dirs.len() == 1 { "y" } else { "ies" },
+            listed
+        )
+    }
+
     pub async fn scan_security(
         &self,
         repo_name: &str,
@@ -5896,6 +5941,10 @@ impl CodeIntelEngine {
         if let Some(ref tags) = ruleset_tags {
             output.push_str(&format!("**Ruleset Filter**: {}\n", tags.join(", ")));
         }
+        output.push_str(&Self::unscanned_dirs_note(
+            &repo_path,
+            &self.options.index_exclude,
+        ));
 
         // Phase C2: Show pagination info
         if truncated {
