@@ -1416,9 +1416,39 @@ impl CallGraph {
         let actual_name = self
             .find_function(function)
             .unwrap_or_else(|| function.to_string());
-        self.reverse_edges()
-            .remove(&actual_name)
-            .unwrap_or_default()
+        self.callers_of(&actual_name)
+    }
+
+    /// Incoming edges for one exact key, without materialising the whole
+    /// reverse adjacency.
+    ///
+    /// [`reverse_edges`](Self::reverse_edges) allocates a `CallEdge` with two
+    /// cloned `String`s for every edge in the graph — 24k of them on narsil's
+    /// own `src/`, 14.66 ms — and then discards all but one bucket. The scan
+    /// is still O(E), but only the edges actually returned are cloned.
+    fn callers_of(&self, callee: &str) -> Vec<CallEdge> {
+        let mut callers = Vec::new();
+        for entry in self.nodes.iter() {
+            let caller = entry.key();
+            for e in &entry.value().calls {
+                if e.target != callee {
+                    continue;
+                }
+                callers.push(CallEdge {
+                    target: caller.clone(),
+                    file_path: e.file_path.clone(),
+                    line: e.line,
+                    column: e.column,
+                    call_type: e.call_type.clone(),
+                    scope_hint: None,
+                    resolved: true,
+                    // How the *forward* edge was matched is what a reader of
+                    // "who calls me" needs to weigh.
+                    resolution: e.resolution,
+                });
+            }
+        }
+        callers
     }
 
     /// Get functions called by a function (with fuzzy matching)
@@ -1694,10 +1724,7 @@ impl CallGraph {
                     }
 
                     md.push_str("## Called By (incoming)\n\n");
-                    let callers = self
-                        .reverse_edges()
-                        .remove(display_name)
-                        .unwrap_or_default();
+                    let callers = self.callers_of(display_name);
                     if callers.is_empty() {
                         md.push_str("*No incoming calls (entry point or unused)*\n\n");
                     } else {
@@ -3099,6 +3126,59 @@ mod tests {
             0,
             "loaded nodes were not registered against their file"
         );
+    }
+
+    /// `get_callers` used to build the entire reverse adjacency — a cloned
+    /// `CallEdge` per edge in the graph — and then throw away every bucket but
+    /// one. The targeted scan must return exactly what the map would have.
+    #[test]
+    fn test_callers_of_matches_reverse_edges() {
+        let graph = CallGraph::new();
+        for (file, name, callees) in [
+            ("src/a.rs", "root", vec!["shared", "only_a"]),
+            ("src/b.rs", "helper", vec!["shared"]),
+            ("src/c.rs", "leaf", vec![]),
+            ("src/d.rs", "shared", vec!["leaf"]),
+        ] {
+            let key = CallGraph::qualified_key(file, name);
+            let mut n = node(name, file, None);
+            n.calls = callees
+                .iter()
+                .enumerate()
+                .map(|(i, target)| CallEdge {
+                    target: (*target).to_string(),
+                    file_path: file.to_string(),
+                    line: i + 1,
+                    column: 0,
+                    call_type: CallType::Direct,
+                    scope_hint: None,
+                    resolved: true,
+                    resolution: CallResolution::Unique,
+                })
+                .collect();
+            graph.insert_node(key, n);
+        }
+
+        let mut rev = graph.reverse_edges();
+        for callee in ["shared", "only_a", "leaf", "absent"] {
+            // `CallEdge` has no `PartialEq`; compare the fields a caller of
+            // `get_callers` actually reads.
+            let project = |edges: Vec<CallEdge>| {
+                let mut v: Vec<_> = edges
+                    .into_iter()
+                    .map(|e| (e.target, e.file_path, e.line, e.resolution))
+                    .collect();
+                // `CallResolution` is not `Ord`; a stable order over the
+                // remaining fields is enough to compare the two sets.
+                v.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+                v
+            };
+            assert_eq!(
+                project(graph.callers_of(callee)),
+                project(rev.remove(callee).unwrap_or_default()),
+                "targeted scan disagreed with the full map for {callee}"
+            );
+        }
     }
 
     /// Removing the last namesake used to leave an empty Vec in `name_index`,
