@@ -17,13 +17,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::index::CodeIntelEngine;
@@ -70,9 +68,103 @@ pub struct AppState {
     tool_registry: Arc<ToolRegistry>,
     mcp: Arc<McpServer>,
     /// Active MCP streamable-http sessions.
-    sessions: Arc<Mutex<HashSet<String>>>,
-    /// Path for persistent session storage
-    sessions_file: PathBuf,
+    sessions: Arc<Mutex<SessionStore>>,
+}
+
+/// How long a session survives without traffic.
+///
+/// Clients normally drop the connection rather than sending `DELETE /mcp`, so
+/// expiry — not the explicit teardown — is what actually retires a session.
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Hard cap on tracked sessions. `/mcp` has no authentication by design and
+/// the server binds `0.0.0.0`, so anyone who can reach the port can mint
+/// sessions with a ~45-byte `initialize` body.
+const MAX_SESSIONS: usize = 4096;
+
+/// Sweeping walks the whole map, so it is rate-limited rather than run per
+/// request.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Live MCP sessions, bounded in both size and age.
+///
+/// In memory only. Sessions used to be written to
+/// `$XDG_CONFIG_HOME/narsil-mcp/sessions-<port>.json` on every mint and
+/// teardown, which was wrong three ways: the whole set was re-serialized under
+/// the mutex inside an async handler, so concurrent requests queued behind a
+/// blocking write; the set only ever grew; and a session id surviving a
+/// restart passed validation while the `client_info` from its `initialize`
+/// did not, so `tools/list` answered with an unadapted tool set instead of an
+/// honest 404. A restart now returns `Unknown Mcp-Session-Id`, which is what
+/// the client is expected to handle by re-initializing.
+struct SessionStore {
+    seen: HashMap<String, Instant>,
+    last_sweep: Instant,
+}
+
+impl SessionStore {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
+
+    /// Whether `sid` is live, refreshing its deadline if so.
+    fn touch(&mut self, sid: &str, now: Instant) -> bool {
+        self.sweep(now);
+        match self.seen.get_mut(sid) {
+            Some(last_seen) => {
+                *last_seen = now;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, sid: String, now: Instant) {
+        self.sweep_now(now);
+        // Sweeping may not free anything if every session is fresh; evicting
+        // the least recently seen keeps the cap hard rather than advisory.
+        while self.seen.len() >= MAX_SESSIONS {
+            let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, last_seen)| **last_seen)
+                .map(|(sid, _)| sid.clone())
+            else {
+                break;
+            };
+            warn!(
+                "Session cap of {} reached, evicting {}",
+                MAX_SESSIONS, oldest
+            );
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(sid, now);
+    }
+
+    fn remove(&mut self, sid: &str) -> bool {
+        self.seen.remove(sid).is_some()
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        if now.duration_since(self.last_sweep) < SWEEP_INTERVAL {
+            return;
+        }
+        self.sweep_now(now);
+    }
+
+    fn sweep_now(&mut self, now: Instant) {
+        self.last_sweep = now;
+        self.seen
+            .retain(|_, last_seen| now.duration_since(*last_seen) < SESSION_TTL);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
 }
 
 /// Request body for tool calls
@@ -141,57 +233,11 @@ impl HttpServer {
 
     /// Run the HTTP server
     pub async fn run(self) -> Result<()> {
-        // Create sessions file path in config directory
-        let config_dir = env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| dirs_home().map(|h| h.join(".config")))
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-
-        let sessions_dir = config_dir.join("narsil-mcp");
-        if let Err(e) = fs::create_dir_all(&sessions_dir) {
-            warn!(
-                "Failed to create sessions directory {}: {}",
-                sessions_dir.display(),
-                e
-            );
-        }
-
-        let sessions_file = sessions_dir.join(format!("sessions-{}.json", self.port));
-
-        // Load existing sessions or create empty set
-        let sessions = if sessions_file.exists() {
-            match fs::read_to_string(&sessions_file) {
-                Ok(content) => match serde_json::from_str::<HashSet<String>>(&content) {
-                    Ok(sessions) => sessions,
-                    Err(e) => {
-                        warn!(
-                            "Failed to parse sessions file {}: {}",
-                            sessions_file.display(),
-                            e
-                        );
-                        HashSet::new()
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        "Failed to read sessions file {}: {}",
-                        sessions_file.display(),
-                        e
-                    );
-                    HashSet::new()
-                }
-            }
-        } else {
-            HashSet::new()
-        };
-
         let state = AppState {
             engine: self.engine,
             tool_registry: Arc::new(self.tool_registry),
             mcp: self.mcp,
-            sessions: Arc::new(Mutex::new(sessions)),
-            sessions_file,
+            sessions: Arc::new(Mutex::new(SessionStore::new())),
         };
 
         // Configure CORS to allow frontend access (needed for development mode)
@@ -506,8 +552,11 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
         // First contact: initialize starts a fresh session.
         (None, true) => {
             let sid = Uuid::new_v4().to_string();
-            state.sessions.lock().unwrap().insert(sid.clone());
-            save_sessions(&state);
+            state
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(sid.clone(), Instant::now());
             info!("MCP streamable-http session started: {}", sid);
             session_to_issue = Some(sid);
         }
@@ -528,7 +577,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
         }
         // Validate an existing session id.
         (Some(sid), _) => {
-            if !state.sessions.lock().unwrap().contains(sid) {
+            if !state.sessions.lock().unwrap().touch(sid, Instant::now()) {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({
@@ -579,7 +628,6 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
 async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
     if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.sessions.lock().unwrap().remove(sid) {
-            save_sessions(&state);
             info!("MCP streamable-http session terminated: {}", sid);
         }
     }
@@ -591,32 +639,6 @@ fn is_initialize(body: &str) -> bool {
     serde_json::from_str::<Value>(body)
         .map(|v| v.get("method").and_then(|m| m.as_str()) == Some("initialize"))
         .unwrap_or(false)
-}
-
-/// Save active sessions to disk for persistence across restarts
-fn save_sessions(state: &AppState) {
-    let sessions = state.sessions.lock().unwrap();
-    match serde_json::to_string(&*sessions) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&state.sessions_file, json) {
-                error!(
-                    "Failed to save sessions to {}: {}",
-                    state.sessions_file.display(),
-                    e
-                );
-            }
-        }
-        Err(e) => {
-            error!("Failed to serialize sessions: {}", e);
-        }
-    }
-}
-
-/// Get home directory, with fallback
-fn dirs_home() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 #[cfg(test)]
@@ -802,5 +824,51 @@ mod tests {
             serde_json::from_str(r#"{"repo": "test", "depth": 1000, "max_nodes": 99999}"#).unwrap();
         assert_eq!(query.depth.min(20), 20);
         assert_eq!(query.max_nodes.map(|n| n.min(5000)), Some(5000));
+    }
+
+    /// The session store used to be an unbounded `HashSet` that only shrank on
+    /// an explicit `DELETE /mcp`, which clients rarely send. `/mcp` needs no
+    /// authentication, so the set grew for as long as the server ran.
+    #[test]
+    fn test_sessions_expire_and_stay_capped() {
+        let mut store = SessionStore::new();
+        let t0 = Instant::now();
+
+        store.insert("live".to_string(), t0);
+        assert!(store.touch("live", t0), "a fresh session must validate");
+
+        // Past the TTL the id is gone, and the client is told so (404) rather
+        // than being served against half-forgotten state.
+        let expired = t0 + SESSION_TTL + Duration::from_secs(1);
+        assert!(!store.touch("live", expired));
+        assert_eq!(store.len(), 0);
+
+        // Traffic keeps a session alive: touching it before expiry moves its
+        // deadline, so a busy client is never cut off mid-conversation.
+        store.insert("busy".to_string(), t0);
+        let halfway = t0 + SESSION_TTL / 2;
+        assert!(store.touch("busy", halfway));
+        assert!(store.touch("busy", halfway + SESSION_TTL / 2 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_session_cap_evicts_least_recently_seen() {
+        let mut store = SessionStore::new();
+        let t0 = Instant::now();
+
+        // All minted within the TTL, so expiry frees nothing and the cap is
+        // the only thing holding the map down.
+        for i in 0..MAX_SESSIONS {
+            store.insert(format!("sid-{i}"), t0 + Duration::from_millis(i as u64));
+        }
+        assert_eq!(store.len(), MAX_SESSIONS);
+
+        store.insert("newcomer".to_string(), t0 + Duration::from_secs(1));
+        assert_eq!(store.len(), MAX_SESSIONS, "the cap must be hard");
+        assert!(store.touch("newcomer", t0 + Duration::from_secs(1)));
+        assert!(
+            !store.touch("sid-0", t0 + Duration::from_secs(1)),
+            "the oldest session should have been the one evicted"
+        );
     }
 }

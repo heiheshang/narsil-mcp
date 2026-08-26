@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-08-26
+
+Follow-up to an adversarial review of 1.9.0 run by three agents over separate
+zones (core and call graph; neural search, embeddings and persistence; MCP,
+HTTP, tools and CI). Every finding here had to come with a concrete failure
+scenario. The recurring shape: a tool that reports success or "clean" for work
+it never did.
+
+### Fixed
+
+- The `wasm` feature builds again, and CI builds it. It is documented
+  (`docs/wasm.md`, `scripts/build-wasm.sh`) but no job ever compiled it, so it
+  had broken in four places: `src/wasm.rs` called `index_snippet` with the
+  arity it had before `repo` was added, `neural_cache` and `config::filter`
+  were not behind `cfg(native)` despite depending on native-only types, and
+  the server binary was compiled for a wasm-only check. The binary now
+  declares `required-features = ["native"]`.
+- Tool arguments are checked against the schema's `type` and `enum`, not only
+  its parameter names and `required` list. Handlers read arguments with
+  `as_u64`/`as_str`, which return `None` on a type mismatch and fall through
+  to the default, so `max_results="50"` quietly returned 10 results and
+  reported success. A whole-valued float still counts as an integer.
+- `scan_security` names the directories it never opened. It can only see
+  indexed files, and the index skips `VENDORED_DIRS` by default — a list that
+  includes `env`, `build` and `dist`, all of which real projects use for
+  source. A repository whose code lives in one of them received a bare "No
+  security issues found", which reads as *clean* and meant *not looked at*.
+- The embedding budget is counted in characters, matching how it was derived
+  (~2.85 chars/token, measured on Cyrillic 1C/BSL source). It was applied
+  through the byte-based `text::truncate`, so on that same corpus — two bytes
+  per character — 23,000 bytes covered 11,500 characters, roughly 4,035 of the
+  8,192 available tokens, and the rest of every long symbol never reached the
+  model.
+- Two models whose names differ only in punctuation no longer destroy each
+  other's embedding cache. `sanitize` maps every non-alphanumeric byte to `_`,
+  so `voyage/code-3` and `voyage-code-3` shared a file; the header check then
+  called the incumbent "a different model" and the file was truncated. Used in
+  turn, each run wiped the other's vectors — silently, permanently, and at the
+  cost of re-buying every vector from the embedding API. The model that
+  claimed the plain name keeps it, so no existing cache is orphaned.
+- `cargo audit` is meaningful again: `quick-xml` moved to 0.41, and the two
+  advisories that remain only through oxigraph's transitive pin are listed in
+  `.cargo/audit.toml` with the reason each is unreachable here. The job had
+  been red continuously, which trained everyone to skip it.
+
+### Performance
+
+- `get_callers` no longer materialises the whole reverse adjacency to answer a
+  question about one node. It allocated a `CallEdge` with two cloned `String`s
+  per edge in the graph — 24,144 of them on narsil's own `src/`, 14.66 ms —
+  and then discarded every bucket but one.
+
 ## [1.9.0] - 2026-08-25
 
 ### Added

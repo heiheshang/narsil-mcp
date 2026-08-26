@@ -22,14 +22,25 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 
 /// TF-IDF based embedding provider
+///
+/// A term's position in the vector is a hash of the term itself, so the
+/// coordinate system is fixed for the life of the corpus. It used to be the
+/// term's rank by document frequency, recomputed on every single insert: the
+/// first document and the hundred-thousandth were written in different bases,
+/// and `sparse_cosine` — which multiplies them position by position — compared
+/// unrelated dimensions. Two documents with *identical* text, inserted 500
+/// documents apart, scored 1.00 and below-the-noise-floor respectively.
+///
+/// The cost of a fixed basis is hash collisions: two terms sharing a slot have
+/// their weights summed. That is the standard hashing-trick trade, it is the
+/// same for every document, and it degrades a score rather than scrambling an
+/// ordering. It also removes a per-insert sort of the whole vocabulary.
 pub struct TfIdfEmbedding {
     /// Global term frequencies across all documents
     document_freq: HashMap<String, usize>,
     /// Total number of documents
     total_docs: usize,
-    /// Vocabulary (terms to indices)
-    vocabulary: HashMap<String, usize>,
-    /// Maximum vocabulary size (for dimensionality)
+    /// Vector dimensionality, and the modulus of the term-slot hash
     max_vocab_size: usize,
 }
 
@@ -39,7 +50,6 @@ impl TfIdfEmbedding {
         Self {
             document_freq: HashMap::new(),
             total_docs: 0,
-            vocabulary: HashMap::new(),
             max_vocab_size,
         }
     }
@@ -54,39 +64,50 @@ impl TfIdfEmbedding {
         }
 
         self.total_docs += 1;
-        self.rebuild_vocabulary();
+        self.prune_document_freq();
     }
 
-    /// Rebuild vocabulary from most frequent terms, and bound `document_freq`.
-    fn rebuild_vocabulary(&mut self) {
-        // Rank terms by document frequency (descending). Materialize into an
-        // owned vec so we can mutate `document_freq` below without holding a
-        // borrow across the mutation.
-        let mut ranked: Vec<(String, usize)> = self
+    /// The vector position a term occupies.
+    ///
+    /// FNV-1a rather than `DefaultHasher`: this has to give the same answer in
+    /// every process and every build, because documents embedded now are
+    /// compared against documents embedded later. `DefaultHasher`'s output is
+    /// explicitly not guaranteed stable across releases.
+    fn slot(&self, term: &str) -> usize {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in term.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        (hash % self.max_vocab_size as u64) as usize
+    }
+
+    /// Bound `document_freq` by dropping the rarest terms.
+    ///
+    /// IDF is the only thing read out of this map and a pruned term simply
+    /// scores zero, so the long tail costs memory and buys nothing. 2x headroom
+    /// over the target vocabulary keeps near-miss terms' counts alive. Unlike
+    /// the vocabulary rebuild this replaces, it runs only when the map is
+    /// actually over the limit, not on every insert.
+    fn prune_document_freq(&mut self) {
+        let limit = self.max_vocab_size.saturating_mul(2);
+        if limit == 0 || self.document_freq.len() <= limit {
+            return;
+        }
+
+        let mut ranked: Vec<(&str, usize)> = self
             .document_freq
             .iter()
-            .map(|(term, &df)| (term.clone(), df))
+            .map(|(term, &df)| (term.as_str(), df))
             .collect();
-        ranked.sort_by_key(|a| std::cmp::Reverse(a.1));
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
-        // Vocabulary = top `max_vocab_size` terms.
-        self.vocabulary.clear();
-        for (idx, (term, _)) in ranked.iter().take(self.max_vocab_size).enumerate() {
-            self.vocabulary.insert(term.clone(), idx);
-        }
-
-        // Bound `document_freq`: IDF is only ever computed for terms that made
-        // it into the vocabulary (`embed()` checks the vocabulary first), so
-        // counts for the long tail are never read. Pruning them keeps memory
-        // O(max_vocab_size) instead of growing with every unique token, and
-        // keeps this per-add sort cheap. Keep 2x headroom so near-miss terms
-        // retain their counts and can still climb into the top-N later.
-        let limit = self.max_vocab_size * 2;
-        if self.document_freq.len() > limit {
-            let keep: std::collections::HashSet<&String> =
-                ranked.iter().take(limit).map(|(term, _)| term).collect();
-            self.document_freq.retain(|term, _| keep.contains(term));
-        }
+        let keep: std::collections::HashSet<String> = ranked
+            .iter()
+            .take(limit)
+            .map(|(term, _)| (*term).to_string())
+            .collect();
+        self.document_freq.retain(|term, _| keep.contains(term));
     }
 
     /// Compute IDF for a term (with smoothing to avoid zero values)
@@ -117,7 +138,7 @@ impl TfIdfEmbedding {
     pub fn stats(&self) -> EmbeddingStats {
         EmbeddingStats {
             total_docs: self.total_docs,
-            vocab_size: self.vocabulary.len(),
+            vocab_size: self.document_freq.len().min(self.max_vocab_size),
             dimension: self.dimension(),
         }
     }
@@ -138,11 +159,14 @@ impl EmbeddingProvider for TfIdfEmbedding {
         let mut vector = vec![0.0; self.dimension()];
 
         for (term, &count) in &term_freq {
-            if let Some(&idx) = self.vocabulary.get(term) {
-                let tf = Self::tf(count, total_terms);
-                let idf = self.idf(term);
-                vector[idx] = tf * idf;
+            let idf = self.idf(term);
+            // A term the corpus has never seen, or one pruned from the long
+            // tail, scores zero and contributes nothing.
+            if idf == 0.0 {
+                continue;
             }
+            // `+=`, not `=`: colliding terms share a slot and their weights add.
+            vector[self.slot(term)] += Self::tf(count, total_terms) * idf;
         }
 
         // L2 normalize the vector
@@ -546,28 +570,17 @@ impl EmbeddingEngine {
     }
 
     /// Approximate memory footprint (diagnostics).
-    /// Returns (docs, content_bytes, embedding_bytes, index_bytes, vocab_bytes, doc_freq_bytes).
-    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
+    /// Returns (docs, content_bytes, embedding_bytes, index_bytes, doc_freq_bytes).
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize) {
         let (docs, content_bytes, embedding_bytes, index_bytes) = self.store.memory_breakdown();
-        let p = self.provider.read();
-        let vocab_bytes: usize = p
-            .vocabulary
-            .keys()
-            .map(|k| k.len() + std::mem::size_of::<usize>())
-            .sum();
-        let df_bytes: usize = p
+        let df_bytes: usize = self
+            .provider
+            .read()
             .document_freq
             .keys()
             .map(|k| k.len() + std::mem::size_of::<usize>())
             .sum();
-        (
-            docs,
-            content_bytes,
-            embedding_bytes,
-            index_bytes,
-            vocab_bytes,
-            df_bytes,
-        )
+        (docs, content_bytes, embedding_bytes, index_bytes, df_bytes)
     }
 
     /// Clear all data
@@ -576,7 +589,6 @@ impl EmbeddingEngine {
         let mut provider = self.provider.write();
         provider.document_freq.clear();
         provider.total_docs = 0;
-        provider.vocabulary.clear();
     }
 }
 
@@ -594,7 +606,7 @@ mod tests {
         tfidf.add_document("fn main() { hello_world(); }");
 
         assert_eq!(tfidf.total_docs, 3);
-        assert!(!tfidf.vocabulary.is_empty());
+        assert!(!tfidf.document_freq.is_empty());
 
         // Generate embedding
         let embedding = tfidf.embed("fn hello_world()");
@@ -622,8 +634,6 @@ mod tests {
             tfidf.document_freq.len(),
             limit
         );
-        assert!(tfidf.vocabulary.len() <= tfidf.max_vocab_size);
-
         // Embedding dimension stays the configured size.
         let embedding = tfidf.embed("fn_42");
         assert_eq!(embedding.len(), tfidf.max_vocab_size);
@@ -947,6 +957,93 @@ mod tests {
             assert!(
                 non_nan[0] >= non_nan[1],
                 "Non-NaN values should be sorted descending"
+            );
+        }
+    }
+
+    /// The reproduction from the v1.9.0 review. Two documents with identical
+    /// text, inserted 500 documents apart, must rank alike — the vocabulary
+    /// used to be re-indexed by document-frequency rank on every insert, so
+    /// they ended up in different coordinate bases and the early one fell out
+    /// of the results entirely (`late` 1.00, noise 0.58, `early` not in top 5).
+    #[test]
+    fn test_identical_documents_rank_alike_regardless_of_insertion_order() {
+        let engine = EmbeddingEngine::new(4096);
+        let repo: Arc<str> = Arc::from("test-repo");
+        let text = "fn compute_checksum(buffer: &[u8]) -> u32 { buffer.iter().fold(0, |a, b| a ^ *b as u32) }";
+
+        let index = |id: &str, content: &str| {
+            engine.index_snippet(
+                id.to_string(),
+                Arc::clone(&repo),
+                format!("{id}.rs"),
+                content.to_string(),
+                1,
+                1,
+            );
+        };
+
+        index("early", text);
+        for i in 0..500 {
+            index(
+                &format!("noise{i}"),
+                &format!("fn unrelated_helper_{i}(value: usize) -> usize {{ value + {i} }}"),
+            );
+        }
+        index("late", text);
+
+        let results = engine.find_similar_code(text, 5);
+        let ranked: Vec<&str> = results.iter().map(|r| r.document.id.as_str()).collect();
+        assert!(
+            ranked.contains(&"early") && ranked.contains(&"late"),
+            "both copies must surface, got {ranked:?}"
+        );
+
+        let score = |id: &str| {
+            results
+                .iter()
+                .find(|r| r.document.id == id)
+                .map(|r| r.similarity)
+                .unwrap()
+        };
+        // Their scores need not be bit-identical — IDF legitimately moves as
+        // the corpus grows — but they must be close, and both must beat noise.
+        assert!(
+            (score("early") - score("late")).abs() < 0.05,
+            "identical text scored {} vs {}",
+            score("early"),
+            score("late")
+        );
+        let best_noise = results
+            .iter()
+            .filter(|r| r.document.id.starts_with("noise"))
+            .map(|r| r.similarity)
+            .fold(0.0f32, f32::max);
+        assert!(
+            score("early") > best_noise,
+            "an exact copy scored {} against noise at {best_noise}",
+            score("early")
+        );
+    }
+
+    /// A term's slot must depend only on the term, never on what else the
+    /// corpus has seen — that independence is the whole fix.
+    #[test]
+    fn test_term_slots_are_independent_of_corpus_state() {
+        let mut fresh = TfIdfEmbedding::new(256);
+        fresh.add_document("alpha beta");
+
+        let mut crowded = TfIdfEmbedding::new(256);
+        for i in 0..300 {
+            crowded.add_document(&format!("filler_{i} beta beta beta"));
+        }
+        crowded.add_document("alpha beta");
+
+        for term in ["alpha", "beta"] {
+            assert_eq!(
+                fresh.slot(term),
+                crowded.slot(term),
+                "slot for {term} moved with corpus state"
             );
         }
     }

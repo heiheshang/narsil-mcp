@@ -212,6 +212,82 @@ impl IndexFilter {
         }
         is_vendored_path(rel_path) || self.exclude.iter().any(|g| g.matches(&rel_str))
     }
+
+    /// Directories under `root` that this filter keeps out of the index.
+    ///
+    /// `scan_security` can only see indexed files, so an excluded directory
+    /// holding real source yields a clean report with nothing to say it was
+    /// never opened — and `env`, `build` and `dist` are default exclusions
+    /// that plenty of projects use for source. Naming them turns a silent
+    /// false negative into a visible gap.
+    ///
+    /// An excluded directory is reported but not descended into, so a
+    /// hundred-thousand-file `node_modules` costs one entry rather than a
+    /// traversal, and only the outermost excluded directory of a nested pair
+    /// is listed. Paths the user's own `.gitignore` hides never appear: those
+    /// are excluded by the user's decision, not by ours.
+    ///
+    /// # Examples
+    /// ```
+    /// # use narsil_mcp::security_rules::IndexFilter;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # std::fs::create_dir_all(dir.path().join("node_modules/pkg/deep")).unwrap();
+    /// # std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    /// let filter = IndexFilter::new(&[]).unwrap();
+    /// assert_eq!(filter.excluded_dirs(dir.path()), vec!["node_modules".to_string()]);
+    /// ```
+    pub fn excluded_dirs(&self, root: &std::path::Path) -> Vec<String> {
+        // The walker's predicate must outlive this borrow, so it gets its own
+        // copy of the compiled patterns rather than a reference to `self`.
+        let pruner = Self {
+            exclude: self.exclude.clone(),
+            include: self.include.clone(),
+        };
+        let walk_root = root.to_path_buf();
+
+        let walker = ignore::WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .require_git(false)
+            .filter_entry(move |entry| {
+                // Yield an excluded directory so it can be named, but visit
+                // nothing beneath it: an entry is dropped when its parent is
+                // already excluded.
+                let Some(parent) = entry.path().parent() else {
+                    return true;
+                };
+                let rel = parent.strip_prefix(&walk_root).unwrap_or(parent);
+                rel.as_os_str().is_empty() || !pruner.is_excluded(rel)
+            })
+            .build();
+
+        let mut found: Vec<String> = Vec::new();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            if rel.as_os_str().is_empty() || !self.is_excluded(rel) {
+                continue;
+            }
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            // A glob exclusion like `**/foo/**` does not match `foo` itself,
+            // so the prune above cannot stop the descent and every directory
+            // below it matches. Report the outermost one only.
+            if found
+                .iter()
+                .any(|seen| rel.starts_with(&format!("{seen}/")))
+            {
+                continue;
+            }
+            found.push(rel);
+        }
+
+        found.sort();
+        found
+    }
 }
 
 /// Remove inline test-only Rust items while preserving line numbers.

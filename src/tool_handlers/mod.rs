@@ -322,6 +322,43 @@ pub fn validate_tool_args(tool: &str, args: &Value, mode: ArgValidationMode) -> 
         }
     }
 
+    // Types and enums. Checking only names and `required` left the schema's
+    // own constraints unenforced, and the handlers read arguments with
+    // `as_u64`/`as_str`, which return None on a mismatch and fall back to the
+    // default: `max_results="50"` quietly became 10 rather than being
+    // reported. A schema constraint that is never checked is worse than none,
+    // because the caller is told the call succeeded.
+    for (key, value) in obj.iter().filter(|(k, _)| !k.starts_with('_')) {
+        let Some(schema) = props.get(key) else {
+            continue; // already reported as unknown
+        };
+        if value.is_null() {
+            continue;
+        }
+        if let Some(expected) = schema.get("type") {
+            if !type_matches(expected, value) {
+                problems.push(format!(
+                    "parameter '{}' must be {}, got {}",
+                    key,
+                    describe_expected_type(expected),
+                    describe_value_type(value)
+                ));
+                continue;
+            }
+        }
+        if let Some(allowed) = schema.get("enum").and_then(|e| e.as_array()) {
+            if !allowed.contains(value) {
+                let choices: Vec<String> = allowed.iter().map(render_scalar).collect();
+                problems.push(format!(
+                    "parameter '{}' must be one of {}, got {}",
+                    key,
+                    choices.join(", "),
+                    render_scalar(value)
+                ));
+            }
+        }
+    }
+
     if problems.is_empty() {
         return Ok(());
     }
@@ -341,6 +378,65 @@ pub fn validate_tool_args(tool: &str, args: &Value, mode: ArgValidationMode) -> 
             Ok(())
         }
         ArgValidationMode::Off => Ok(()),
+    }
+}
+
+/// Whether `value` satisfies a JSON Schema `type`, which may be a single name
+/// or a list of alternatives.
+fn type_matches(expected: &Value, value: &Value) -> bool {
+    match expected {
+        Value::String(name) => matches_type_name(name, value),
+        Value::Array(names) => names
+            .iter()
+            .filter_map(|n| n.as_str())
+            .any(|name| matches_type_name(name, value)),
+        // An unrecognisable schema constrains nothing; do not invent an error.
+        _ => true,
+    }
+}
+
+fn matches_type_name(name: &str, value: &Value) -> bool {
+    match name {
+        "string" => value.is_string(),
+        // A whole-valued float is an integer: JSON has one number type, and
+        // several clients send 10.0 where the schema says 10.
+        "integer" => value.as_i64().is_some() || value.as_f64().is_some_and(|f| f.fract() == 0.0),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+fn describe_expected_type(expected: &Value) -> String {
+    match expected {
+        Value::String(name) => format!("a {}", name),
+        Value::Array(names) => {
+            let names: Vec<&str> = names.iter().filter_map(|n| n.as_str()).collect();
+            format!("one of: {}", names.join(", "))
+        }
+        _ => "of the declared type".to_string(),
+    }
+}
+
+fn describe_value_type(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "a string",
+        Value::Number(_) => "a number",
+        Value::Bool(_) => "a boolean",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+        Value::Null => "null",
+    }
+}
+
+/// A short rendering for enum diagnostics: quoted strings, bare scalars.
+fn render_scalar(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{}'", s),
+        other => other.to_string(),
     }
 }
 
