@@ -249,6 +249,7 @@ impl HttpServer {
         // Build router with API routes
         let app = Router::new()
             .route("/health", get(health_check))
+            .route("/ready", get(readiness_check))
             .route("/tools", get(list_tools))
             .route("/tools/call", post(call_tool))
             .route("/graph", get(get_graph))
@@ -283,12 +284,47 @@ impl HttpServer {
     }
 }
 
-/// Health check endpoint
+/// Liveness probe: the process is up and serving HTTP.
+///
+/// Deliberately says nothing about the index. Use `/ready` to find out whether
+/// the answers can be trusted.
 async fn health_check() -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Readiness probe: the index has finished re-checking the repositories.
+///
+/// `/health` goes green about a second after start, while the engine is still
+/// serving the *persisted* index and has not yet re-walked the working tree.
+/// For a long-running server that is harmless. For an on-demand server that is
+/// started per request and stopped when idle, it is not: the repository may
+/// have changed while the service was down, so early answers describe the
+/// state as of the last shutdown — silently stale rather than an error.
+///
+/// Returns 503 until `is_fully_initialized()` flips, so a supervisor
+/// (systemd `ExecStartPost`, a socket proxy, a load balancer) can hold traffic
+/// until the answers are current.
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state.engine.is_fully_initialized();
+    let status = state.engine.get_initialization_status();
+
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        Json(json!({
+            "status": if ready { "ready" } else { "initializing" },
+            "version": env!("CARGO_PKG_VERSION"),
+            "initialization": status,
+        })),
+    )
 }
 
 /// List available tools

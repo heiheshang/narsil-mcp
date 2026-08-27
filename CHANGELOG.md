@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-08-27
+
+### Added
+
+- **`GET /ready` readiness probe**, separate from `/health`. `/health` is
+  liveness: it goes green about a second after start, while the engine is still
+  serving the persisted index and has not yet re-walked the working tree.
+  `/ready` returns 503 until background initialization completes, then 200 with
+  the full initialization status. For a long-running server the distinction is
+  harmless; for a server started on demand and stopped when idle it is not —
+  the repository can change while the service is down, so early answers
+  describe the state as of the last shutdown: silently stale rather than an
+  error. Supervisors (systemd `ExecStartPost`, socket proxies, load balancers)
+  can now hold traffic until the answers are current.
+
 ## [1.9.3] - 2026-08-27
 
 ### Fixed
