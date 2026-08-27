@@ -50,6 +50,17 @@ jobs:
       - name: Clippy (CI features)
         run: cargo clippy --all-targets --features "$CI_FEATURES" -- -D warnings
 
+      # The frontend feature is built by no other job: release.yml and
+      # build-binaries.yml ship "native,neural,graph", and verify-nix.yml would
+      # catch it but its paths: filter excludes src/**. Release 1.9.0 shipped a
+      # commit fixing a duplicate import that made the feature entirely
+      # unbuildable, and every job stayed green through it. rust-embed is
+      # declared with allow_missing, so this needs no npm build of
+      # frontend/dist — it reuses this job's warm cache and costs a recompile
+      # of the crate itself.
+      - name: Clippy (frontend feature)
+        run: cargo clippy --all-targets --features "$CI_FEATURES,frontend" -- -D warnings
+
   # Main test suite
   test:
     name: Test (${{ matrix.os }})
@@ -110,6 +121,36 @@ jobs:
       - name: Run tests (graph)
         run: cargo test --features "$CI_FEATURES,graph" -- --test-threads=1
 
+  # The WASM build is documented (docs/wasm.md) and shipped, but nothing built
+  # it: `index_snippet` gained a `repo` parameter and src/wasm.rs kept calling
+  # it with the old arity, so the feature sat broken on main until someone
+  # built it by hand. Check-only — wasm32 has no test runner here, and a
+  # compile failure is the whole failure mode this guards against.
+  wasm:
+    name: WASM feature
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      # Own cache prefix: a wasm32 build shares no artifacts with the host
+      # ones, and a shared key would just evict them.
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-wasm"
+          cache-on-failure: true
+
+      - name: Clippy (wasm)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
+
   # Security audit
   security:
     name: Security Audit
@@ -128,6 +169,6 @@ jobs:
   # Build release binaries
   build-release:
     name: Build Release Binaries
-    needs: [test, graph, security]
+    needs: [test, graph, wasm, security]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/build-binaries.yml

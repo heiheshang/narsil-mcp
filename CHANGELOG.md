@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-08-27
+
+### Added
+
+- **`GET /ready` readiness probe**, separate from `/health`. `/health` is
+  liveness: it goes green about a second after start, while the engine is still
+  serving the persisted index and has not yet re-walked the working tree.
+  `/ready` returns 503 until background initialization completes, then 200 with
+  the full initialization status. For a long-running server the distinction is
+  harmless; for a server started on demand and stopped when idle it is not —
+  the repository can change while the service is down, so early answers
+  describe the state as of the last shutdown: silently stale rather than an
+  error. Supervisors (systemd `ExecStartPost`, socket proxies, load balancers)
+  can now hold traffic until the answers are current.
+
+## [1.9.3] - 2026-08-27
+
+### Fixed
+
+- **Watch mode no longer burns a CPU core.** `FileWatcher` and `AsyncFileWatcher`
+  used `PollWatcher` with a 500 ms interval, re-stat'ing the entire corpus twice a
+  second: on a 23k-file repository the watcher thread consumed a full core
+  indefinitely, even with no clients connected. Both now use the OS event-driven
+  backend (inotify / FSEvents / ReadDirectoryChangesW). Polling remains only as a
+  fallback when the OS backend cannot be created, and at a 30 s interval.
+  Set `NARSIL_WATCH_POLL=1` to force polling on filesystems that never deliver
+  events (NFS, CIFS). Regression introduced in 1.7.0.
+
+- **Watch mode ignored most languages.** `is_source_file` filtered watcher
+  events against its own hard-coded list of 20 extensions, unrelated to the
+  parser's language table: changes to `.bsl`, `.rb`, `.php`, `.cs`, `.kt`,
+  `.scala`, `.lua`, `.sh` and others were detected and then discarded, so
+  `--watch` was a no-op on those repositories. The filter now derives from
+  `parser::is_supported_extension`, which reads the same language table that
+  indexing uses, so the two cannot drift apart again.
+
+## [1.9.2] - 2026-08-26
+
+Flow analysis for BSL (1С:Предприятие). `get_control_flow` and
+`get_data_flow` answered `Function 'X' not found` for every 1C function,
+while `find_symbols` located the same function by file and line — an answer
+that reads as *there is no such function* and meant *this language is
+unsupported*.
+
+### Fixed
+
+- Control flow is built for BSL procedures and functions. `Процедура` is a
+  node type of its own that the function walk never listed, so nearly every
+  1C event handler was invisible; and the grammar has no body node at all —
+  statements hang directly off the definition, off `Если`, `Пока` and
+  `Попытка` — so the search for a `block` wrapper found nothing and `Функция`
+  failed too. Conditions live in an unnamed `expression`, which left every
+  branch labelled with an empty condition.
+- `ИначеЕсли` chains are branches of their own. Their statements were dropped
+  from the graph entirely rather than appearing anywhere.
+- `Попытка`/`Исключение` are split on the keyword token, there being no clause
+  wrapper to find. Both halves used to be dropped.
+- BSL statements are recognised: assignment, `Перем`, call, and
+  `ВызватьИсключение`.
+- Data flow no longer requires a lower-case first letter to accept an
+  identifier as a variable. That rule tells a variable from a type in Rust and
+  Python; BSL capitalises everything, so every read in a 1C module was
+  discarded and every assignment then looked like a store nobody read.
+- Numeric literals, words inside string literals and the name of a called
+  function are no longer counted as variables read, and an assignment's own
+  target is no longer counted as a read of itself.
+- A write to a property (`Запрос.Текст = …`, `Элементы.X.Заголовок = …`) is
+  recorded as an effect rather than a store, and a write to a parameter is
+  not reported dead: BSL passes by reference unless a parameter is declared
+  `Знач`, so `Отказ = Истина` is what a validation handler exists to do.
+  `Знач` is not distinguished, so a genuinely dead write to a by-value
+  parameter is missed — a cheaper error than accusing every validation
+  handler in a configuration.
+- A statement's full text is kept and truncated only when rendered. Data flow
+  mines that text for the variables a statement reads, and cutting it at 100
+  characters hid every read past the cut — 1C statements are long and its
+  identifiers are whole words.
+- The iteration variable of `Для Каждого` is bound on entry to the loop body,
+  and the loop header carries its own source rather than a synthetic label
+  that was read back as a variable named `enhanced`.
+
+## [1.9.1] - 2026-08-26
+
+Follow-up to an adversarial review of 1.9.0 run by three agents over separate
+zones (core and call graph; neural search, embeddings and persistence; MCP,
+HTTP, tools and CI). Every finding here had to come with a concrete failure
+scenario. The recurring shape: a tool that reports success or "clean" for work
+it never did.
+
+### Fixed
+
+- The `wasm` feature builds again, and CI builds it. It is documented
+  (`docs/wasm.md`, `scripts/build-wasm.sh`) but no job ever compiled it, so it
+  had broken in four places: `src/wasm.rs` called `index_snippet` with the
+  arity it had before `repo` was added, `neural_cache` and `config::filter`
+  were not behind `cfg(native)` despite depending on native-only types, and
+  the server binary was compiled for a wasm-only check. The binary now
+  declares `required-features = ["native"]`.
+- Tool arguments are checked against the schema's `type` and `enum`, not only
+  its parameter names and `required` list. Handlers read arguments with
+  `as_u64`/`as_str`, which return `None` on a type mismatch and fall through
+  to the default, so `max_results="50"` quietly returned 10 results and
+  reported success. A whole-valued float still counts as an integer.
+- `scan_security` names the directories it never opened. It can only see
+  indexed files, and the index skips `VENDORED_DIRS` by default — a list that
+  includes `env`, `build` and `dist`, all of which real projects use for
+  source. A repository whose code lives in one of them received a bare "No
+  security issues found", which reads as *clean* and meant *not looked at*.
+- The embedding budget is counted in characters, matching how it was derived
+  (~2.85 chars/token, measured on Cyrillic 1C/BSL source). It was applied
+  through the byte-based `text::truncate`, so on that same corpus — two bytes
+  per character — 23,000 bytes covered 11,500 characters, roughly 4,035 of the
+  8,192 available tokens, and the rest of every long symbol never reached the
+  model.
+- Two models whose names differ only in punctuation no longer destroy each
+  other's embedding cache. `sanitize` maps every non-alphanumeric byte to `_`,
+  so `voyage/code-3` and `voyage-code-3` shared a file; the header check then
+  called the incumbent "a different model" and the file was truncated. Used in
+  turn, each run wiped the other's vectors — silently, permanently, and at the
+  cost of re-buying every vector from the embedding API. The model that
+  claimed the plain name keeps it, so no existing cache is orphaned.
+- `cargo audit` is meaningful again: `quick-xml` moved to 0.41, and the two
+  advisories that remain only through oxigraph's transitive pin are listed in
+  `.cargo/audit.toml` with the reason each is unreachable here. The job had
+  been red continuously, which trained everyone to skip it.
+
+### Performance
+
+- `get_callers` no longer materialises the whole reverse adjacency to answer a
+  question about one node. It allocated a `CallEdge` with two cloned `String`s
+  per edge in the graph — 24,144 of them on narsil's own `src/`, 14.66 ms —
+  and then discarded every bucket but one.
+
 ## [1.9.0] - 2026-08-25
 
 ### Added

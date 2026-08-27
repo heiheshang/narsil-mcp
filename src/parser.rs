@@ -64,6 +64,31 @@ pub struct ParsedFile {
     pub tree: Option<Tree>,
 }
 
+/// Whether the parser recognises this file extension.
+///
+/// Watch mode used to carry its own hard-coded list of 20 extensions, so a
+/// change to a `.bsl`, `.rb` or `.php` file was detected by the watcher and
+/// then silently discarded — `--watch` did nothing at all on those corpora.
+/// Derive the answer from the language table rather than copying it.
+#[must_use]
+pub fn is_supported_extension(ext: &str) -> bool {
+    static EXTENSIONS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+
+    EXTENSIONS
+        .get_or_init(|| match LanguageParser::new() {
+            Ok(parser) => parser
+                .configs
+                .iter()
+                .flat_map(|c| c.config.extensions.iter().copied())
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Could not enumerate supported extensions: {e}");
+                std::collections::HashSet::new()
+            }
+        })
+        .contains(ext)
+}
+
 /// Multi-language parser using tree-sitter
 pub struct LanguageParser {
     configs: Vec<LazyLanguageConfig>,

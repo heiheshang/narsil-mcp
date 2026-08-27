@@ -624,7 +624,22 @@ impl CodeIntelEngine {
                     match store.load_call_graph(repo_path) {
                         Ok(Some(json)) => {
                             if let Some(cg) = self.call_graphs.get(&repo_name) {
-                                if let Err(e) = cg.from_json(&json) {
+                                // A graph that was just built from source is
+                                // authoritative and the snapshot is not:
+                                // `--call-graph` forces a full re-walk (symbol
+                                // reuse is disabled because the call graph
+                                // needs the parse trees), so loading on top
+                                // could only resurrect functions the code no
+                                // longer defines. The snapshot is still worth
+                                // having when nothing was built this run — an
+                                // unreadable or unwalked repository.
+                                if cg.node_count() > 0 {
+                                    debug!(
+                                        "Call-graph for {} was rebuilt from source; \
+                                         ignoring the persisted snapshot",
+                                        repo_name
+                                    );
+                                } else if let Err(e) = cg.from_json(&json) {
                                     warn!(
                                         "Failed to load persisted call-graph for {}: {}",
                                         repo_name, e
@@ -1669,8 +1684,14 @@ impl CodeIntelEngine {
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = symbol.start_line.saturating_sub(context_lines + 1);
-        let end = (symbol.end_line + context_lines).min(lines.len());
+        // The file on disk may be shorter than it was when the symbol was
+        // indexed, which puts start_line past EOF; clamp instead of aborting.
+        let range = crate::text::clamp_line_range(
+            symbol.start_line.saturating_sub(context_lines + 1),
+            symbol.end_line + context_lines,
+            lines.len(),
+        );
+        let (start, end) = (range.start, range.end);
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", symbol.name));
@@ -1922,8 +1943,14 @@ impl CodeIntelEngine {
         };
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = start_line.unwrap_or(1).saturating_sub(1);
-        let end = end_line.unwrap_or(lines.len()).min(lines.len());
+        // start_line/end_line are caller-supplied and frequently come from an
+        // index built against a different revision than `git_ref` renders.
+        let range = crate::text::clamp_line_range(
+            start_line.unwrap_or(1).saturating_sub(1),
+            end_line.unwrap_or(lines.len()),
+            lines.len(),
+        );
+        let (start, end) = (range.start, range.end);
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", path));
@@ -2268,11 +2295,10 @@ impl CodeIntelEngine {
         }
 
         {
-            let (docs, content_b, emb_b, idx_b, vocab_b, df_b) =
-                self.embedding_engine.memory_breakdown();
+            let (docs, content_b, emb_b, idx_b, df_b) = self.embedding_engine.memory_breakdown();
             info!(
-                "[mem] embedding_engine: {} docs, content {:.1} MB, embedding {:.1} MB, id_index {:.1} MB, vocab {:.1} MB, doc_freq {:.1} MB",
-                docs, content_b as f64 / 1e6, emb_b as f64 / 1e6, idx_b as f64 / 1e6, vocab_b as f64 / 1e6, df_b as f64 / 1e6
+                "[mem] embedding_engine: {} docs, content {:.1} MB, embedding {:.1} MB, id_index {:.1} MB, doc_freq {:.1} MB",
+                docs, content_b as f64 / 1e6, emb_b as f64 / 1e6, idx_b as f64 / 1e6, df_b as f64 / 1e6
             );
         }
 
@@ -5749,6 +5775,51 @@ impl CodeIntelEngine {
     /// This helps bound output size for large codebases.
     ///
     /// Results are cached when no pagination is used (offset=None, max_findings=None).
+    /// A line naming directories the scan never opened, or an empty string
+    /// when there are none.
+    ///
+    /// `scan_security` reads only what the index holds, and the index skips
+    /// `VENDORED_DIRS` by default — a list that includes `env`, `build` and
+    /// `dist`, all of which real projects use for source. Without this note a
+    /// repository whose code lives in one of them gets "No security issues
+    /// found", which reads as *clean* when it means *not looked at*.
+    fn unscanned_dirs_note(repo_path: &Path, index_exclude: &[String]) -> String {
+        /// Enough to show the shape of what was skipped without burying the
+        /// findings under a directory listing.
+        const MAX_LISTED: usize = 8;
+
+        let Ok(filter) = crate::security_rules::IndexFilter::new(index_exclude) else {
+            // The scan itself could not have run with an unparseable filter;
+            // stay silent rather than reporting a second, confusing error.
+            return String::new();
+        };
+        let dirs = filter.excluded_dirs(repo_path);
+        if dirs.is_empty() {
+            return String::new();
+        }
+
+        let shown: Vec<String> = dirs
+            .iter()
+            .take(MAX_LISTED)
+            .map(|d| format!("`{}/`", d))
+            .collect();
+        let overflow = dirs.len().saturating_sub(shown.len());
+        let listed = if overflow > 0 {
+            format!("{} and {} more", shown.join(", "), overflow)
+        } else {
+            shown.join(", ")
+        };
+
+        format!(
+            "**Not Scanned**: {} excluded director{} — {}. \
+             Findings below say nothing about their contents; re-include one \
+             with a `!`-prefixed `index_exclude` pattern to scan it.\n",
+            dirs.len(),
+            if dirs.len() == 1 { "y" } else { "ies" },
+            listed
+        )
+    }
+
     pub async fn scan_security(
         &self,
         repo_name: &str,
@@ -5870,6 +5941,10 @@ impl CodeIntelEngine {
         if let Some(ref tags) = ruleset_tags {
             output.push_str(&format!("**Ruleset Filter**: {}\n", tags.join(", ")));
         }
+        output.push_str(&Self::unscanned_dirs_note(
+            &repo_path,
+            &self.options.index_exclude,
+        ));
 
         // Phase C2: Show pagination info
         if truncated {
@@ -7407,9 +7482,12 @@ impl CodeIntelEngine {
 
         // Extract the symbol's code
         let lines: Vec<&str> = content.lines().collect();
-        let start = symbol.start_line.saturating_sub(1);
-        let end = symbol.end_line.min(lines.len());
-        let symbol_code = lines[start..end].join("\n");
+        let symbol_code = lines[crate::text::clamp_line_range(
+            symbol.start_line.saturating_sub(1),
+            symbol.end_line,
+            lines.len(),
+        )]
+        .join("\n");
 
         // Search for similar code — clones of a function belong to the same
         // codebase, so the search stays inside this repository.
@@ -7922,8 +8000,13 @@ impl CodeIntelEngine {
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = center_line.saturating_sub(context + 1);
-        let end = (center_line + context).min(lines.len());
+        // A centre line past EOF would otherwise invert the range.
+        let range = crate::text::clamp_line_range(
+            center_line.saturating_sub(context + 1),
+            center_line + context,
+            lines.len(),
+        );
+        let (start, end) = (range.start, range.end);
 
         let excerpt: String = lines[start..end]
             .iter()

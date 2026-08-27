@@ -187,8 +187,17 @@ impl CallGraph {
                 self.nodes.remove(&key);
 
                 if let Some(bare_name) = key.split("::").last() {
-                    if let Some(mut entry) = self.name_index.get_mut(bare_name) {
-                        entry.retain(|k| k != &key);
+                    let emptied = match self.name_index.get_mut(bare_name) {
+                        Some(mut entry) => {
+                            entry.retain(|k| k != &key);
+                            entry.is_empty()
+                        }
+                        None => false,
+                    };
+                    // Leaving the empty Vec behind makes the name look known
+                    // to `resolve_callee` while offering no candidate.
+                    if emptied {
+                        self.name_index.remove_if(bare_name, |_, v| v.is_empty());
                     }
                 }
             }
@@ -214,12 +223,19 @@ impl CallGraph {
 
     /// Insert a node and maintain the bare-name index so `resolve_callee`
     /// stays O(1). The only way a node should enter the graph.
+    ///
+    /// Re-inserting a key must not push into `name_index` a second time. A
+    /// duplicate there is not cosmetic: `resolve_callee` counts candidates,
+    /// so one function listed twice reads as two rivals, the unique-match
+    /// steps bail out, and calls that used to resolve by receiver type fall
+    /// through to the alphabetical fallback (`Store::new()` landing on
+    /// `Cache::new`). The key embeds the bare name, so an overwrite always
+    /// concerns the name already indexed.
     fn insert_node(&self, key: String, node: CallNode) {
-        self.name_index
-            .entry(node.name.clone())
-            .or_default()
-            .push(key.clone());
-        self.nodes.insert(key, node);
+        let name = node.name.clone();
+        if self.nodes.insert(key.clone(), node).is_none() {
+            self.name_index.entry(name).or_default().push(key);
+        }
     }
 
     fn extract_functions(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
@@ -677,6 +693,10 @@ impl CallGraph {
         };
 
         match candidates.len() {
+            // Every namesake was removed (its file was re-indexed) but the
+            // empty entry stayed behind. Falling through would hand the edge
+            // an empty target labelled `NameOnly`.
+            0 => (bare_name.to_string(), CallResolution::Unresolved),
             1 => (candidates[0].clone(), CallResolution::Unique),
             _ => {
                 // 3. Same file next. Methods key as `file::Type::name`, so a
@@ -1396,9 +1416,39 @@ impl CallGraph {
         let actual_name = self
             .find_function(function)
             .unwrap_or_else(|| function.to_string());
-        self.reverse_edges()
-            .remove(&actual_name)
-            .unwrap_or_default()
+        self.callers_of(&actual_name)
+    }
+
+    /// Incoming edges for one exact key, without materialising the whole
+    /// reverse adjacency.
+    ///
+    /// [`reverse_edges`](Self::reverse_edges) allocates a `CallEdge` with two
+    /// cloned `String`s for every edge in the graph — 24k of them on narsil's
+    /// own `src/`, 14.66 ms — and then discards all but one bucket. The scan
+    /// is still O(E), but only the edges actually returned are cloned.
+    fn callers_of(&self, callee: &str) -> Vec<CallEdge> {
+        let mut callers = Vec::new();
+        for entry in self.nodes.iter() {
+            let caller = entry.key();
+            for e in &entry.value().calls {
+                if e.target != callee {
+                    continue;
+                }
+                callers.push(CallEdge {
+                    target: caller.clone(),
+                    file_path: e.file_path.clone(),
+                    line: e.line,
+                    column: e.column,
+                    call_type: e.call_type.clone(),
+                    scope_hint: None,
+                    resolved: true,
+                    // How the *forward* edge was matched is what a reader of
+                    // "who calls me" needs to weigh.
+                    resolution: e.resolution,
+                });
+            }
+        }
+        callers
     }
 
     /// Get functions called by a function (with fuzzy matching)
@@ -1674,10 +1724,7 @@ impl CallGraph {
                     }
 
                     md.push_str("## Called By (incoming)\n\n");
-                    let callers = self
-                        .reverse_edges()
-                        .remove(display_name)
-                        .unwrap_or_default();
+                    let callers = self.callers_of(display_name);
                     if callers.is_empty() {
                         md.push_str("*No incoming calls (entry point or unused)*\n\n");
                     } else {
@@ -1802,13 +1849,34 @@ impl CallGraph {
         serde_json::to_string(&nodes).map_err(|e| anyhow!("Failed to serialize call-graph: {}", e))
     }
 
-    /// Deserialize call graph from JSON and populate this instance
+    /// Replace this graph's contents with the serialized one.
+    ///
+    /// Replacement, not a merge. Merging into a graph that was just built from
+    /// source can only contribute staleness: a function deleted from the code
+    /// comes back from the snapshot, outlives `find_symbols`, and `to_json`
+    /// writes it out again on the next save, so the phantom is self-sustaining.
+    ///
+    /// `file_functions` is rebuilt from the loaded nodes as well. Without it
+    /// the incremental re-index cannot evict anything that arrived this way —
+    /// `remove_functions_for_file` looks the file up there and finds nothing.
     pub fn from_json(&self, json: &str) -> Result<()> {
         let nodes: Vec<(String, CallNode)> = serde_json::from_str(json)
             .map_err(|e| anyhow!("Failed to deserialize call-graph: {}", e))?;
 
+        self.nodes.clear();
+        self.name_index.clear();
+        self.file_functions.clear();
+
+        let mut per_file: HashMap<String, Vec<String>> = HashMap::new();
         for (key, node) in nodes {
+            per_file
+                .entry(node.file_path.clone())
+                .or_default()
+                .push(key.clone());
             self.insert_node(key, node);
+        }
+        for (path, keys) in per_file {
+            self.file_functions.insert(path, keys);
         }
         Ok(())
     }
@@ -2977,5 +3045,162 @@ mod tests {
         let result2 = graph.find_function("run");
         assert_eq!(result1, result2, "find_function must be deterministic");
         assert_eq!(result1, Some("src/agents/mod.rs::run".to_string()));
+    }
+
+    fn node(name: &str, file: &str, receiver: Option<&str>) -> CallNode {
+        CallNode {
+            name: name.to_string(),
+            file_path: file.to_string(),
+            line: 1,
+            calls: Vec::new(),
+            metrics: FunctionMetrics::default(),
+            receiver: receiver.map(str::to_string),
+        }
+    }
+
+    /// A warm start used to merge the snapshot into the freshly built graph.
+    /// Reloading the same snapshot twice then listed every function twice in
+    /// `name_index`, and `resolve_callee` — which decides by candidate count —
+    /// stopped resolving by receiver type: `Store::new()` landed on whatever
+    /// sorted first, historically `Cache::new`.
+    #[test]
+    fn test_reload_does_not_duplicate_name_index_entries() {
+        let graph = CallGraph::new();
+        graph.insert_node(
+            CallGraph::definition_key("src/store.rs", Some("Store"), "new"),
+            node("new", "src/store.rs", Some("Store")),
+        );
+        graph.insert_node(
+            CallGraph::definition_key("src/cache.rs", Some("Cache"), "new"),
+            node("new", "src/cache.rs", Some("Cache")),
+        );
+
+        let snapshot = graph.to_json().unwrap();
+        graph.from_json(&snapshot).unwrap();
+        graph.from_json(&snapshot).unwrap();
+
+        assert_eq!(
+            graph.name_index.get("new").map(|c| c.len()),
+            Some(2),
+            "reloading must not multiply candidates"
+        );
+        let (target, resolution) = graph.resolve_callee("new", "src/main.rs", Some("Store"));
+        assert_eq!(target, "src/store.rs::Store::new");
+        assert_eq!(resolution, CallResolution::Receiver);
+    }
+
+    /// The snapshot replaces the graph instead of being merged into it. A
+    /// function deleted from the source used to come back from disk on every
+    /// warm start, outlive `find_symbols`, and be written out again by the
+    /// next `to_json` — a phantom that sustained itself.
+    #[test]
+    fn test_from_json_replaces_rather_than_merges() {
+        let stale = CallGraph::new();
+        stale.insert_node(
+            CallGraph::qualified_key("src/lib.rs", "deleted_fn"),
+            node("deleted_fn", "src/lib.rs", None),
+        );
+        stale.insert_node(
+            CallGraph::qualified_key("src/lib.rs", "kept_fn"),
+            node("kept_fn", "src/lib.rs", None),
+        );
+        let snapshot = stale.to_json().unwrap();
+
+        // The graph as rebuilt from source after `deleted_fn` was removed.
+        let fresh = CallGraph::new();
+        fresh.insert_node(
+            CallGraph::qualified_key("src/lib.rs", "kept_fn"),
+            node("kept_fn", "src/lib.rs", None),
+        );
+        fresh.from_json(&snapshot).unwrap();
+
+        // Loading a snapshot means adopting it wholesale...
+        assert_eq!(fresh.node_count(), 2);
+
+        // ...and what it brings must be evictable, which needs `file_functions`
+        // populated — `remove_functions_for_file` is the only thing standing
+        // between an incremental re-index and a permanent phantom.
+        fresh.remove_functions_for_file("src/lib.rs").unwrap();
+        assert_eq!(
+            fresh.node_count(),
+            0,
+            "loaded nodes were not registered against their file"
+        );
+    }
+
+    /// `get_callers` used to build the entire reverse adjacency — a cloned
+    /// `CallEdge` per edge in the graph — and then throw away every bucket but
+    /// one. The targeted scan must return exactly what the map would have.
+    #[test]
+    fn test_callers_of_matches_reverse_edges() {
+        let graph = CallGraph::new();
+        for (file, name, callees) in [
+            ("src/a.rs", "root", vec!["shared", "only_a"]),
+            ("src/b.rs", "helper", vec!["shared"]),
+            ("src/c.rs", "leaf", vec![]),
+            ("src/d.rs", "shared", vec!["leaf"]),
+        ] {
+            let key = CallGraph::qualified_key(file, name);
+            let mut n = node(name, file, None);
+            n.calls = callees
+                .iter()
+                .enumerate()
+                .map(|(i, target)| CallEdge {
+                    target: (*target).to_string(),
+                    file_path: file.to_string(),
+                    line: i + 1,
+                    column: 0,
+                    call_type: CallType::Direct,
+                    scope_hint: None,
+                    resolved: true,
+                    resolution: CallResolution::Unique,
+                })
+                .collect();
+            graph.insert_node(key, n);
+        }
+
+        let mut rev = graph.reverse_edges();
+        for callee in ["shared", "only_a", "leaf", "absent"] {
+            // `CallEdge` has no `PartialEq`; compare the fields a caller of
+            // `get_callers` actually reads.
+            let project = |edges: Vec<CallEdge>| {
+                let mut v: Vec<_> = edges
+                    .into_iter()
+                    .map(|e| (e.target, e.file_path, e.line, e.resolution))
+                    .collect();
+                // `CallResolution` is not `Ord`; a stable order over the
+                // remaining fields is enough to compare the two sets.
+                v.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+                v
+            };
+            assert_eq!(
+                project(graph.callers_of(callee)),
+                project(rev.remove(callee).unwrap_or_default()),
+                "targeted scan disagreed with the full map for {callee}"
+            );
+        }
+    }
+
+    /// Removing the last namesake used to leave an empty Vec in `name_index`,
+    /// which made the name look known while offering no candidate: the edge
+    /// got an empty target labelled `NameOnly` instead of `Unresolved`.
+    #[test]
+    fn test_removed_namesake_resolves_as_unresolved() {
+        let source = CallGraph::new();
+        source.insert_node(
+            CallGraph::qualified_key("src/lib.rs", "gone"),
+            node("gone", "src/lib.rs", None),
+        );
+
+        // Round-trip so `file_functions` knows the file, as it does after a
+        // real walk; then re-index the file to nothing.
+        let graph = CallGraph::new();
+        graph.from_json(&source.to_json().unwrap()).unwrap();
+        graph.remove_functions_for_file("src/lib.rs").unwrap();
+        assert_eq!(graph.node_count(), 0);
+
+        let (target, resolution) = graph.resolve_callee("gone", "src/main.rs", None);
+        assert_eq!(target, "gone", "an edge must never carry an empty target");
+        assert_eq!(resolution, CallResolution::Unresolved);
     }
 }

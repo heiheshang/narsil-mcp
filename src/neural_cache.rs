@@ -60,7 +60,7 @@ impl EmbeddingCache {
     pub fn open(dir: &Path, model: &str, dimension: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create cache directory {:?}", dir))?;
-        let path = dir.join(format!("emb-{}-{}.bin", sanitize(model), dimension));
+        let path = cache_path(dir, model, dimension);
 
         let mut entries = HashMap::new();
         let mut valid_len = 0u64;
@@ -190,6 +190,60 @@ fn sanitize(model: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// The file this model's vectors belong in.
+///
+/// `sanitize` maps every non-alphanumeric byte to `_`, so distinct models
+/// collapse onto one name — `voyage/code-3` and `voyage-code-3` both become
+/// `voyage_code_3`. The header check then rejects the incumbent's file as
+/// "a different model" and `open` *truncates* it, so two such models used in
+/// turn wipe each other's vectors on every run: silent, permanent, and paid
+/// for again per token at the embedding API.
+///
+/// Whichever model claimed the plain name keeps it, so no existing cache is
+/// orphaned; a colliding model gets its own file, keyed by a digest of the
+/// exact model string.
+fn cache_path(dir: &Path, model: &str, dimension: usize) -> PathBuf {
+    let plain = dir.join(format!("emb-{}-{}.bin", sanitize(model), dimension));
+    match header_model(&plain) {
+        // Unreadable or absent: the plain name is free, or holds something
+        // that is no use to anyone and may be reset.
+        None => plain,
+        Some(owner) if owner == model => plain,
+        Some(_) => dir.join(format!(
+            "emb-{}-{}-{}.bin",
+            sanitize(model),
+            dimension,
+            model_digest(model)
+        )),
+    }
+}
+
+/// The model named in an existing cache header, or `None` if the file is
+/// missing, not a cache, or too damaged to say.
+fn header_model(path: &Path) -> Option<String> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic).ok()?;
+    if &magic != MAGIC {
+        return None;
+    }
+    if read_u16(&mut reader).ok()? != FORMAT_VERSION {
+        return None;
+    }
+    let _dimension = read_u32(&mut reader).ok()?;
+    let model_len = read_u16(&mut reader).ok()? as usize;
+    let mut model_bytes = vec![0u8; model_len];
+    reader.read_exact(&mut model_bytes).ok()?;
+    String::from_utf8(model_bytes).ok()
+}
+
+/// Short digest of the exact model string, to separate names that `sanitize`
+/// would otherwise merge.
+fn model_digest(model: &str) -> String {
+    let digest = Sha256::digest(model.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn write_header(file: &mut File, model: &str, dimension: usize) -> Result<()> {
@@ -562,5 +616,43 @@ mod tests {
         backend.embed_batch(&["alpha".to_string()]).unwrap();
         let reopened = EmbeddingCache::open(&dir, "test-model", 4).unwrap();
         assert_eq!(reopened.len(), 1);
+    }
+
+    /// `sanitize` turns every non-alphanumeric byte into `_`, so two real
+    /// model names can land on one file. The header check then called the
+    /// incumbent "a different model" and `open` truncated it — so alternating
+    /// between the two wiped both caches on every run, and every vector had
+    /// to be bought again from the embedding API.
+    #[test]
+    fn colliding_model_names_do_not_wipe_each_others_vectors() {
+        let dir = temp_dir("collision");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Both sanitize to `voyage_code_3`.
+        let (first, second) = ("voyage/code-3", "voyage-code-3");
+
+        let cache = EmbeddingCache::open(&dir, first, 4).unwrap();
+        let backend = CachedBackend::new(Arc::new(CountingBackend::new(4)), cache);
+        backend.embed_batch(&["alpha".to_string()]).unwrap();
+
+        // The second model must get its own file, not reset the first's.
+        let other = EmbeddingCache::open(&dir, second, 4).unwrap();
+        assert_eq!(other.len(), 0, "the second model starts empty, as it must");
+        let backend = CachedBackend::new(Arc::new(CountingBackend::new(4)), other);
+        backend.embed_batch(&["beta".to_string()]).unwrap();
+
+        // Reopening the first must still find its vector.
+        let reopened = EmbeddingCache::open(&dir, first, 4).unwrap();
+        assert_eq!(
+            reopened.len(),
+            1,
+            "the first model's cache was destroyed by the second"
+        );
+        let reopened_second = EmbeddingCache::open(&dir, second, 4).unwrap();
+        assert_eq!(reopened_second.len(), 1);
+
+        // The model that claimed the plain name keeps it, so upgrading does
+        // not orphan a cache that already exists on disk.
+        assert!(dir.join("emb-voyage_code_3-4.bin").exists());
     }
 }

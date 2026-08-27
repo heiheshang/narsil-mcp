@@ -405,9 +405,14 @@ impl ControlFlowGraph {
             if !block.statements.is_empty() {
                 md.push_str("```\n");
                 for stmt in &block.statements {
+                    // Statements are stored whole so data flow can read them;
+                    // one line of a report is not the place to print all of a
+                    // 400-character 1C call.
                     md.push_str(&format!(
                         "{:4}: {:?} - {}\n",
-                        stmt.line, stmt.kind, stmt.text
+                        stmt.line,
+                        stmt.kind,
+                        crate::text::truncate_with_ellipsis(stmt.text.trim(), 160)
                     ));
                 }
                 md.push_str("```\n\n");
@@ -638,11 +643,20 @@ impl CfgBuilder {
         let entry = builder.create_block("entry");
         builder.set_entry(entry);
 
-        // Find function body
-        let body = find_function_body(node).ok_or_else(|| anyhow!("No function body found"))?;
-
-        // Build CFG from body
-        let exit = builder.process_block_node(entry, body, source)?;
+        // Build CFG from the body, whichever shape the grammar gives it.
+        let exit = builder
+            .process_body_of(
+                entry,
+                node,
+                source,
+                &[
+                    "block",
+                    "function_body",
+                    "statement_block",
+                    "compound_statement",
+                ],
+            )?
+            .ok_or_else(|| anyhow!("No function body found"))?;
 
         // Set exit
         builder.set_exit(exit);
@@ -675,6 +689,58 @@ impl CfgBuilder {
         Ok(active_block)
     }
 
+    /// Process the body of `node` into `block`, whichever shape the grammar
+    /// gives it.
+    ///
+    /// Most grammars wrap a body in a node of its own (`block`,
+    /// `statement_block`, `compound_statement`). BSL has no such node at all:
+    /// the statements of a `Процедура`, an `Если` or a `Пока` are direct
+    /// children of that construct. Every body site used to look only for the
+    /// wrapper, so on BSL it found nothing and silently produced an empty
+    /// branch — or, for a whole procedure, refused to build a CFG at all.
+    ///
+    /// Returns the block control reaches at the end of the body, or `None`
+    /// when the construct genuinely has no body.
+    fn process_body_of(
+        &mut self,
+        block: BlockId,
+        node: Node,
+        source: &[u8],
+        wrappers: &[&str],
+    ) -> Result<Option<BlockId>> {
+        for wrapper in wrappers {
+            if let Some(body) = find_child_by_kind(node, wrapper) {
+                return Ok(Some(self.process_block_node(block, body, source)?));
+            }
+        }
+        if !has_inline_statements(node) {
+            return Ok(None);
+        }
+        Ok(Some(self.process_inline_body(block, node, source)?))
+    }
+
+    /// Process the statements hanging directly off `node`, skipping the
+    /// keywords, name, parameters and condition around them.
+    ///
+    /// Clause wrappers (`else_clause`, `elseif_clause`, `except_clause`) are
+    /// skipped too: each is a branch of its own and is wired up by the
+    /// handler that owns it, not swallowed into the current block.
+    fn process_inline_body(
+        &mut self,
+        current: BlockId,
+        node: Node,
+        source: &[u8],
+    ) -> Result<BlockId> {
+        let mut active = current;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if is_inline_statement(child.kind()) {
+                active = self.process_statement(active, child, source)?;
+            }
+        }
+        Ok(active)
+    }
+
     fn process_statement(
         &mut self,
         current: BlockId,
@@ -683,12 +749,14 @@ impl CfgBuilder {
     ) -> Result<BlockId> {
         let kind = node.kind();
         let line = node.start_position().row + 1;
-        let text = node
-            .utf8_text(source)
-            .unwrap_or("")
-            .chars()
-            .take(100)
-            .collect::<String>();
+        // The whole statement, not a prefix: the data-flow pass mines this
+        // text for the variables the statement reads, so cutting it at 100
+        // characters hid every read past that point. 1C statements are long
+        // and its identifiers are whole words — `ОткрытьФорму(..., ЭтаФорма,
+        // ..., ОписаниеОповещения, ...)` puts its reads well beyond the cut —
+        // so the variables were reported as assigned and never used. Display
+        // truncation belongs in the renderer, and lives there now.
+        let text = node.utf8_text(source).unwrap_or("").to_string();
 
         match kind {
             // Control flow statements
@@ -937,6 +1005,82 @@ impl CfgBuilder {
                 );
                 Ok(current)
             }
+            // BSL: `Перем А, Б;` — names become defined with no value.
+            // That is what `PatternBinding` already means downstream: the
+            // data-flow pass records a definition with no right-hand side, so
+            // reading such a variable before assigning it is visible.
+            "var_statement" => {
+                let mut cursor = node.walk();
+                let variables: Vec<String> = node
+                    .children_by_field_name("var_name", &mut cursor)
+                    .filter_map(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string())
+                    .collect();
+                self.add_statement(
+                    current,
+                    Statement {
+                        line,
+                        kind: StatementKind::PatternBinding { variables },
+                        text,
+                    },
+                );
+                Ok(current)
+            }
+
+            // BSL: `Х = ...;` is a statement, not an expression, and it names
+            // its target in a field. Reaching definitions and dead-store
+            // detection both key off `Assignment`, so without this arm the
+            // whole data-flow layer saw a 1C module as a list of opaque
+            // statements.
+            "assignment_statement" => {
+                let left = node.child_by_field_name("left");
+                // Writing a property — `Запрос.Текст = ...`, `Элементы.X.Заголовок
+                // = ...` — is the effect the code exists for, not a store into a
+                // local that someone might forget to read. Recording it as an
+                // assignment made the dead-store report accuse every form-setup
+                // procedure in the configuration.
+                let writes_property = left.is_some_and(|n| n.kind() == "property_access");
+                let kind = if writes_property {
+                    StatementKind::Expression
+                } else {
+                    let variable = left
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| text.split('=').next().unwrap_or("").trim().to_string());
+                    StatementKind::Assignment { variable }
+                };
+                self.add_statement(current, Statement { line, kind, text });
+                Ok(current)
+            }
+
+            // BSL: a bare procedure call.
+            "call_statement" => {
+                self.add_statement(
+                    current,
+                    Statement {
+                        line,
+                        kind: StatementKind::Expression,
+                        text,
+                    },
+                );
+                Ok(current)
+            }
+
+            // BSL: `ВызватьИсключение` — the same shape as `throw`.
+            "rise_error_statement" => {
+                self.add_statement(
+                    current,
+                    Statement {
+                        line,
+                        kind: StatementKind::ControlFlow,
+                        text,
+                    },
+                );
+                self.set_terminator(current, Terminator::Jump);
+                let next = self.create_block("after_raise");
+                Ok(next)
+            }
+
             // Assignment expressions (all languages)
             "assignment_expression" => {
                 let stmt_kind = if text.contains('=') {
@@ -1115,13 +1259,45 @@ impl CfgBuilder {
         }
 
         // Process then branch
-        if let Some(then_body) =
-            find_child_by_kind(node, "block").or_else(|| find_child_by_kind(node, "consequence"))
-        {
-            let then_exit = self.process_block_node(then_block, then_body, source)?;
-            self.add_edge(then_exit, merge_block, EdgeKind::FallThrough);
-        } else {
-            self.add_edge(then_block, merge_block, EdgeKind::FallThrough);
+        match self.process_body_of(then_block, node, source, &["block", "consequence"])? {
+            Some(then_exit) => self.add_edge(then_exit, merge_block, EdgeKind::FallThrough),
+            None => self.add_edge(then_block, merge_block, EdgeKind::FallThrough),
+        }
+
+        // Walk the `else if` chain, if any, hanging the next test off the
+        // previous one's false edge. BSL spells these `elseif_clause` and they
+        // are extremely common in 1C; without this their statements were
+        // dropped from the graph entirely rather than appearing on a branch.
+        let mut false_from = current;
+        let mut cursor = node.walk();
+        let elseif_clauses: Vec<Node> = node
+            .named_children(&mut cursor)
+            .filter(|child| matches!(child.kind(), "elseif_clause" | "else_if_clause"))
+            .collect();
+
+        for clause in elseif_clauses {
+            let test_block = self.create_block("elseif");
+            self.add_edge(false_from, test_block, EdgeKind::FalseBranch);
+
+            let condition = extract_condition(clause, source).unwrap_or_default();
+            self.add_statement(
+                test_block,
+                Statement {
+                    line: clause.start_position().row + 1,
+                    kind: StatementKind::ControlFlow,
+                    text: format!("else if {}", condition),
+                },
+            );
+            self.set_terminator(test_block, Terminator::Branch { condition });
+
+            let body_block = self.create_block("elseif_body");
+            self.add_edge(test_block, body_block, EdgeKind::TrueBranch);
+            match self.process_body_of(body_block, clause, source, &["block", "consequence"])? {
+                Some(body_exit) => self.add_edge(body_exit, merge_block, EdgeKind::FallThrough),
+                None => self.add_edge(body_block, merge_block, EdgeKind::FallThrough),
+            }
+
+            false_from = test_block;
         }
 
         // Check for else
@@ -1129,13 +1305,24 @@ impl CfgBuilder {
             .or_else(|| find_child_by_kind(node, "alternative"))
         {
             let else_block = self.create_block("else");
-            self.add_edge(current, else_block, EdgeKind::FalseBranch);
+            self.add_edge(false_from, else_block, EdgeKind::FalseBranch);
 
-            let else_exit = self.process_block_node(else_block, else_clause, source)?;
+            let else_exit = match self.process_body_of(
+                else_block,
+                else_clause,
+                source,
+                &["block", "consequence"],
+            )? {
+                Some(exit) => exit,
+                // Grammars that put the else body straight in the clause:
+                // Rust's `else_clause` holds a `block`, or a nested
+                // `if_expression` for `else if`.
+                None => self.process_block_node(else_block, else_clause, source)?,
+            };
             self.add_edge(else_exit, merge_block, EdgeKind::FallThrough);
         } else {
-            // No else - false branch goes directly to merge
-            self.add_edge(current, merge_block, EdgeKind::FalseBranch);
+            // No else - the last false branch goes directly to merge
+            self.add_edge(false_from, merge_block, EdgeKind::FalseBranch);
         }
 
         Ok(merge_block)
@@ -1196,11 +1383,9 @@ impl CfgBuilder {
         }
 
         // Process body
-        if let Some(body) = find_child_by_kind(node, "block") {
-            let body_exit = self.process_block_node(body_block, body, source)?;
-            self.add_edge(body_exit, header, EdgeKind::LoopBack);
-        } else {
-            self.add_edge(body_block, header, EdgeKind::LoopBack);
+        match self.process_body_of(body_block, node, source, &["block"])? {
+            Some(body_exit) => self.add_edge(body_exit, header, EdgeKind::LoopBack),
+            None => self.add_edge(body_block, header, EdgeKind::LoopBack),
         }
 
         self.pop_loop();
@@ -1249,11 +1434,9 @@ impl CfgBuilder {
             }
         }
 
-        if let Some(body) = find_child_by_kind(node, "block") {
-            let body_exit = self.process_block_node(body_block, body, source)?;
-            self.add_edge(body_exit, header, EdgeKind::LoopBack);
-        } else {
-            self.add_edge(body_block, header, EdgeKind::LoopBack);
+        match self.process_body_of(body_block, node, source, &["block"])? {
+            Some(body_exit) => self.add_edge(body_exit, header, EdgeKind::LoopBack),
+            None => self.add_edge(body_block, header, EdgeKind::LoopBack),
         }
 
         self.pop_loop();
@@ -1283,11 +1466,9 @@ impl CfgBuilder {
 
         self.add_edge(header, body_block, EdgeKind::FallThrough);
 
-        if let Some(body) = find_child_by_kind(node, "block") {
-            let body_exit = self.process_block_node(body_block, body, source)?;
-            self.add_edge(body_exit, header, EdgeKind::LoopBack);
-        } else {
-            self.add_edge(body_block, header, EdgeKind::LoopBack);
+        match self.process_body_of(body_block, node, source, &["block"])? {
+            Some(body_exit) => self.add_edge(body_exit, header, EdgeKind::LoopBack),
+            None => self.add_edge(body_block, header, EdgeKind::LoopBack),
         }
 
         self.pop_loop();
@@ -1498,6 +1679,36 @@ impl CfgBuilder {
 
         self.add_edge(current, try_block, EdgeKind::FallThrough);
 
+        // BSL has no clause wrappers: the `Попытка` and `Исключение`
+        // statements are all direct children of `try_statement`, separated
+        // only by the keyword token. Searching for a `catch_clause` that
+        // cannot exist dropped both halves of the construct from the graph.
+        if let Some(except_kw) = find_child_by_kind(node, "EXCEPT_KEYWORD") {
+            let split = except_kw.start_byte();
+            let mut cursor = node.walk();
+            let (guarded, handler): (Vec<Node>, Vec<Node>) = node
+                .named_children(&mut cursor)
+                .filter(|child| is_inline_statement(child.kind()))
+                .partition(|child| child.start_byte() < split);
+
+            let mut try_exit = try_block;
+            for stmt in guarded {
+                try_exit = self.process_statement(try_exit, stmt, source)?;
+            }
+            self.add_edge(try_exit, merge, EdgeKind::FallThrough);
+
+            let handler_block = self.create_block("except");
+            // The exception edge leaves the guarded region, not its exit.
+            self.add_edge(try_block, handler_block, EdgeKind::Jump);
+            let mut handler_exit = handler_block;
+            for stmt in handler {
+                handler_exit = self.process_statement(handler_exit, stmt, source)?;
+            }
+            self.add_edge(handler_exit, merge, EdgeKind::FallThrough);
+
+            return Ok(merge);
+        }
+
         // Process try body and catch/finally clauses
         let mut cursor = node.walk();
         let mut try_exit = try_block;
@@ -1653,12 +1864,16 @@ impl CfgBuilder {
         let header = self.create_block("enhanced_for_header");
         self.add_edge(current, header, EdgeKind::FallThrough);
 
+        // The header's own source, not a synthetic label: the data-flow pass
+        // mines a statement's text for the variables it reads, so the literal
+        // string "enhanced for" was read back as a variable named `enhanced`
+        // and reported as never initialised.
         self.add_statement(
             header,
             Statement {
                 line: node.start_position().row + 1,
                 kind: StatementKind::ControlFlow,
-                text: "enhanced for".to_string(),
+                text: loop_header_text(node, source),
             },
         );
         self.set_terminator(header, Terminator::Loop);
@@ -1671,14 +1886,29 @@ impl CfgBuilder {
         self.add_edge(header, body_block, EdgeKind::TrueBranch);
         self.add_edge(header, exit_block, EdgeKind::FalseBranch);
 
-        // Process body
-        if let Some(body) =
-            find_child_by_kind(node, "block").or_else(|| find_child_by_kind(node, "statement"))
+        // The iteration variable is bound on entry to the body. Without this
+        // it read as a variable used before any assignment — on every
+        // iteration of every `Для Каждого`.
+        if let Some(var) = find_child_by_kind(node, "identifier")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string())
         {
-            let body_exit = self.process_block_node(body_block, body, source)?;
-            self.add_edge(body_exit, header, EdgeKind::LoopBack);
-        } else {
-            self.add_edge(body_block, header, EdgeKind::LoopBack);
+            self.add_statement(
+                body_block,
+                Statement {
+                    line: node.start_position().row + 1,
+                    kind: StatementKind::PatternBinding {
+                        variables: vec![var],
+                    },
+                    text: loop_header_text(node, source),
+                },
+            );
+        }
+
+        // Process body
+        match self.process_body_of(body_block, node, source, &["block", "statement"])? {
+            Some(body_exit) => self.add_edge(body_exit, header, EdgeKind::LoopBack),
+            None => self.add_edge(body_block, header, EdgeKind::LoopBack),
         }
 
         self.pop_loop();
@@ -1703,11 +1933,9 @@ impl CfgBuilder {
         self.push_loop(condition_block, exit_block);
 
         // Process body first (do-while executes body at least once)
-        if let Some(body) = find_child_by_kind(node, "block") {
-            let body_exit = self.process_block_node(body_block, body, source)?;
-            self.add_edge(body_exit, condition_block, EdgeKind::FallThrough);
-        } else {
-            self.add_edge(body_block, condition_block, EdgeKind::FallThrough);
+        match self.process_body_of(body_block, node, source, &["block"])? {
+            Some(body_exit) => self.add_edge(body_exit, condition_block, EdgeKind::FallThrough),
+            None => self.add_edge(body_block, condition_block, EdgeKind::FallThrough),
         }
 
         // Condition
@@ -1829,12 +2057,7 @@ impl CfgBuilder {
         node: Node,
         source: &[u8],
     ) -> Result<BlockId> {
-        let text = node
-            .utf8_text(source)
-            .unwrap_or("")
-            .chars()
-            .take(100)
-            .collect::<String>();
+        let text = node.utf8_text(source).unwrap_or("").to_string();
         let line = node.start_position().row + 1;
 
         // Determine the type of jump
@@ -2091,30 +2314,6 @@ fn find_while_let_pattern(while_node: Node) -> Option<Node> {
 
 // Helper functions
 
-fn find_function_body(node: Node) -> Option<Node> {
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            // Handle body node names across different languages:
-            // - "block": Rust, Python, Go
-            // - "function_body": Kotlin
-            // - "statement_block": JavaScript, TypeScript
-            // - "compound_statement": C, C++
-            if matches!(
-                child.kind(),
-                "block" | "function_body" | "statement_block" | "compound_statement"
-            ) {
-                return Some(child);
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-    None
-}
-
 /// Extract function parameter names from a function definition node
 fn extract_function_parameters(node: Node, source: &[u8]) -> Vec<String> {
     let mut params = Vec::new();
@@ -2205,6 +2404,60 @@ fn extract_param_name(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// The source text of a loop's header — everything before its first
+/// statement.
+///
+/// Used as the text of the header block, so the data-flow pass sees the
+/// variables the loop actually reads instead of a synthetic label.
+fn loop_header_text(node: Node, source: &[u8]) -> String {
+    let mut cursor = node.walk();
+    let body_start = node
+        .named_children(&mut cursor)
+        .find(|child| is_inline_statement(child.kind()))
+        .map_or(node.end_byte(), |child| child.start_byte());
+
+    let header = source
+        .get(node.start_byte()..body_start)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or("for");
+
+    header
+        .lines()
+        .next()
+        .unwrap_or("for")
+        .trim()
+        .chars()
+        .take(100)
+        .collect()
+}
+
+/// Whether `kind` is a statement that a flat grammar hangs directly off its
+/// parent rather than wrapping in a body node.
+///
+/// Every BSL statement node is named `*_statement`; `preprocessor` is the one
+/// exception (`#Если`, `#Область`). Keywords are upper-case, and `expression`,
+/// `identifier`, `parameters` and the `*_clause` wrappers do not match either,
+/// so this admits exactly the statements.
+fn is_inline_statement(kind: &str) -> bool {
+    kind.ends_with("_statement") || kind == "preprocessor"
+}
+
+/// Whether `node` has any statement hanging directly off it.
+fn has_inline_statements(node: Node) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if is_inline_statement(cursor.node().kind()) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
 fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
@@ -2240,7 +2493,12 @@ fn extract_condition(node: Node, source: &[u8]) -> Option<String> {
             }
         }
     }
-    None
+    // BSL wraps the condition of `Если`/`Пока` in a plain `expression` child
+    // with no field and no parentheses, so none of the shapes above match and
+    // every branch used to be labelled with an empty condition.
+    find_child_by_kind(node, "expression")
+        .and_then(|child| child.utf8_text(source).ok())
+        .map(|s| s.to_string())
 }
 
 fn extract_variable_name(node: Node, source: &[u8]) -> Option<String> {
@@ -2445,6 +2703,10 @@ fn walk_for_functions(
                 | "method_declaration"
                 // Java, C# constructors
                 | "constructor_declaration"
+                // BSL: `Процедура` is a separate node from `Функция`, and it
+                // is what nearly every 1C event handler is. Without it the
+                // whole flow layer was blind to most of a 1C codebase.
+                | "procedure_definition"
         ) {
             // Extract function name
             if let Some(name) = extract_function_name_from_node(node, source) {
@@ -3984,6 +4246,134 @@ fun test() {
         assert!(
             cfg.blocks.len() >= 3,
             "Try-catch should create multiple blocks"
+        );
+    }
+
+    /// BSL was invisible to the whole flow layer. `Процедура` is a node type
+    /// of its own that the function walk did not list, and the grammar has no
+    /// body node at all — statements hang directly off the definition — so
+    /// even `Функция` failed with "no function body". Every call answered
+    /// `Function 'X' not found`, which reads as "there is no such function"
+    /// while meaning "this language is unsupported".
+    #[test]
+    fn test_bsl_procedure_and_function_cfg() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bsl::LANGUAGE.into())
+            .unwrap();
+
+        let source = "Процедура Приветствие(Отказ)\n\tЕсли Отказ Тогда\n\t\tВозврат;\n\tКонецЕсли;\n\tСообщить(\"привет\");\nКонецПроцедуры\n\nФункция Сумма(Список)\n\tИтог = 0;\n\tДля Каждого Элемент Из Список Цикл\n\t\tИтог = Итог + Элемент;\n\tКонецЦикла;\n\tВозврат Итог;\nКонецФункции\n";
+
+        let tree = parser.parse(source, None).unwrap();
+        let cfgs = analyze_function(&tree, source, "Module.bsl").unwrap();
+
+        let names: Vec<&str> = cfgs.iter().map(|c| c.function_name.as_str()).collect();
+        assert!(
+            names.contains(&"Приветствие"),
+            "a `Процедура` must reach the flow layer, got {names:?}"
+        );
+        assert!(
+            names.contains(&"Сумма"),
+            "a `Функция` must reach the flow layer, got {names:?}"
+        );
+
+        // The procedure branches, so its guarded `Возврат` is its own block.
+        let proc = cfgs
+            .iter()
+            .find(|c| c.function_name == "Приветствие")
+            .unwrap();
+        assert!(
+            proc.blocks.len() >= 3,
+            "`Если` must produce branches, got {} block(s)",
+            proc.blocks.len()
+        );
+        assert!(
+            proc.blocks
+                .values()
+                .any(|b| b.statements.iter().any(|s| s.text.contains("Сообщить"))),
+            "the statements after `КонецЕсли` are missing from the graph"
+        );
+
+        // The loop must close, and its body statement must be inside it.
+        let func = cfgs.iter().find(|c| c.function_name == "Сумма").unwrap();
+        assert!(
+            func.edges.iter().any(|e| e.kind == EdgeKind::LoopBack),
+            "`Для Каждого` must produce a loop back edge"
+        );
+        assert!(
+            func.blocks.values().any(|b| b.statements.iter().any(|s| {
+                matches!(&s.kind, StatementKind::Assignment { variable } if variable == "Итог")
+            })),
+            "`Итог = Итог + Элемент` must be recorded as an assignment"
+        );
+    }
+
+    /// `ИначеЕсли` is everywhere in 1C code. Its statements used to be dropped
+    /// from the graph entirely rather than appearing on a branch of their own.
+    #[test]
+    fn test_bsl_elseif_chain_is_a_branch() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bsl::LANGUAGE.into())
+            .unwrap();
+
+        let source = "Процедура Выбор(Режим)\n\tЕсли Режим = 1 Тогда\n\t\tПервый();\n\tИначеЕсли Режим = 2 Тогда\n\t\tВторой();\n\tИначе\n\t\tТретий();\n\tКонецЕсли;\nКонецПроцедуры\n";
+
+        let tree = parser.parse(source, None).unwrap();
+        let cfgs = analyze_function(&tree, source, "Module.bsl").unwrap();
+        let cfg = cfgs.first().expect("a CFG for `Выбор`");
+
+        for expected in ["Первый", "Второй", "Третий"] {
+            assert!(
+                cfg.blocks
+                    .values()
+                    .any(|b| b.statements.iter().any(|s| s.text.contains(expected))),
+                "branch calling {expected} is missing from the graph"
+            );
+        }
+        // The `ИначеЕсли` test is a branch of its own, not a fall-through.
+        assert!(
+            cfg.blocks.values().any(|b| b
+                .statements
+                .iter()
+                .any(|s| s.text.contains("else if Режим = 2"))),
+            "the `ИначеЕсли` condition was not recorded as a branch"
+        );
+    }
+
+    /// `Попытка`/`Исключение` have no clause wrappers: both halves are direct
+    /// children of `try_statement`, split only by the keyword token. Looking
+    /// for a `catch_clause` that cannot exist dropped both.
+    #[test]
+    fn test_bsl_try_except_splits_on_keyword() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bsl::LANGUAGE.into())
+            .unwrap();
+
+        let source = "Процедура Риск()\n\tПопытка\n\t\tОпасно();\n\tИсключение\n\t\tОбработать();\n\tКонецПопытки;\nКонецПроцедуры\n";
+
+        let tree = parser.parse(source, None).unwrap();
+        let cfgs = analyze_function(&tree, source, "Module.bsl").unwrap();
+        let cfg = cfgs.first().expect("a CFG for `Риск`");
+
+        let block_with = |needle: &str| {
+            cfg.blocks
+                .iter()
+                .find(|(_, b)| b.statements.iter().any(|s| s.text.contains(needle)))
+                .map(|(id, _)| *id)
+        };
+        let guarded = block_with("Опасно").expect("the guarded statement is missing");
+        let handler = block_with("Обработать").expect("the handler statement is missing");
+        assert_ne!(
+            guarded, handler,
+            "guarded and handler statements must not share a block"
+        );
+        assert!(
+            cfg.edges
+                .iter()
+                .any(|e| e.to == handler && e.kind == EdgeKind::Jump),
+            "the handler must be reached by an exception edge"
         );
     }
 
