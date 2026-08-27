@@ -119,7 +119,6 @@ lazy_static = "1.5"
 parking_lot = "0.12"
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
-mimalloc = "0.1"  # Global allocator (lower peak RSS than glibc malloc on huge indexes)
 uuid = { version = "1.0", features = ["v4"] }  # For generating unique streaming tokens
 chrono = "0.4"  # Date/time handling for SBOM generation
 url = "2.5"  # URL parsing and validation
@@ -180,6 +179,13 @@ strip = true
 name = "narsil_mcp"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
+
+# mimalloc - это C-библиотека, и под wasm32 она не собирается: там нет
+# сишного sysroot, сборка падает на `wchar.h file not found`. Держать её в
+# общих [dependencies] нельзя - cargo тянет зависимость независимо от того,
+# что бинарь помечен required-features = ["native"] и под wasm не строится.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mimalloc = "0.1"  # Global allocator (lower peak RSS than glibc malloc on huge indexes)
 
 [[bin]]
 name = "narsil-mcp"
