@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-08-27
+
+### Fixed
+
+- **Watch mode no longer burns a CPU core.** `FileWatcher` and `AsyncFileWatcher`
+  used `PollWatcher` with a 500 ms interval, re-stat'ing the entire corpus twice a
+  second: on a 23k-file repository the watcher thread consumed a full core
+  indefinitely, even with no clients connected. Both now use the OS event-driven
+  backend (inotify / FSEvents / ReadDirectoryChangesW). Polling remains only as a
+  fallback when the OS backend cannot be created, and at a 30 s interval.
+  Set `NARSIL_WATCH_POLL=1` to force polling on filesystems that never deliver
+  events (NFS, CIFS). Regression introduced in 1.7.0.
+
+- **Watch mode ignored most languages.** `is_source_file` filtered watcher
+  events against its own hard-coded list of 20 extensions, unrelated to the
+  parser's language table: changes to `.bsl`, `.rb`, `.php`, `.cs`, `.kt`,
+  `.scala`, `.lua`, `.sh` and others were detected and then discarded, so
+  `--watch` was a no-op on those repositories. The filter now derives from
+  `parser::is_supported_extension`, which reads the same language table that
+  indexing uses, so the two cannot drift apart again.
+
 ## [1.9.2] - 2026-08-26
 
 Flow analysis for BSL (1С:Предприятие). `get_control_flow` and

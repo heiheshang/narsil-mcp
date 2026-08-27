@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 #[cfg(feature = "native")]
-use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -314,10 +314,49 @@ impl IndexStore {
     }
 }
 
-/// File watcher for incremental updates (legacy, sync-based polling)
+/// Poll interval used only when the OS event-driven watcher is unavailable.
+///
+/// Polling re-stats every watched path on each tick, so on large corpora (tens
+/// of thousands of files) a sub-second interval pins a CPU core permanently.
+/// Keep it lazy: the fallback is for correctness, not latency.
+#[cfg(feature = "native")]
+const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Build a file watcher, preferring the OS event-driven backend (inotify on
+/// Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows).
+///
+/// Falls back to `PollWatcher` when the OS backend cannot be created (e.g. the
+/// inotify instance limit is exhausted), or when `NARSIL_WATCH_POLL` is set,
+/// which is the escape hatch for network filesystems that never deliver events.
+#[cfg(feature = "native")]
+fn build_watcher<F, H>(handler_factory: F) -> Result<Box<dyn Watcher + Send>>
+where
+    F: Fn() -> H,
+    H: notify::EventHandler,
+{
+    let force_poll = std::env::var_os("NARSIL_WATCH_POLL").is_some_and(|v| v != "0");
+
+    if !force_poll {
+        match RecommendedWatcher::new(handler_factory(), Config::default()) {
+            Ok(watcher) => return Ok(Box::new(watcher)),
+            Err(e) => warn!(
+                "OS file watcher unavailable ({e}), falling back to polling every {:?}",
+                FALLBACK_POLL_INTERVAL
+            ),
+        }
+    }
+
+    let watcher = PollWatcher::new(
+        handler_factory(),
+        Config::default().with_poll_interval(FALLBACK_POLL_INTERVAL),
+    )?;
+    Ok(Box::new(watcher))
+}
+
+/// File watcher for incremental updates (legacy, sync API)
 #[cfg(feature = "native")]
 pub struct FileWatcher {
-    watcher: PollWatcher,
+    watcher: Box<dyn Watcher + Send>,
     rx: std::sync::mpsc::Receiver<Result<Event, notify::Error>>,
     watched_paths: Vec<PathBuf>,
 }
@@ -327,12 +366,12 @@ impl FileWatcher {
     pub fn new() -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let watcher = PollWatcher::new(
+        let watcher = build_watcher(move || {
+            let tx = tx.clone();
             move |res| {
                 let _ = tx.send(res);
-            },
-            Config::default().with_poll_interval(Duration::from_millis(500)),
-        )?;
+            }
+        })?;
 
         Ok(Self {
             watcher,
@@ -409,7 +448,7 @@ impl FileWatcher {
 /// Async file watcher for event-driven incremental updates
 #[cfg(feature = "native")]
 pub struct AsyncFileWatcher {
-    _watcher: PollWatcher,
+    _watcher: Box<dyn Watcher + Send>,
     watched_paths: Vec<PathBuf>,
 }
 
@@ -422,12 +461,12 @@ impl AsyncFileWatcher {
         // Create a channel for the notify watcher
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
 
-        let watcher = PollWatcher::new(
+        let watcher = build_watcher(move || {
+            let notify_tx = notify_tx.clone();
             move |res| {
                 let _ = notify_tx.send(res);
-            },
-            Config::default().with_poll_interval(Duration::from_millis(500)),
-        )?;
+            }
+        })?;
 
         // Spawn a task to process notify events and send batched changes
         tokio::spawn(async move {
@@ -516,15 +555,9 @@ pub enum ChangeType {
 
 /// Check if a path is a source file we care about
 fn is_source_file(path: &Path) -> bool {
-    let extensions = [
-        "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp", "cc", "cxx",
-        "hxx", "swift", "v", "vh", "sv", "svh",
-    ];
-
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| extensions.contains(&e))
-        .unwrap_or(false)
+        .is_some_and(crate::parser::is_supported_extension)
 }
 
 /// Convert a notify path into source-file changes.
@@ -771,6 +804,13 @@ mod tests {
         assert!(is_source_file(Path::new("src/index.ts")));
         assert!(!is_source_file(Path::new("README.md")));
         assert!(!is_source_file(Path::new("data.json")));
+
+        // Every language the parser supports must reach watch mode, not just
+        // the 20 extensions this function used to hard-code.
+        assert!(is_source_file(Path::new("Модуль.bsl")));
+        assert!(is_source_file(Path::new("app.rb")));
+        assert!(is_source_file(Path::new("Main.kt")));
+        assert!(is_source_file(Path::new("deploy.sh")));
     }
 
     #[test]
