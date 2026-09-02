@@ -23,8 +23,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are reported as `receiver inferred from factory name` — a naming convention
   is evidence, not proof, so the resolution is deliberately not counted as
   certain. On a 3,232-file Go corpus this hinted 9,460 edges, of which ~4,700
-  previously resolved to the wrong type. Dispatch through an interface value
-  held in a variable or field remains unresolved.
+  previously resolved to the wrong type.
+
+- **Three more receiver shapes the call graph can now read.** Each was a
+  qualifier that named no type, so resolution fell through to a namesake pick;
+  each has the type written a few lines away.
+  - `self.Logger()` inside a method resolves on the enclosing method's own
+    receiver type. Go spreads one type's methods across the files of its
+    package, so the old answer came from the caller's file or from an unrelated
+    namesake — `BaseApplication::Logger` picked at random out of many `Logger`s.
+  - A call on a local variable or parameter (`batchService.Create(dto)`,
+    `lineRepo := NewPayoutBatchLineRepo(c)`) resolves on the type in its
+    declaration — parameter lists, `var x T`, `x := NewT(...)`, `x := &T{}`.
+    The reading is deliberately shallow (no flow analysis, no shadowing, last
+    declaration wins), so the type is only *offered*: it is used when a
+    namesake is genuinely defined on it and dropped otherwise.
+  - A qualifier that names an imported package is resolved through the file's
+    import list: a package of this repository narrows the namesakes to its
+    directory, and a package outside the index resolves to **nothing**. This
+    is the one that removes false edges rather than redirecting them —
+    `assert.Len(t, x, 3)` from testify used to be reported as a call to some
+    `Len` of the audited repository, `fmt`/`time`/`strings` likewise, and a Go
+    type conversion (`account_model.AccountUuid(x)`) is not a call at all.
+
+  On the same 3,232-file corpus: name-only guesses 16,698 -> 9,593, receiver
+  matches 25 -> 13,126, and ~3,400 edges that pointed at unrelated functions
+  are now honestly absent. Still unresolved: interface values held in struct
+  fields, values out of multi-value assignments, Go struct embedding,
+  reflection and platform-invoked handlers.
 
 ## [1.9.4] - 2026-08-27
 

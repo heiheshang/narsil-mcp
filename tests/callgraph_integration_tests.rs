@@ -1194,3 +1194,238 @@ fn test_chained_call_without_factory_naming_stays_a_name_match() {
         "`lookup` names no type, so the edge is still a deterministic guess"
     );
 }
+
+/// `self.method()` inside a method names no type at the call site, but the
+/// enclosing method does. Go spreads the methods of one type across the files
+/// of its package, so before this the target was picked among namesakes (or
+/// from the caller's own file) rather than on the receiver.
+#[test]
+fn test_self_call_resolves_on_the_enclosing_type() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/app/sms_code.go",
+            r#"
+package app
+
+func (self *BaseApplication) SendCode(code string) error {
+	self.Logger().Info(code)
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/app/base_app.go",
+            "package app\n\ntype BaseApplication struct{}\n\nfunc (self *BaseApplication) Logger() *log.Logger {\n\treturn nil\n}\n",
+        ),
+        (
+            "internal/deployer/runner.go",
+            "package deployer\n\ntype Runner struct{}\n\nfunc (self *Runner) Logger() *log.Logger {\n\treturn nil\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("BaseApplication.SendCode")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Logger"))
+        .expect("self.Logger() should produce an edge");
+    assert!(
+        edge.target
+            .ends_with("base_app.go::BaseApplication::Logger"),
+        "got {}",
+        edge.target
+    );
+    assert_eq!(
+        edge.resolution,
+        CallResolution::Receiver,
+        "the enclosing method's receiver type is read from the source, not guessed"
+    );
+    assert!(edge.resolution.is_certain());
+}
+
+/// A qualifier that names an imported package is neither a receiver nor a
+/// variable. Before the import list was read, `assert.Len(t, x, 3)` from
+/// testify resolved to whatever `Len` sorted first in this repository.
+#[test]
+fn test_call_qualified_by_a_third_party_package_is_not_in_the_graph() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/lib/argon/test/argon_test.go",
+            r#"
+package test
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestArgon(t *testing.T) {
+	assert.Len(t, []int{1}, 1)
+}
+"#,
+        ),
+        (
+            "internal/config/config.go",
+            "package config\n\ntype CountryPhoneCodes struct{}\n\nfunc (self *CountryPhoneCodes) Len() int {\n\treturn 0\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("internal/lib/argon/test/argon_test.go::TestArgon")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("Len"))
+        .expect("the call site should still be recorded");
+    assert_eq!(
+        edge.resolution,
+        CallResolution::Unresolved,
+        "testify is not this repository's code: got {}",
+        edge.target
+    );
+    assert!(
+        call_graph.get_callers("CountryPhoneCodes.Len").is_empty(),
+        "an unrelated method must not collect a caller from another package"
+    );
+}
+
+/// The mirror case: the qualifier names a package of this repository, so the
+/// namesakes narrow to that one directory.
+#[test]
+fn test_call_qualified_by_an_internal_package_resolves_within_it() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/sfx/impl/pay.go",
+            r#"
+package impl
+
+import (
+	"go-rest-api/internal/config"
+)
+
+func Pay() {
+	config.Get()
+}
+"#,
+        ),
+        (
+            "internal/config/config.go",
+            "package config\n\nfunc Get() *Config {\n\treturn nil\n}\n",
+        ),
+        (
+            "internal/usecase/sfx/impl/other.go",
+            "package impl\n\nfunc Get() string {\n\treturn \"\"\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("internal/usecase/sfx/impl/pay.go::Pay")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Get"))
+        .expect("config.Get() should produce an edge");
+    assert_eq!(
+        edge.target, "internal/config/config.go::Get",
+        "the import names the package, so the namesake next door loses"
+    );
+    assert_eq!(edge.resolution, CallResolution::Scope);
+}
+
+/// A call on a local variable or parameter: the type is written in the
+/// declaration, so `svc.Create()` need not be a guess among namesakes.
+#[test]
+fn test_call_on_a_local_variable_resolves_on_its_declared_type() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/module/payout/handler/create.go",
+            r#"
+package handler
+
+func handleFromParameter(batchService payout_use.PayoutBatchUse) error {
+	return batchService.Create(nil)
+}
+
+func handleFromConstructor() error {
+	lineRepo := NewPayoutBatchLineRepo(nil)
+	return lineRepo.Create(nil)
+}
+"#,
+        ),
+        (
+            "internal/module/payout/usecase/impl/payout_batch.go",
+            "package impl\n\ntype PayoutBatchUse struct{}\n\nfunc (self *PayoutBatchUse) Create(dto *Dto) error {\n\treturn nil\n}\n",
+        ),
+        (
+            "internal/module/payout/model/repository/impl/payout_batch_line.go",
+            "package impl\n\ntype PayoutBatchLineRepo struct{}\n\nfunc (self *PayoutBatchLineRepo) Create(dto *Dto) error {\n\treturn nil\n}\n",
+        ),
+        (
+            "internal/model/account/repository/impl/account.go",
+            "package impl\n\ntype AccountRepo struct{}\n\nfunc (self *AccountRepo) Create(dto *Dto) error {\n\treturn nil\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let from_param = call_graph
+        .get_callees("internal/module/payout/handler/create.go::handleFromParameter")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Create"))
+        .expect("batchService.Create() should produce an edge");
+    assert!(
+        from_param.target.ends_with("::PayoutBatchUse::Create"),
+        "got {}",
+        from_param.target
+    );
+    assert_eq!(from_param.resolution, CallResolution::Receiver);
+
+    let from_ctor = call_graph
+        .get_callees("internal/module/payout/handler/create.go::handleFromConstructor")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Create"))
+        .expect("lineRepo.Create() should produce an edge");
+    assert!(
+        from_ctor.target.ends_with("::PayoutBatchLineRepo::Create"),
+        "got {}",
+        from_ctor.target
+    );
+}

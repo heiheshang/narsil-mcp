@@ -48,7 +48,7 @@ Each entry says what its target was matched on:
 | `receiver inferred from factory name` | The call was chained onto a factory or constructor (`XFactory(c).M()`, `NewX().M()`) and exactly one namesake is defined on type `X` | Strong candidate - the type came from a naming convention, not from the call site |
 | `same-file match` | Namesakes exist; the one in the caller's file was taken | Likely, say so |
 | `name match only` | Namesakes exist and nothing distinguished them | A candidate - verify before acting |
-| `not in graph` | Third-party, stdlib, or unindexed | Not project code; usually noise |
+| `not in graph` | Third-party, stdlib, unindexed - or a qualifier that names an imported package outside this repo (`assert.Len`), or a Go type conversion (`account_model.AccountUuid(x)`), which is no call at all | Not project code; usually noise |
 
 The footer counts them (`> 12 of 23 targets ... matched by name alone`). Carry
 that number into your answer. "117 callers, all matched by name" is a different
@@ -74,22 +74,28 @@ rebuilt. Filter test callers yourself by path.
 
 ## What the graph cannot do
 
-Resolution is by name plus whatever qualifier the call site carries. There is no
-type inference, so `x.run()` on an untyped receiver is matched by name, and
-reflection, callbacks stored in variables, and platform-invoked handlers produce
-no edge at all. A BSL handler such as `ПриДобавленииОбработчиковОбновления`
-legitimately shows zero callers - the platform calls it, not the code.
+Resolution is by name plus whatever the call site or its function can be read
+to say about the receiver's type. There is no flow analysis and no real type
+checker, so what is covered is what is written nearby:
 
-One dynamic-dispatch shape *is* covered: a call chained onto a factory or
-constructor, `self.Depend.SfxOperationUseFactory(self.C).ProcessNewOperation()`
-or `NewGoSchedulerApplication(cfg).Run()`. The receiver type is not written
-there, but the factory name is, so the target is looked up on type
-`SfxOperationUse` / `GoSchedulerApplication` and the edge is marked
-`receiver inferred from factory name`. It fires for names ending in
-`Factory`/`Provider`/`Builder` and starting with `New`/`Make` (snake_case too),
-and only when a namesake is genuinely defined on a type of that name. Dispatch
-through an interface value held in a variable or a struct field is still
-unresolved - that one has no name to go on.
+| Call site | How it resolves |
+|---|---|
+| `self.Logger()` / `this.save()` | On the enclosing method's own receiver type - exact, `Receiver` |
+| `svc.Create(dto)` where `svc` is a parameter, `var svc T`, `svc := NewT()` or `svc := &T{}` | On that declared type - `Receiver`, and dropped silently if no namesake is defined on it |
+| `XFactory(c).M()`, `NewX().M()` | On type `X` from the factory/constructor name - `receiver inferred from factory name`; fires for `Factory`/`Provider`/`Builder` suffixes and `New`/`Make` prefixes, snake_case included |
+| `config.Get()` where `config` is an imported package of this repo | Narrowed to that package's directory - `Scope` |
+| `assert.Len(t, x, 3)` where the package is third-party | **No target at all** - `not in graph`, instead of some `Len` of this repo |
+
+Still unresolved, and still needing a manual check:
+
+- dispatch through an interface value in a **struct field** (`self.Repo.Find()`)
+  or one whose implementing type is named differently from the interface;
+- a value from a multi-value assignment (`svc, err := build()`), a map, or a
+  slice element;
+- methods reached through Go **struct embedding**;
+- reflection, callbacks stored in variables, and platform-invoked handlers. A
+  BSL handler such as `ПриДобавленииОбработчиковОбновления` legitimately shows
+  zero callers - the platform calls it, not the code.
 
 Therefore: **"0 callers" is never proof that code is dead.** Cross-check with
 `find_references`, `find_symbol_usages`, and a plain string search of the name

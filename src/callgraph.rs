@@ -159,12 +159,37 @@ pub struct CallGraph {
     /// this once per key per process lifetime is cheap and needs no
     /// serde-compat handling for caches written before this field existed.
     file_path_lower_cache: FastMap<String, Arc<str>>,
+    /// Import path (as written in the source) -> the directory of the indexed
+    /// package it names, or `None` for a package that is not in the index at
+    /// all. Memoized because answering it means scanning the known file paths;
+    /// cleared whenever the set of indexed files changes, since both answers
+    /// depend on it. See [`package_dir_for`](CallGraph::package_dir_for).
+    import_dir_cache: FastMap<String, Option<Arc<str>>>,
 }
 
 impl Default for CallGraph {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Per-file constants of a call-site walk: the file being walked, and the
+/// packages its import list binds. A struct because these plus the
+/// enclosing-function state ([`FnScope`]) pushed `walk_for_calls` past a
+/// readable argument count.
+struct FileScope<'a> {
+    path: &'a str,
+    imports: &'a HashMap<String, String>,
+}
+
+/// What the walk knows about the function it is currently inside: its graph
+/// key, the type it is defined on (for `self` call sites), and the declared
+/// types of its parameters and local variables.
+#[derive(Default)]
+struct FnScope {
+    function: Option<String>,
+    receiver: Option<String>,
+    locals: HashMap<String, String>,
 }
 
 impl CallGraph {
@@ -174,6 +199,7 @@ impl CallGraph {
             file_functions: DashMap::default(),
             name_index: DashMap::default(),
             file_path_lower_cache: DashMap::default(),
+            import_dir_cache: DashMap::default(),
         }
     }
 
@@ -192,6 +218,9 @@ impl CallGraph {
         for (path, content, tree) in files {
             self.extract_functions(path, content, tree)?;
         }
+        // A "package not in the index" answer cached before this batch may be
+        // wrong now, and a directory answer may have become ambiguous.
+        self.import_dir_cache.clear();
         Ok(())
     }
 
@@ -208,6 +237,7 @@ impl CallGraph {
     /// Remove all functions defined in a file from the call graph.
     /// Call this before re-indexing a file to clean up stale function definitions.
     pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {
+        self.import_dir_cache.clear();
         if let Some((_, function_keys)) = self.file_functions.remove(path) {
             for key in function_keys {
                 self.nodes.remove(&key);
@@ -444,23 +474,284 @@ impl CallGraph {
         })
     }
 
+    /// Variable name -> declared type, for the parameters and local variables
+    /// of one function.
+    ///
+    /// The largest remaining group of guessed edges is a call on a name that
+    /// stands for a value: `batchService.Create(dto)`, `lineRepo.FindByUuid(id)`,
+    /// `svc.Run()`. The qualifier is the variable, not the type, so resolution
+    /// had nothing to match a receiver against — but the type is written a few
+    /// lines up, in the parameter list or in the declaration that produced the
+    /// value. This is a deliberately shallow reading of it (no flow analysis,
+    /// no shadowing, last declaration of a name wins), which is why the type it
+    /// yields is only ever *offered* to `resolve_scoped_callee`: it is used
+    /// when a namesake is actually defined on that type, and dropped otherwise.
+    fn collect_local_types(&self, node: Node, source: &[u8]) -> HashMap<String, String> {
+        let mut types = HashMap::new();
+        let mut cursor = node.walk();
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            match current.kind() {
+                // `func f(svc sfx_use.SfxOperationUse)`, and Go's `var x T`.
+                "parameter_declaration" | "var_spec" | "const_spec" => {
+                    if let Some(type_name) = current
+                        .child_by_field_name("type")
+                        .and_then(|node| Self::first_type_identifier(node, source))
+                    {
+                        for name in Self::declared_names(current, source) {
+                            types.insert(name, type_name.clone());
+                        }
+                    }
+                }
+                // `svc := NewSfxOperationUse(c)`, `dto := &PayoutDto{}`.
+                "short_var_declaration" | "assignment_statement" => {
+                    let names = current
+                        .child_by_field_name("left")
+                        .map(|left| Self::declared_names(left, source))
+                        .unwrap_or_default();
+                    let values: Vec<Node> = current
+                        .child_by_field_name("right")
+                        .map(|right| {
+                            let mut walker = right.walk();
+                            right
+                                .children(&mut walker)
+                                .filter(|child| child.is_named())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // Only the one-to-one case: a multi-value call
+                    // (`a, b := f()`) says nothing about which value is which.
+                    if names.len() == 1 && values.len() == 1 {
+                        if let Some(type_name) = self.expression_type_hint(values[0], source) {
+                            types.insert(names[0].clone(), type_name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for child in current.children(&mut cursor) {
+                if child.is_named() {
+                    stack.push(child);
+                }
+            }
+        }
+        types
+    }
+
+    /// The identifiers a declaration or assignment target binds.
+    fn declared_names(node: Node, source: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        if matches!(node.kind(), "identifier" | "field_identifier") {
+            if let Ok(text) = node.utf8_text(source) {
+                names.push(text.to_string());
+            }
+            return names;
+        }
+        // A declaration names one or more identifiers before its type; an
+        // `expression_list` on the left of `:=` holds them directly.
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "identifier" => {
+                    if let Ok(text) = child.utf8_text(source) {
+                        names.push(text.to_string());
+                    }
+                }
+                "expression_list" | "identifier_list" => {
+                    names.extend(Self::declared_names(child, source));
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// The type an initialiser expression produces, as far as it can be read
+    /// off the syntax: a composite literal names it outright, a factory or
+    /// constructor call names it through
+    /// [`factory_type_hint`](Self::factory_type_hint).
+    fn expression_type_hint(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "composite_literal" => node
+                .child_by_field_name("type")
+                .and_then(|node| Self::first_type_identifier(node, source)),
+            // `&T{}`, `*p`, `(expr)`.
+            "unary_expression" | "parenthesized_expression" | "pointer_expression" => {
+                let inner = node
+                    .child_by_field_name("operand")
+                    .or_else(|| node.child_by_field_name("argument"))
+                    .or_else(|| node.named_child(0))?;
+                self.expression_type_hint(inner, source)
+            }
+            kind if Self::is_call_kind(kind) => {
+                let (callee, _) = Self::callee_slot(node)?;
+                let (name, ..) = self.describe_callee(callee, source, None)?;
+                Self::factory_type_hint(&name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Package name (or alias) -> import path, for the file's imports.
+    ///
+    /// Go's `assert.Len(t, x, 3)` and `config.Get()` look identical to the
+    /// resolver: a qualifier that names neither a receiver type nor a local
+    /// variable. The import list is what tells them apart — one is a third
+    /// party the index has never seen, the other is a package of this very
+    /// repository — and [`resolve_package_qualified`](Self::resolve_package_qualified)
+    /// turns that into either an honest `Unresolved` or a target narrowed to
+    /// the right directory.
+    ///
+    /// Go-shaped `import_spec` only. Python's `from x import y` and JS's
+    /// namespace imports bind names differently and would need their own
+    /// handling rather than sharing this one.
+    fn collect_imports(tree: &Tree, source: &[u8]) -> HashMap<String, String> {
+        let mut imports = HashMap::new();
+        let mut cursor = tree.walk();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "import_spec" {
+                let Some(path) = node
+                    .child_by_field_name("path")
+                    .and_then(|path| path.utf8_text(source).ok())
+                    .map(|path| path.trim_matches(['"', '`', '\''].as_slice()).to_string())
+                else {
+                    continue;
+                };
+                let alias = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                    .map(|name| name.to_string());
+                let name = match alias.as_deref() {
+                    // `_ "pkg"` imports for side effects and `. "pkg"` dumps
+                    // the package into the file scope: neither binds a
+                    // qualifier a call site can carry.
+                    Some("_") | Some(".") => continue,
+                    Some(alias) => alias.to_string(),
+                    None => path.rsplit('/').next().unwrap_or(&path).to_string(),
+                };
+                imports.insert(name, path);
+                continue;
+            }
+            for child in node.children(&mut cursor) {
+                // Imports sit at the top of a file; no need to walk into
+                // function bodies looking for them.
+                if child.is_named() && !child.kind().contains("function") {
+                    stack.push(child);
+                }
+            }
+        }
+        imports
+    }
+
+    /// The directory of the indexed package an import path names, or `None`
+    /// when no indexed file lives there — meaning the package is third-party,
+    /// standard library, or simply not part of this index.
+    ///
+    /// Matched on the trailing path segments rather than the full import path,
+    /// because the import path carries the module prefix
+    /// (`github.com/org/repo/internal/config`) while indexed paths are
+    /// repository-relative (`internal/config/config.go`).
+    fn package_dir_for(&self, import_path: &str) -> Option<Arc<str>> {
+        if let Some(cached) = self.import_dir_cache.get(import_path) {
+            return cached.clone();
+        }
+        let needle = format!("{}/", import_path.trim_end_matches('/'));
+        // Either string may carry a prefix the other lacks — the import path
+        // its module prefix (`github.com/org/repo/`), the indexed path a
+        // checkout subdirectory (`go-rest-api/`) — so the shorter one has to
+        // be a trailing part of the longer. Two segments minimum, or a
+        // third-party `.../model` would be answered with this repo's `model/`.
+        let matches_dir = |dir: &str| {
+            let (short, long) = if dir.len() <= needle.len() {
+                (dir, needle.as_str())
+            } else {
+                (needle.as_str(), dir)
+            };
+            short.matches('/').count() >= 2 && long.ends_with(short)
+        };
+        let mut found: Option<Arc<str>> = None;
+        for entry in self.file_functions.iter() {
+            let file_path = entry.key();
+            let Some(dir_end) = file_path.rfind('/') else {
+                continue;
+            };
+            let dir = &file_path[..=dir_end];
+            if matches_dir(dir) {
+                found = Some(Arc::from(dir));
+                break;
+            }
+        }
+        self.import_dir_cache
+            .insert(import_path.to_string(), found.clone());
+        found
+    }
+
+    /// Resolve `pkg.Func()` using the file's import of `pkg`.
+    ///
+    /// Two outcomes, both better than the name match this replaces: a package
+    /// outside the index resolves to nothing at all (a call to
+    /// `assert.Len(t, x, 3)` must not be reported as a call to some `Len`
+    /// method of this repository), and a package inside it narrows the
+    /// namesakes to that one directory.
+    fn resolve_package_qualified(
+        &self,
+        bare_name: &str,
+        import_path: &str,
+    ) -> Option<(String, CallResolution)> {
+        let Some(dir) = self.package_dir_for(import_path) else {
+            return Some((bare_name.to_string(), CallResolution::Unresolved));
+        };
+        let candidates = self.name_index.get(bare_name)?;
+        let in_package: Vec<&String> = candidates
+            .iter()
+            .filter(|key| {
+                self.key_file_path(key)
+                    .map(|file_path| file_path.starts_with(dir.as_ref()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        match in_package.len() {
+            // The package is indexed but carries no such function: a method on
+            // one of its types reached through a value, or an unindexed file.
+            0 => Some((bare_name.to_string(), CallResolution::Unresolved)),
+            1 => Some((in_package[0].clone(), CallResolution::Scope)),
+            // Namesakes within one package (methods of different types), which
+            // the qualifier cannot separate — but the pick is at least from
+            // the right package now.
+            _ => Some((
+                in_package.iter().min().map(|key| (*key).clone())?,
+                CallResolution::NameOnly,
+            )),
+        }
+    }
+
     fn extract_calls(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
         let source = content.as_bytes();
         let mut cursor = tree.walk();
 
         // Track current function scope
-        let mut current_function: Option<String> = None;
-        self.walk_for_calls(&mut cursor, source, path, &mut current_function, "");
+        let imports = Self::collect_imports(tree, source);
+        let file = FileScope {
+            path,
+            imports: &imports,
+        };
+        let mut scope = FnScope::default();
+        self.walk_for_calls(&mut cursor, source, &file, &mut scope, "");
 
         Ok(())
     }
 
+    /// `scope` carries what the enclosing function contributes to resolution:
+    /// its receiver type for `self` call sites and the declared types of its
+    /// parameters and locals (see [`scope_hint_from`](Self::scope_hint_from)
+    /// and [`collect_local_types`](Self::collect_local_types)).
     fn walk_for_calls(
         &self,
         cursor: &mut tree_sitter::TreeCursor,
         source: &[u8],
-        path: &str,
-        current_function: &mut Option<String>,
+        file: &FileScope,
+        scope: &mut FnScope,
         parent_kind: &str,
     ) {
         loop {
@@ -482,8 +773,10 @@ impl CallGraph {
             ) {
                 if let Some(name) = extract_function_name(node, source) {
                     let receiver = Self::extract_receiver_type(node, source);
-                    *current_function =
-                        Some(Self::definition_key(path, receiver.as_deref(), &name));
+                    scope.function =
+                        Some(Self::definition_key(file.path, receiver.as_deref(), &name));
+                    scope.receiver = receiver;
+                    scope.locals = self.collect_local_types(node, source);
                 }
             }
 
@@ -504,16 +797,57 @@ impl CallGraph {
                     | "scoped_call_expression"
             ) || (kind == "method_call" && parent_kind != "call_expression");
             if is_call {
-                if let Some(ref caller_key) = current_function {
-                    if let Some((edge, scope_inferred)) = self.extract_call_edge(node, source, path)
+                if let Some(ref caller_key) = scope.function {
+                    if let Some((edge, scope_inferred)) =
+                        self.extract_call_edge(node, source, file.path, scope.receiver.as_deref())
                     {
+                        // A qualifier naming a local variable or parameter
+                        // carries its declared type a few lines up. Taken only
+                        // when a namesake really is defined on that type — the
+                        // reading of the declaration is shallow (see
+                        // `collect_local_types`), so a miss must cost nothing.
+                        let by_local = edge
+                            .scope_hint
+                            .as_deref()
+                            .and_then(|hint| scope.locals.get(hint))
+                            .map(|declared| {
+                                self.resolve_scoped_callee(
+                                    &edge.target,
+                                    file.path,
+                                    Some(declared),
+                                    false,
+                                )
+                            })
+                            .filter(|(_, resolution)| *resolution == CallResolution::Receiver);
+
+                        // A qualifier that is not a shadowing local names an
+                        // imported package: `config.Get()` is a call into this
+                        // repository's `internal/config`, and `assert.Len(...)`
+                        // is a call into testify — which the graph must report
+                        // as absent rather than as some `Len` of this
+                        // repository. This runs *before* the general
+                        // resolution, not as a fallback for its weak answers:
+                        // a package-qualified name with a single namesake in
+                        // the index would otherwise be answered `Unique`,
+                        // which is the same wrong target stated as a fact.
+                        let by_package = by_local.is_none().then_some(()).and_then(|_| {
+                            let import_path = edge
+                                .scope_hint
+                                .as_deref()
+                                .and_then(|hint| file.imports.get(hint))?;
+                            self.resolve_package_qualified(&edge.target, import_path)
+                        });
+
                         // Resolve callee with scope hint for disambiguation
-                        let (callee_key, resolution) = self.resolve_scoped_callee(
-                            &edge.target,
-                            path,
-                            edge.scope_hint.as_deref(),
-                            scope_inferred,
-                        );
+                        let (callee_key, resolution) = match by_local.or(by_package) {
+                            Some(resolved) => resolved,
+                            None => self.resolve_scoped_callee(
+                                &edge.target,
+                                file.path,
+                                edge.scope_hint.as_deref(),
+                                scope_inferred,
+                            ),
+                        };
 
                         // Add to caller's outgoing calls (with resolved key as target)
                         // Compute `resolved` *before* taking the caller's write
@@ -535,11 +869,11 @@ impl CallGraph {
             // Handle macro invocations (opaque token trees in tree-sitter)
             // Extract call patterns from macro body text
             if kind == "macro_invocation" {
-                if let Some(ref caller_key) = current_function {
+                if let Some(ref caller_key) = scope.function {
                     if let Ok(macro_text) = node.utf8_text(source) {
                         let macro_line = node.start_position().row + 1;
                         self.extract_calls_from_macro_text(
-                            macro_text, caller_key, path, macro_line,
+                            macro_text, caller_key, file.path, macro_line,
                         );
                     }
                 }
@@ -547,7 +881,7 @@ impl CallGraph {
 
             // Recurse
             if cursor.goto_first_child() {
-                self.walk_for_calls(cursor, source, path, current_function, node.kind());
+                self.walk_for_calls(cursor, source, file, scope, node.kind());
                 cursor.goto_parent();
             }
 
@@ -873,10 +1207,17 @@ impl CallGraph {
     }
 
     /// Text of a receiver/qualifier node, when it can plausibly narrow a
-    /// callee down to a file. `self`/`this` receivers carry no such
-    /// information, so they are dropped instead of being fed to
-    /// [`resolve_callee`](Self::resolve_callee).
-    fn scope_hint_from(node: Node, source: &[u8]) -> Option<String> {
+    /// callee down to a file.
+    ///
+    /// A `self`/`this` receiver names no type at the call site, but the
+    /// enclosing method does: inside `func (self *BaseApplication) Start()`,
+    /// `self.Logger()` means `BaseApplication::Logger`. `self_type` carries
+    /// that type down from [`walk_for_calls`](Self::walk_for_calls), so such a
+    /// call resolves on the receiver instead of falling through to a name
+    /// match among namesakes — which, for a method name as common as `Logger`,
+    /// picked an unrelated type. Without a known enclosing type the receiver
+    /// is dropped as before.
+    fn scope_hint_from(node: Node, source: &[u8], self_type: Option<&str>) -> Option<String> {
         let usable = matches!(
             node.kind(),
             "identifier"
@@ -893,8 +1234,11 @@ impl CallGraph {
             return None;
         }
         let text = node.utf8_text(source).ok()?.trim_start_matches('$');
-        if text.is_empty() || matches!(text, "self" | "Self" | "this") {
+        if text.is_empty() {
             return None;
+        }
+        if matches!(text, "self" | "Self" | "this") {
+            return self_type.map(|owner| owner.to_string());
         }
         Some(text.to_string())
     }
@@ -985,12 +1329,17 @@ impl CallGraph {
     /// expression rather than a name and [`scope_hint_from`](Self::scope_hint_from)
     /// has nothing to offer. Falls back to the callee name of the inner call,
     /// turned into a type name by [`factory_type_hint`](Self::factory_type_hint).
-    fn chained_call_scope_hint(&self, operand: Node, source: &[u8]) -> Option<String> {
+    fn chained_call_scope_hint(
+        &self,
+        operand: Node,
+        source: &[u8],
+        self_type: Option<&str>,
+    ) -> Option<String> {
         if !Self::is_call_kind(operand.kind()) {
             return None;
         }
         let (callee, _) = Self::callee_slot(operand)?;
-        let (name, ..) = self.describe_callee(callee, source)?;
+        let (name, ..) = self.describe_callee(callee, source, self_type)?;
         Self::factory_type_hint(&name)
     }
 
@@ -1010,6 +1359,7 @@ impl CallGraph {
         &self,
         node: Node,
         source: &[u8],
+        self_type: Option<&str>,
     ) -> Option<(String, CallType, Option<String>, bool)> {
         let kind = node.kind();
         let text_of = |n: Node| n.utf8_text(source).ok().map(|s| s.to_string());
@@ -1043,10 +1393,11 @@ impl CallGraph {
                     .or_else(|| node.child_by_field_name("expression"))
                     .or_else(|| node.child_by_field_name("value"))
                     .or_else(|| node.child_by_field_name("argument"));
-                let scope = receiver.and_then(|node| Self::scope_hint_from(node, source));
+                let scope =
+                    receiver.and_then(|node| Self::scope_hint_from(node, source, self_type));
                 if scope.is_none() {
-                    if let Some(inferred) =
-                        receiver.and_then(|node| self.chained_call_scope_hint(node, source))
+                    if let Some(inferred) = receiver
+                        .and_then(|node| self.chained_call_scope_hint(node, source, self_type))
                     {
                         return Some((name, CallType::Method, Some(inferred), true));
                     }
@@ -1066,10 +1417,10 @@ impl CallGraph {
                 let target = node
                     .child_by_field_name("target")
                     .or_else(|| node.named_child(0));
-                let scope = target.and_then(|node| Self::scope_hint_from(node, source));
+                let scope = target.and_then(|node| Self::scope_hint_from(node, source, self_type));
                 if scope.is_none() {
-                    if let Some(inferred) =
-                        target.and_then(|node| self.chained_call_scope_hint(node, source))
+                    if let Some(inferred) = target
+                        .and_then(|node| self.chained_call_scope_hint(node, source, self_type))
                     {
                         return Some((name, CallType::Method, Some(inferred), true));
                     }
@@ -1137,12 +1488,13 @@ impl CallGraph {
         node: Node,
         source: &[u8],
         path: &str,
+        self_type: Option<&str>,
     ) -> Option<(CallEdge, bool)> {
         let kind = node.kind();
         let (callee, receiver) = Self::callee_slot(node)?;
 
         let (target, mut call_type, mut scope_hint, mut scope_inferred) =
-            self.describe_callee(callee, source)?;
+            self.describe_callee(callee, source, self_type)?;
 
         if let Some(receiver) = receiver {
             call_type = if kind == "scoped_call_expression" {
@@ -1150,10 +1502,10 @@ impl CallGraph {
             } else {
                 CallType::Method
             };
-            scope_hint = Self::scope_hint_from(receiver, source);
+            scope_hint = Self::scope_hint_from(receiver, source, self_type);
             scope_inferred = false;
             if scope_hint.is_none() {
-                if let Some(inferred) = self.chained_call_scope_hint(receiver, source) {
+                if let Some(inferred) = self.chained_call_scope_hint(receiver, source, self_type) {
                     scope_hint = Some(inferred);
                     scope_inferred = true;
                 }
@@ -1178,8 +1530,14 @@ impl CallGraph {
     /// The edge for a call site, plus whether its `scope_hint` was inferred
     /// from a factory name instead of read off the call site — the flag
     /// `resolve_callee` needs to label the match honestly.
-    fn extract_call_edge(&self, node: Node, source: &[u8], path: &str) -> Option<(CallEdge, bool)> {
-        if let Some(found) = self.extract_call_edge_by_fields(node, source, path) {
+    fn extract_call_edge(
+        &self,
+        node: Node,
+        source: &[u8],
+        path: &str,
+        self_type: Option<&str>,
+    ) -> Option<(CallEdge, bool)> {
+        if let Some(found) = self.extract_call_edge_by_fields(node, source, path, self_type) {
             return Some(found);
         }
 
