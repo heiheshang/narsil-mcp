@@ -462,6 +462,11 @@ pub trait ArgExtractor {
     fn get_bool(&self, key: &str) -> Option<bool>;
     fn get_bool_or(&self, key: &str, default: bool) -> bool;
     fn get_array(&self, key: &str) -> Option<&Vec<Value>>;
+    /// A result-count limit, with the same "0 means no limit" convention
+    /// across every tool that accepts one: a caller shouldn't have to learn
+    /// a different escape hatch (or discover there isn't one) per tool to
+    /// get a genuine full enumeration instead of a silently-clamped default.
+    fn get_limit_any(&self, keys: &[&str], default: usize) -> usize;
 }
 
 impl ArgExtractor for Value {
@@ -499,6 +504,14 @@ impl ArgExtractor for Value {
 
     fn get_array(&self, key: &str) -> Option<&Vec<Value>> {
         self.get(key).and_then(|v| v.as_array())
+    }
+
+    fn get_limit_any(&self, keys: &[&str], default: usize) -> usize {
+        match self.get_u64_any(keys) {
+            Some(0) => usize::MAX,
+            Some(n) => n as usize,
+            None => default,
+        }
     }
 }
 

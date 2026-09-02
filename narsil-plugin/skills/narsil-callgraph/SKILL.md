@@ -45,6 +45,7 @@ Each entry says what its target was matched on:
 | Marker | Meaning | What you may claim |
 |---|---|---|
 | *(no marker)* | Unique name, receiver type, or module scope matched | A fact |
+| `receiver inferred from factory name` | The call was chained onto a factory or constructor (`XFactory(c).M()`, `NewX().M()`) and exactly one namesake is defined on type `X` | Strong candidate - the type came from a naming convention, not from the call site |
 | `same-file match` | Namesakes exist; the one in the caller's file was taken | Likely, say so |
 | `name match only` | Namesakes exist and nothing distinguished them | A candidate - verify before acting |
 | `not in graph` | Third-party, stdlib, or unindexed | Not project code; usually noise |
@@ -75,10 +76,20 @@ rebuilt. Filter test callers yourself by path.
 
 Resolution is by name plus whatever qualifier the call site carries. There is no
 type inference, so `x.run()` on an untyped receiver is matched by name, and
-interface/dynamic dispatch, reflection, callbacks stored in variables, and
-platform-invoked handlers produce no edge at all. A BSL handler such as
-`ПриДобавленииОбработчиковОбновления` legitimately shows zero callers - the
-platform calls it, not the code.
+reflection, callbacks stored in variables, and platform-invoked handlers produce
+no edge at all. A BSL handler such as `ПриДобавленииОбработчиковОбновления`
+legitimately shows zero callers - the platform calls it, not the code.
+
+One dynamic-dispatch shape *is* covered: a call chained onto a factory or
+constructor, `self.Depend.SfxOperationUseFactory(self.C).ProcessNewOperation()`
+or `NewGoSchedulerApplication(cfg).Run()`. The receiver type is not written
+there, but the factory name is, so the target is looked up on type
+`SfxOperationUse` / `GoSchedulerApplication` and the edge is marked
+`receiver inferred from factory name`. It fires for names ending in
+`Factory`/`Provider`/`Builder` and starting with `New`/`Make` (snake_case too),
+and only when a namesake is genuinely defined on a type of that name. Dispatch
+through an interface value held in a variable or a struct field is still
+unresolved - that one has no name to go on.
 
 Therefore: **"0 callers" is never proof that code is dead.** Cross-check with
 `find_references`, `find_symbol_usages`, and a plain string search of the name

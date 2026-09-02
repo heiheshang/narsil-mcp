@@ -984,3 +984,213 @@ fn test_name_only_match_is_flagged() {
     assert!(!run_edge.resolution.is_certain());
     assert_eq!(run_edge.resolution.caveat(), Some("name match only"));
 }
+
+/// The DI-factory shape that dominates Go service code:
+/// `self.Depend.XFactory(self.C).Method()`. No receiver type is written at the
+/// call site, so before the factory hint the edge landed on whichever namesake
+/// sorted first — on a real corpus that was the wrong type most of the time.
+#[test]
+fn test_go_di_factory_call_resolves_to_the_type_the_factory_names() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/system_event/impl/handler/process_payment_operation.go",
+            r#"
+package handler
+
+type HandlerProcessPaymentOperation struct {
+	Depend Dependency
+	C      ctx.Ctx
+}
+
+func (self *HandlerProcessPaymentOperation) handleSfx(uuid string) error {
+	operation, err := self.Depend.SfxOperationRepoFactory(self.C).
+		FindByUuid(sfx_model.SfxOperationUuid(uuid))
+	if err != nil {
+		return err
+	}
+	return self.Depend.SfxOperationUseFactory(self.C).ProcessNewOperation(operation)
+}
+
+func (self *HandlerProcessPaymentOperation) handleAirtime(uuid string) error {
+	return self.Depend.AirtimeUseCaseFactory(self.C).ProcessNewOperation(nil)
+}
+"#,
+        ),
+        (
+            "internal/usecase/sfx/impl/send_to_provider.go",
+            r#"
+package impl
+
+type SfxOperationUse struct{}
+
+func (self *SfxOperationUse) ProcessNewOperation(operation *sfx_model.SfxOperation) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/usecase/airtime/impl/airtime.go",
+            r#"
+package impl
+
+type AirtimeUseCase struct{}
+
+func (self *AirtimeUseCase) ProcessNewOperation(operation *airtime_model.AirtimeOperation) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/repository/sfx/impl/sfx_operation.go",
+            r#"
+package impl
+
+type SfxOperationRepo struct{}
+
+func (self *SfxOperationRepo) FindByUuid(uuid sfx_model.SfxOperationUuid) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/repository/airtime/impl/airtime.go",
+            r#"
+package impl
+
+type AirtimeOperationRepo struct{}
+
+func (self *AirtimeOperationRepo) FindByUuid(uuid string) error {
+	return nil
+}
+"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let sfx_callers = call_graph.get_callers("SfxOperationUse.ProcessNewOperation");
+    assert_eq!(sfx_callers.len(), 1, "got {sfx_callers:?}");
+    assert!(
+        sfx_callers[0]
+            .target
+            .ends_with("::HandlerProcessPaymentOperation::handleSfx"),
+        "got {}",
+        sfx_callers[0].target
+    );
+    assert_eq!(
+        sfx_callers[0].resolution,
+        CallResolution::FactoryReceiver,
+        "the type came from the factory name, not from the call site"
+    );
+    assert!(
+        !sfx_callers[0].resolution.is_certain(),
+        "a naming convention is evidence, not proof"
+    );
+
+    // The other handler keeps its own namesake: the hint separates them.
+    let airtime_callers = call_graph.get_callers("AirtimeUseCase.ProcessNewOperation");
+    assert_eq!(airtime_callers.len(), 1, "got {airtime_callers:?}");
+    assert!(airtime_callers[0].target.ends_with("::handleAirtime"));
+
+    // Same for the repository call written across two lines.
+    let repo_callers = call_graph.get_callers("SfxOperationRepo.FindByUuid");
+    assert_eq!(repo_callers.len(), 1, "got {repo_callers:?}");
+    assert_eq!(repo_callers[0].resolution, CallResolution::FactoryReceiver);
+}
+
+/// `NewType(...).method()` is the same shape without the DI container, and it
+/// is what makes a call to a method named `Run` (107 namesakes on a real Go
+/// corpus) resolvable at all.
+#[test]
+fn test_constructor_chained_call_resolves_by_constructed_type() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "cmd/goscheduler/goscheduler.go",
+            "package main\n\nfunc main() {\n\tapp.NewGoSchedulerApplication(cfg).Run()\n}\n",
+        ),
+        (
+            "internal/app/scheduler_app.go",
+            "package app\n\ntype GoSchedulerApplication struct{}\n\nfunc (self *GoSchedulerApplication) Run() {}\n",
+        ),
+        (
+            "internal/app/api_app.go",
+            "package app\n\ntype ApiApplication struct{}\n\nfunc (self *ApiApplication) Run() {}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("cmd/goscheduler/goscheduler.go::main")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Run"))
+        .expect("chained Run() should produce an edge");
+    assert!(
+        edge.target
+            .ends_with("scheduler_app.go::GoSchedulerApplication::Run"),
+        "got {}",
+        edge.target
+    );
+    assert_eq!(edge.resolution, CallResolution::FactoryReceiver);
+}
+
+/// The hint is only taken when a namesake is actually defined on a type of
+/// that name — a chained call whose inner name is not a factory, or names a
+/// type nothing matches, must stay the guess it was.
+#[test]
+fn test_chained_call_without_factory_naming_stays_a_name_match() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "main.go",
+            "package main\n\nfunc main() {\n\tlookup(id).Run()\n}\n\nfunc lookup(id string) {}\n",
+        ),
+        (
+            "first.go",
+            "package main\n\ntype First struct{}\n\nfunc (self *First) Run() {}\n",
+        ),
+        (
+            "second.go",
+            "package main\n\ntype Second struct{}\n\nfunc (self *Second) Run() {}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("main.go::main")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Run"))
+        .expect("lookup(id).Run() should produce an edge");
+    assert_eq!(
+        edge.resolution,
+        CallResolution::NameOnly,
+        "`lookup` names no type, so the edge is still a deterministic guess"
+    );
+}

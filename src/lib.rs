@@ -1,6 +1,19 @@
 // Library exports for integration tests
 #![recursion_limit = "256"]
 
+/// A `DashMap` hashed with `ahash` instead of the default SipHash-based
+/// `RandomState` — for index-time maps hot enough (one entry per symbol/file,
+/// looked up per call site across a large corpus) that SipHash's DoS
+/// resistance costs real throughput. See the longer note on
+/// `callgraph::CallGraph::nodes` for why that tradeoff is accepted even
+/// though narsil-mcp's own supply-chain-audit use case means these keys can
+/// come from adversarial (vendored, untrusted) source.
+///
+/// One alias instead of five hand-written `DashMap<K, V, ahash::RandomState>`
+/// declarations spread across `callgraph.rs`/`index.rs`: changing the hasher
+/// choice is then one edit, not five kept in lockstep by hand.
+pub(crate) type FastMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
+
 // Core modules (always available)
 pub mod cache;
 pub mod callgraph;

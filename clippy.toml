@@ -1,0 +1,35 @@
+# clippy.toml — кладётся в корень крейта или воркспейса.
+# Уровни самих линтов задаются в Cargo.toml ([lints.clippy]), здесь только пороги.
+
+# Не ломать публичный API ради лаконичности — снимает пачку ложных pedantic-срабатываний
+avoid-breaking-exported-api = true
+
+# Порог когнитивной сложности функции. Дефолт 25; LLM любит писать монолиты.
+cognitive-complexity-threshold = 20
+
+# Слишком много аргументов — сигнал, что нужна структура
+too-many-arguments-threshold = 7
+
+# Слишком много строк в функции
+too-many-lines-threshold = 150
+
+# Тип, который дорого копировать — предупреждать о передаче по значению
+trivial-copy-size-limit = 16
+
+# Порог, после которого большой enum-вариант надо боксить
+enum-variant-size-threshold = 200
+
+# Разрешённые «магические» числа в literal-лintах
+allowed-idents-below-min-chars = ["i", "j", "k", "n", "x", "y", "z", "id", "db", "rx", "tx"]
+
+# Методы, которые запрещаем звать напрямую.
+# Раскомментируй и подстрой под проект — это самый действенный пункт файла.
+# disallowed-methods = [
+#   { path = "std::time::SystemTime::now", reason = "используй инжектируемый Clock, иначе тесты недетерминированы" },
+#   { path = "std::env::var", reason = "конфиг читается один раз в config::load()" },
+# ]
+
+# Типы, которые запрещаем использовать напрямую
+# disallowed-types = [
+#   { path = "std::collections::HashMap", reason = "используй ahash::AHashMap для горячих путей" },
+# ]

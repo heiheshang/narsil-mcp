@@ -511,10 +511,24 @@ pub fn tokenize_code(text: &str) -> Vec<String> {
         tokens.extend(split_identifier(&current));
     }
 
-    // Lowercase and filter short tokens
+    // Lowercase and filter short tokens. Most identifiers in an indexed
+    // corpus are ASCII (keywords, common names); `to_ascii_lowercase` skips
+    // the Unicode case-fold tables `to_lowercase` must consult for the
+    // general case, and is measurably cheaper at the scale of "every token
+    // in every file" — profiling a 49k-file/237k-symbol index showed
+    // `to_lowercase`'s Unicode path as one of the largest single self-time
+    // contributors. Falls back to full `to_lowercase` for non-ASCII tokens
+    // (e.g. Cyrillic identifiers in BSL/1C source) so case-folding stays
+    // correct for them.
     tokens
         .into_iter()
-        .map(|t| t.to_lowercase())
+        .map(|t| {
+            if t.is_ascii() {
+                t.to_ascii_lowercase()
+            } else {
+                t.to_lowercase()
+            }
+        })
         .filter(|t| t.len() >= 2)
         .filter(|t| !is_stop_word(t))
         .collect()

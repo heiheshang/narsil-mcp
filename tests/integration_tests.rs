@@ -425,6 +425,137 @@ fn test_find_symbols_rust() -> Result<()> {
 }
 
 #[test]
+fn test_find_symbols_name_regex() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn on_click() {}
+        pub fn on_close() {}
+        pub fn process_user() {}
+        pub struct ClickHandler {}
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    // Shape-based matching a substring 'pattern' cannot express: names
+    // starting with "on_" but not containing "click" elsewhere.
+    let response = server.call_tool(
+        "find_symbols",
+        json!({
+            "repo": repo_name,
+            "name_regex": "^on_"
+        }),
+    )?;
+    assert!(response["error"].is_null(), "{response:?}");
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(content.contains("on_click"));
+    assert!(content.contains("on_close"));
+    assert!(!content.contains("process_user"));
+    assert!(!content.contains("ClickHandler"));
+
+    // Invalid regex is a clear error, not a silent empty result.
+    let response = server.call_tool(
+        "find_symbols",
+        json!({
+            "repo": repo_name,
+            "name_regex": "("
+        }),
+    )?;
+    let response_text = format!("{response}");
+    assert!(
+        response_text.contains("Invalid") && response_text.contains("name_regex"),
+        "invalid regex should error, got: {response_text}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_find_symbols_compact_output() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub struct User {
+            pub name: String,
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_symbols",
+        json!({
+            "repo": repo_name,
+            "pattern": "User",
+            "compact": true
+        }),
+    )?;
+    assert!(response["error"].is_null(), "{response:?}");
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    // A flat "name (file:line)" list — no markdown reading surface.
+    assert!(content.contains("User ("));
+    assert!(!content.contains("# Symbols in"));
+    assert!(!content.contains("## "));
+
+    Ok(())
+}
+
+#[test]
+fn test_find_symbols_limit_zero_is_unbounded() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn alpha() {}
+        pub fn beta() {}
+        pub fn gamma() {}
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    // A small explicit limit truncates and says so.
+    let truncated = server.call_tool(
+        "find_symbols",
+        json!({"repo": repo_name, "symbol_type": "function", "limit": 1}),
+    )?;
+    let truncated_text = truncated["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(truncated_text.contains("showing first 1"));
+
+    // limit:0 is the explicit "no limit" sentinel — everything, no truncation note.
+    let unbounded = server.call_tool(
+        "find_symbols",
+        json!({"repo": repo_name, "symbol_type": "function", "limit": 0}),
+    )?;
+    let unbounded_text = unbounded["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(unbounded_text.contains("alpha"));
+    assert!(unbounded_text.contains("beta"));
+    assert!(unbounded_text.contains("gamma"));
+    assert!(!unbounded_text.contains("showing first"));
+
+    Ok(())
+}
+
+#[test]
 fn test_find_symbols_python() -> Result<()> {
     let repo = TestRepo::new()?;
     repo.add_python_file(

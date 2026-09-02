@@ -31,6 +31,7 @@ use crate::search::{ConcurrentSearchIndex, DocType, SearchDocument};
 use crate::streaming::StreamingConfig;
 use crate::symbols::{Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
+use crate::FastMap;
 
 /// Map a `SymbolKind` to a search `DocType` for per-symbol search documents.
 fn symbol_kind_to_doc_type(kind: &SymbolKind) -> DocType {
@@ -169,7 +170,11 @@ pub struct CodeIntelEngine {
     /// Set of indexed file paths (absolute). Raw content is NOT cached here —
     /// it is read from disk on demand via `content_for`. Holds ~96k paths
     /// (~10 MB) instead of ~2.8 GB of whole-file text (lever 2).
-    file_cache: DashMap<PathBuf, ()>,
+    /// Keys are on-disk paths from the indexed repo — see the longer note on
+    /// `CallGraph::nodes` (`callgraph.rs`) on why "on-disk" doesn't mean
+    /// "trusted" for this tool and why `ahash` here is still an accepted
+    /// tradeoff rather than a real DoS exposure.
+    file_cache: FastMap<PathBuf, ()>,
     /// Synthetic normalized documents indexed separately from raw files
     normalized_docs: DashMap<String, Vec<NormalizedDocument>>,
     /// Language parser
@@ -233,6 +238,45 @@ fn reusable_symbols(persisted: Option<&PersistedIndex>, file_path: &Path) -> Opt
         return None;
     }
     Some(metadata.symbols.clone())
+}
+
+/// Parameters for [`CodeIntelEngine::find_symbols`]. A struct instead of
+/// positional arguments: the parameter list grew to 8 (several sharing the
+/// same `Option<&str>`/`Option<bool>` shape), which needed
+/// `#[allow(clippy::too_many_arguments)]` and left every call site (the tool
+/// handler, plus 5+ in tests) passing opaque `None, None, None, None, None,
+/// None` runs an accidental reorder at any position would compile silently.
+/// Named fields catch that; `..Default::default()` keeps call sites that
+/// only care about a couple of fields short.
+///
+/// `limit` is a plain `usize`, already resolved by the caller (the tool
+/// handler, via `ArgExtractor::get_limit_any`) — the "0 means no limit"
+/// convention lives at that shared layer so every tool that accepts a limit
+/// gets it the same way, not just this one.
+pub struct FindSymbolsQuery<'a> {
+    pub repo: &'a str,
+    pub symbol_type: Option<&'a str>,
+    pub pattern: Option<&'a str>,
+    pub name_regex: Option<&'a str>,
+    pub file_pattern: Option<&'a str>,
+    pub exclude_tests: Option<bool>,
+    pub limit: usize,
+    pub compact: bool,
+}
+
+impl Default for FindSymbolsQuery<'_> {
+    fn default() -> Self {
+        Self {
+            repo: "",
+            symbol_type: None,
+            pattern: None,
+            name_regex: None,
+            file_pattern: None,
+            exclude_tests: None,
+            limit: 200,
+            compact: false,
+        }
+    }
 }
 
 impl CodeIntelEngine {
@@ -378,7 +422,7 @@ impl CodeIntelEngine {
             repo_paths: expanded_repos.clone(),
             repos: DashMap::new(),
             symbols: DashMap::new(),
-            file_cache: DashMap::new(),
+            file_cache: DashMap::default(),
             normalized_docs: DashMap::new(),
             parser: Arc::new(LanguageParser::new()?),
             git_repos: DashMap::new(),
@@ -1497,24 +1541,26 @@ impl CodeIntelEngine {
         })
     }
 
-    pub async fn find_symbols(
-        &self,
-        repo: &str,
-        symbol_type: Option<&str>,
-        pattern: Option<&str>,
-        file_pattern: Option<&str>,
-        exclude_tests: Option<bool>,
-        limit: Option<usize>,
-    ) -> Result<String> {
+    pub async fn find_symbols(&self, q: FindSymbolsQuery<'_>) -> Result<String> {
         use crate::security_rules::is_test_file;
+        use regex::RegexBuilder;
+
+        let FindSymbolsQuery {
+            repo,
+            symbol_type,
+            pattern,
+            name_regex,
+            file_pattern,
+            exclude_tests,
+            limit,
+            compact,
+        } = q;
 
         if let Some(p) = pattern {
             if p.trim().is_empty() {
                 anyhow::bail!("'pattern' must not be empty; omit it to list all symbols");
             }
         }
-
-        let limit = limit.unwrap_or(200).max(1);
 
         // Build cache key from query parameters
         let cache_key = {
@@ -1524,9 +1570,11 @@ impl CodeIntelEngine {
                 exclude_tests,
             };
             let query = format!(
-                "{}|{}",
+                "{}|{}|{}|{}",
                 pattern.unwrap_or("*"),
-                symbol_type.unwrap_or("all")
+                name_regex.unwrap_or("*"),
+                symbol_type.unwrap_or("all"),
+                compact
             );
             QueryCacheKey::code_search_with_options(Some(repo), query, &options)
         };
@@ -1563,6 +1611,22 @@ impl CodeIntelEngine {
 
         let glob_pattern = file_pattern.map(Self::compile_file_pattern).transpose()?;
 
+        let compiled_regex = name_regex
+            .map(|re| {
+                RegexBuilder::new(re)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Invalid 'name_regex' /{}/: {}", re, e))
+            })
+            .transpose()?;
+
+        // Lowercased once, not once per symbol: the loop below used to call
+        // `pat.to_lowercase()` on every candidate — a Unicode case-fold
+        // recomputed from the same string hundreds of thousands of times on
+        // a large repo, the same wasted-work shape profiling found (and
+        // fixed) in `callgraph::resolve_callee`'s scope-hint filter.
+        let pat_lower = pattern.map(str::to_lowercase);
+
         let mut filtered: Vec<_> = symbols
             .iter()
             .filter(|s| {
@@ -1576,9 +1640,15 @@ impl CodeIntelEngine {
                         return false;
                     }
                 }
-                // Name pattern filter
-                if let Some(pat) = pattern {
-                    if !s.name.to_lowercase().contains(&pat.to_lowercase()) {
+                // Name pattern filter (substring)
+                if let Some(ref pat_lower) = pat_lower {
+                    if !s.name.to_lowercase().contains(pat_lower) {
+                        return false;
+                    }
+                }
+                // Name shape filter (regex) — e.g. `^On[A-Z]`, `Handler$`
+                if let Some(ref re) = compiled_regex {
+                    if !re.is_match(&s.name) {
                         return false;
                     }
                 }
@@ -1595,13 +1665,12 @@ impl CodeIntelEngine {
         // Rank exact name matches first, then case-insensitive exact,
         // then shorter (more specific) names — so an exact-name query
         // surfaces its target even before the limit is applied.
-        if let Some(pat) = pattern {
-            let pat_lower = pat.to_lowercase();
+        if let (Some(pat), Some(pat_lower)) = (pattern, &pat_lower) {
             filtered.sort_by(|a, b| {
                 let rank = |s: &Symbol| {
                     (
                         s.name != pat,
-                        s.name.to_lowercase() != pat_lower,
+                        &s.name.to_lowercase() != pat_lower,
                         s.name.len(),
                     )
                 };
@@ -1616,10 +1685,34 @@ impl CodeIntelEngine {
         let dependent_files: Vec<String> = filtered.iter().map(|s| s.file_path.clone()).collect();
 
         let mut output = String::new();
+
+        if compact {
+            // Flat "name (file:line)" list, no headers/grouping/signatures —
+            // for callers that just need the names, not a reading surface.
+            if total > filtered.len() {
+                output.push_str(&format!(
+                    "Found {} symbols (showing first {}; pass limit:0 for all)\n",
+                    total,
+                    filtered.len()
+                ));
+            }
+            for sym in &filtered {
+                output.push_str(&format!(
+                    "{} ({}:{})\n",
+                    sym.name, sym.file_path, sym.start_line
+                ));
+            }
+            if self.options.cache_enabled {
+                self.query_cache
+                    .insert_with_files(cache_key, output.clone(), dependent_files);
+            }
+            return Ok(output);
+        }
+
         output.push_str(&format!("# Symbols in {}\n\n", repo));
         if total > filtered.len() {
             output.push_str(&format!(
-                "Found {} symbols (showing first {}; pass 'limit' to adjust, or narrow with 'pattern')\n\n",
+                "Found {} symbols (showing first {}; pass 'limit' to adjust — 0 for no limit — or narrow with 'pattern'/'name_regex')\n\n",
                 total,
                 filtered.len()
             ));

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::CodeIntelEngine;
+use crate::index::{CodeIntelEngine, FindSymbolsQuery};
 
 /// Handler for find_symbols tool
 pub struct FindSymbolsHandler;
@@ -16,23 +16,17 @@ impl ToolHandler for FindSymbolsHandler {
     }
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
-        let repo = args.get_str("repo").unwrap_or("");
-        let symbol_type = args.get_str("symbol_type");
-        let pattern = args.get_str_any(&["pattern", "query", "name"]);
-        let file_pattern = args.get_str("file_pattern");
-        let exclude_tests = args.get_bool("exclude_tests");
-        let limit = args
-            .get_u64_any(&["limit", "max_results"])
-            .map(|v| v as usize);
         engine
-            .find_symbols(
-                repo,
-                symbol_type,
-                pattern,
-                file_pattern,
-                exclude_tests,
-                limit,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: args.get_str("repo").unwrap_or(""),
+                symbol_type: args.get_str("symbol_type"),
+                pattern: args.get_str_any(&["pattern", "query", "name"]),
+                name_regex: args.get_str("name_regex"),
+                file_pattern: args.get_str("file_pattern"),
+                exclude_tests: args.get_bool("exclude_tests"),
+                limit: args.get_limit_any(&["limit", "max_results"], 200),
+                compact: args.get_bool_or("compact", false),
+            })
             .await
     }
 }
@@ -141,7 +135,7 @@ impl ToolHandler for WorkspaceSymbolSearchHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let query = args.get_str("query").unwrap_or("");
         let kind = args.get_str("kind");
-        let limit = args.get_u64_or("limit", 20) as usize;
+        let limit = args.get_limit_any(&["limit"], 20);
         engine.workspace_symbol_search(query, kind, limit).await
     }
 }

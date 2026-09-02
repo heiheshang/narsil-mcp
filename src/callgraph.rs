@@ -2,10 +2,12 @@
 //!
 //! This is critical for AI understanding of code flow and impact analysis.
 
+use crate::FastMap;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 /// A node in the call graph
@@ -67,6 +69,12 @@ pub enum CallResolution {
     Unique,
     /// The call qualifier named the target's receiver type (`Store::new()`).
     Receiver,
+    /// No receiver type was written at the call site: the call was chained onto
+    /// a factory or constructor call, and the type came from *its* name
+    /// (`SfxOperationUseFactory(c).Pay()` -> type `SfxOperationUse`). Exactly
+    /// one namesake is defined on that type, so this is a strong candidate —
+    /// but the type was inferred from a naming convention, not read.
+    FactoryReceiver,
     /// The qualifier matched the target's module or file path.
     Scope,
     /// Several namesakes; the one in the caller's own file was taken.
@@ -87,6 +95,7 @@ impl CallResolution {
     /// Short label for reports; `None` for edges that need no caveat.
     pub fn caveat(self) -> Option<&'static str> {
         match self {
+            Self::FactoryReceiver => Some("receiver inferred from factory name"),
             Self::SameFile => Some("same-file match"),
             Self::NameOnly => Some("name match only"),
             Self::Unresolved => Some("not in graph"),
@@ -126,14 +135,30 @@ pub struct FunctionMetrics {
 
 /// The call graph for a repository
 pub struct CallGraph {
-    /// Function name -> CallNode
-    nodes: DashMap<String, CallNode>,
+    /// Function name -> CallNode. Keys are derived from indexed source
+    /// files, not from network input reaching this process directly — but
+    /// narsil-mcp's own supply-chain/dependency-audit use case means "on
+    /// disk" can still mean "an adversarial vendored dependency the user
+    /// pointed the tool at". `ahash` trades SipHash's resistance to crafted
+    /// collisions for real speed on a map this hot (one entry per symbol,
+    /// looked up per call site across the corpus); the accepted risk is a
+    /// hostile repo degrading its own indexing run toward worst case, not a
+    /// security-boundary break — this is a single local process, not a
+    /// multi-tenant service where one attacker could starve other users.
+    nodes: FastMap<String, CallNode>,
     /// File -> Functions defined in that file
-    file_functions: DashMap<String, Vec<String>>,
+    file_functions: FastMap<String, Vec<String>>,
     /// Bare function name -> qualified keys. Lets `resolve_callee` look up
     /// candidates in O(1) instead of scanning every node per call site
     /// (O(N²) on a 469k-symbol corpus).
-    name_index: DashMap<String, Vec<String>>,
+    name_index: FastMap<String, Vec<String>>,
+    /// Lazily-memoized `file_path.to_lowercase()` per node key, used by
+    /// `resolve_callee`'s scope-hint disambiguation (`scope_matches_file_path`).
+    /// Not persisted: `CallGraph` is always reconstructed via `new()` then
+    /// repopulated (fresh parse or from a persisted snapshot), so recomputing
+    /// this once per key per process lifetime is cheap and needs no
+    /// serde-compat handling for caches written before this field existed.
+    file_path_lower_cache: FastMap<String, Arc<str>>,
 }
 
 impl Default for CallGraph {
@@ -145,9 +170,10 @@ impl Default for CallGraph {
 impl CallGraph {
     pub fn new() -> Self {
         Self {
-            nodes: DashMap::new(),
-            file_functions: DashMap::new(),
-            name_index: DashMap::new(),
+            nodes: DashMap::default(),
+            file_functions: DashMap::default(),
+            name_index: DashMap::default(),
+            file_path_lower_cache: DashMap::default(),
         }
     }
 
@@ -185,6 +211,10 @@ impl CallGraph {
         if let Some((_, function_keys)) = self.file_functions.remove(path) {
             for key in function_keys {
                 self.nodes.remove(&key);
+                // Otherwise this grows for the life of the process under
+                // `--watch`: every reindex of a changed file adds fresh
+                // entries but never reclaims the ones for keys removed here.
+                self.file_path_lower_cache.remove(&key);
 
                 if let Some(bare_name) = key.split("::").last() {
                     let emptied = match self.name_index.get_mut(bare_name) {
@@ -475,10 +505,15 @@ impl CallGraph {
             ) || (kind == "method_call" && parent_kind != "call_expression");
             if is_call {
                 if let Some(ref caller_key) = current_function {
-                    if let Some(edge) = self.extract_call_edge(node, source, path) {
+                    if let Some((edge, scope_inferred)) = self.extract_call_edge(node, source, path)
+                    {
                         // Resolve callee with scope hint for disambiguation
-                        let (callee_key, resolution) =
-                            self.resolve_callee(&edge.target, path, edge.scope_hint.as_deref());
+                        let (callee_key, resolution) = self.resolve_scoped_callee(
+                            &edge.target,
+                            path,
+                            edge.scope_hint.as_deref(),
+                            scope_inferred,
+                        );
 
                         // Add to caller's outgoing calls (with resolved key as target)
                         // Compute `resolved` *before* taking the caller's write
@@ -618,6 +653,27 @@ impl CallGraph {
         self.nodes.get(key).map(|node| node.file_path.clone())
     }
 
+    /// Lowercased file path for `key`, memoized in `file_path_lower_cache`.
+    ///
+    /// `scope_matches_file_path` used to call `file_path.to_lowercase()` on
+    /// every namesake candidate on every ambiguous call site — a Unicode
+    /// case-fold recomputed from scratch for the same handful of file paths
+    /// across the whole corpus. Profiling a real 49k-file index showed this
+    /// (plus the matching `scope.to_lowercase()`, hoisted in `resolve_callee`
+    /// instead) as ~5-6% of total indexing CPU. Caching it here means each
+    /// distinct file path is lowercased once per process lifetime, not once
+    /// per candidate per call site.
+    fn key_file_path_lower(&self, key: &str) -> Option<Arc<str>> {
+        if let Some(cached) = self.file_path_lower_cache.get(key) {
+            return Some(cached.clone());
+        }
+        let file_path = self.nodes.get(key).map(|node| node.file_path.clone())?;
+        let lower: Arc<str> = Arc::from(file_path.to_lowercase());
+        self.file_path_lower_cache
+            .insert(key.to_string(), lower.clone());
+        Some(lower)
+    }
+
     /// Does the node behind `key` belong to the type named `qualifier`?
     ///
     /// `case_sensitive` is on for call-site resolution, where Go's `store.Get()`
@@ -652,6 +708,20 @@ impl CallGraph {
         caller_file: &str,
         scope_hint: Option<&str>,
     ) -> (String, CallResolution) {
+        self.resolve_scoped_callee(bare_name, caller_file, scope_hint, false)
+    }
+
+    /// [`resolve_callee`](Self::resolve_callee) with the provenance of the
+    /// hint. `scope_inferred` marks a hint guessed from a factory name rather
+    /// than written at the call site: a receiver match on it is reported as
+    /// [`CallResolution::FactoryReceiver`], not as a read qualifier.
+    fn resolve_scoped_callee(
+        &self,
+        bare_name: &str,
+        caller_file: &str,
+        scope_hint: Option<&str>,
+        scope_inferred: bool,
+    ) -> (String, CallResolution) {
         // 0. A scope qualifier naming a receiver type is harder evidence than
         //    the caller's own file: `Store::new()` means `Store`, wherever it
         //    lives. Only a unique match counts.
@@ -662,7 +732,12 @@ impl CallGraph {
                     .filter(|key| self.receiver_matches(key, scope, true));
                 if let Some(first) = by_receiver.next() {
                     if by_receiver.next().is_none() {
-                        return (first.clone(), CallResolution::Receiver);
+                        let resolution = if scope_inferred {
+                            CallResolution::FactoryReceiver
+                        } else {
+                            CallResolution::Receiver
+                        };
+                        return (first.clone(), resolution);
                     }
                 }
             }
@@ -710,11 +785,22 @@ impl CallGraph {
                     return (key.clone(), CallResolution::SameFile);
                 }
 
-                // 4. If scope_hint present, try to narrow down
-                if let Some(scope) = scope_hint {
+                // 4. If scope_hint present, try to narrow down. `scope` is the
+                // same string for every candidate here, so its path-fragment
+                // form is computed once rather than per candidate (this loop
+                // used to re-lowercase `scope` — a Unicode case-fold — on
+                // every namesake; with "hundreds of candidates" per the O(1)
+                // lookup comment above, that was pure waste).
+                // An inferred hint is a type name, not a module path: feeding
+                // `SfxOperationUse` to the path filter would match whatever
+                // file happens to sit under a similarly named directory.
+                if let Some(scope) = scope_hint.filter(|_| !scope_inferred) {
+                    let scope_path = Self::scope_path_fragment(scope);
                     let mut scope_matches = candidates.iter().filter(|key| {
-                        self.key_file_path(key)
-                            .map(|file_path| Self::scope_matches_file_path(scope, &file_path))
+                        self.key_file_path_lower(key)
+                            .map(|file_path_lower| {
+                                Self::path_fragment_matches(&scope_path, &file_path_lower)
+                            })
                             .unwrap_or(false)
                     });
 
@@ -751,24 +837,39 @@ impl CallGraph {
         }
     }
 
-    /// Check if a scope qualifier plausibly matches a file path.
-    /// Lowercases scope, strips `crate::`/`self::`/`super::` prefix,
-    /// converts `::` to `/`, and checks if `file_path` contains `/{scope}/` or `/{scope}.`.
-    fn scope_matches_file_path(scope: &str, file_path: &str) -> bool {
+    /// Lowercases `scope`, strips a `crate::`/`self::`/`super::` prefix, and
+    /// converts `::` to `/` — the path-fragment form `path_fragment_matches`
+    /// checks a file path against. Split out of the old single-shot
+    /// `scope_matches_file_path` so a caller checking many candidates against
+    /// the same scope (`resolve_callee`'s namesake filter) computes this once
+    /// instead of once per candidate.
+    fn scope_path_fragment(scope: &str) -> String {
         let scope_lower = scope.to_lowercase();
-        // Strip common Rust path prefixes
         let stripped = scope_lower
             .strip_prefix("crate::")
             .or_else(|| scope_lower.strip_prefix("self::"))
             .or_else(|| scope_lower.strip_prefix("super::"))
             .unwrap_or(&scope_lower);
-        // Convert :: to / for path matching
-        let as_path = stripped.replace("::", "/");
-        let path_lower = file_path.to_lowercase();
-        // Check if file_path contains /{scope}/ or /{scope}.
-        let with_slash = format!("/{}/", as_path);
-        let with_dot = format!("/{}.", as_path);
-        path_lower.contains(&with_slash) || path_lower.contains(&with_dot)
+        stripped.replace("::", "/")
+    }
+
+    /// Does an already-lowercased file path contain `/{scope_path}/` or
+    /// `/{scope_path}.`? `scope_path` comes from [`scope_path_fragment`] and
+    /// `file_path_lower` from [`key_file_path_lower`] — both precomputed so
+    /// this call itself does no case-folding.
+    fn path_fragment_matches(scope_path: &str, file_path_lower: &str) -> bool {
+        let with_slash = format!("/{}/", scope_path);
+        let with_dot = format!("/{}.", scope_path);
+        file_path_lower.contains(&with_slash) || file_path_lower.contains(&with_dot)
+    }
+
+    /// Single-shot convenience combining [`scope_path_fragment`] and
+    /// [`path_fragment_matches`] for callers checking one scope against one
+    /// file path (not a per-candidate loop, where computing the fragment
+    /// once outside the loop is what actually matters).
+    #[cfg(test)]
+    fn scope_matches_file_path(scope: &str, file_path: &str) -> bool {
+        Self::path_fragment_matches(&Self::scope_path_fragment(scope), &file_path.to_lowercase())
     }
 
     /// Text of a receiver/qualifier node, when it can plausibly narrow a
@@ -798,7 +899,103 @@ impl CallGraph {
         Some(text.to_string())
     }
 
-    /// Describe the callee slot of a call: `(name, call type, scope hint)`.
+    /// Call shapes whose callee slot [`callee_slot`](Self::callee_slot) knows.
+    fn is_call_kind(kind: &str) -> bool {
+        matches!(
+            kind,
+            "call_expression"
+                | "call"
+                | "method_call_expression"
+                | "invocation_expression"
+                | "method_invocation"
+                | "function_call_expression"
+                | "member_call_expression"
+                | "scoped_call_expression"
+        )
+    }
+
+    /// A type name guessed from a factory or constructor function name.
+    ///
+    /// Needed because a call chained onto a factory names no receiver type at
+    /// the call site: `self.Depend.SfxOperationUseFactory(self.C).PayOperation()`
+    /// carries nothing to tell `PayOperation` on `SfxOperationUse` apart from
+    /// the same method on five other types — yet the factory's own name says
+    /// which one. Same for a constructor: `NewStore().get()` -> `Store`.
+    ///
+    /// Only names carrying one of the conventions produce a hint, so a plain
+    /// `lookup(id).run()` stays a name match instead of inventing a type. The
+    /// hint is a hypothesis either way: [`resolve_callee`](Self::resolve_callee)
+    /// keeps it only if a namesake is actually defined on a type of that name.
+    fn factory_type_hint(name: &str) -> Option<String> {
+        const CAMEL_SUFFIXES: [&str; 3] = ["Factory", "Provider", "Builder"];
+        const SNAKE_SUFFIXES: [&str; 3] = ["_factory", "_provider", "_builder"];
+        const CAMEL_PREFIXES: [&str; 2] = ["New", "Make"];
+        const SNAKE_PREFIXES: [&str; 2] = ["new_", "make_"];
+
+        let stem = CAMEL_SUFFIXES
+            .iter()
+            .chain(SNAKE_SUFFIXES.iter())
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .or_else(|| {
+                // `NewsFeed` must not be read as `New` + `sFeed`: after a
+                // CamelCase prefix the type name starts with a capital.
+                CAMEL_PREFIXES.iter().find_map(|prefix| {
+                    name.strip_prefix(prefix)
+                        .filter(|rest| rest.starts_with(char::is_uppercase))
+                })
+            })
+            .or_else(|| {
+                SNAKE_PREFIXES
+                    .iter()
+                    .find_map(|prefix| name.strip_prefix(prefix))
+            })?;
+
+        let stem = stem.trim_matches('_');
+        if stem.len() < 2 {
+            return None;
+        }
+        Some(Self::to_upper_camel(stem))
+    }
+
+    /// `store` -> `Store`, `sfx_operation` -> `SfxOperation`, `SfxOp` -> `SfxOp`.
+    /// Receiver types are CamelCase in every language where the factory
+    /// convention above appears, while function names may be snake_case.
+    fn to_upper_camel(name: &str) -> String {
+        if !name.contains('_') {
+            let mut chars = name.chars();
+            return match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+        }
+        name.split('_')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| {
+                let mut chars = segment.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// Scope hint for a call chained onto another call — the DI-factory and
+    /// constructor shape `factory(args).method()`, where the receiver is an
+    /// expression rather than a name and [`scope_hint_from`](Self::scope_hint_from)
+    /// has nothing to offer. Falls back to the callee name of the inner call,
+    /// turned into a type name by [`factory_type_hint`](Self::factory_type_hint).
+    fn chained_call_scope_hint(&self, operand: Node, source: &[u8]) -> Option<String> {
+        if !Self::is_call_kind(operand.kind()) {
+            return None;
+        }
+        let (callee, _) = Self::callee_slot(operand)?;
+        let (name, ..) = self.describe_callee(callee, source)?;
+        Self::factory_type_hint(&name)
+    }
+
+    /// Describe the callee slot of a call:
+    /// `(name, call type, scope hint, hint was inferred)`.
     ///
     /// Each language spells a method callee differently, and the name always
     /// lives in a named field: Go `selector_expression.field`, Python
@@ -806,11 +1003,14 @@ impl CallGraph {
     /// `member_access_expression.name`, Kotlin/Swift `navigation_expression`'s
     /// trailing `navigation_suffix`, Rust/C `field_expression.field`.
     /// Returns `None` for shapes it does not know so the caller can fall back.
+    /// The last element is set when the scope hint was inferred from a factory
+    /// name rather than read off the call site (see
+    /// [`chained_call_scope_hint`](Self::chained_call_scope_hint)).
     fn describe_callee(
         &self,
         node: Node,
         source: &[u8],
-    ) -> Option<(String, CallType, Option<String>)> {
+    ) -> Option<(String, CallType, Option<String>, bool)> {
         let kind = node.kind();
         let text_of = |n: Node| n.utf8_text(source).ok().map(|s| s.to_string());
 
@@ -820,7 +1020,7 @@ impl CallGraph {
             | "property_identifier"
             | "simple_identifier"
             | "name"
-            | "constant" => Some((text_of(node)?, CallType::Direct, None)),
+            | "constant" => Some((text_of(node)?, CallType::Direct, None, false)),
 
             "selector_expression"
             | "attribute"
@@ -837,14 +1037,21 @@ impl CallGraph {
                     .child_by_field_name(name_field)
                     .and_then(text_of)
                     .or_else(|| self.get_last_identifier(node, source))?;
-                let scope = node
+                let receiver = node
                     .child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("operand"))
                     .or_else(|| node.child_by_field_name("expression"))
                     .or_else(|| node.child_by_field_name("value"))
-                    .or_else(|| node.child_by_field_name("argument"))
-                    .and_then(|receiver| Self::scope_hint_from(receiver, source));
-                Some((name, CallType::Method, scope))
+                    .or_else(|| node.child_by_field_name("argument"));
+                let scope = receiver.and_then(|node| Self::scope_hint_from(node, source));
+                if scope.is_none() {
+                    if let Some(inferred) =
+                        receiver.and_then(|node| self.chained_call_scope_hint(node, source))
+                    {
+                        return Some((name, CallType::Method, Some(inferred), true));
+                    }
+                }
+                Some((name, CallType::Method, scope, false))
             }
 
             // Kotlin/Swift: `target . (navigation_suffix suffix)`. The suffix is
@@ -856,11 +1063,18 @@ impl CallGraph {
                     .filter(|child| child.kind() == "navigation_suffix")
                     .last()?;
                 let name = self.get_last_identifier(suffix, source)?;
-                let scope = node
+                let target = node
                     .child_by_field_name("target")
-                    .or_else(|| node.named_child(0))
-                    .and_then(|target| Self::scope_hint_from(target, source));
-                Some((name, CallType::Method, scope))
+                    .or_else(|| node.named_child(0));
+                let scope = target.and_then(|node| Self::scope_hint_from(node, source));
+                if scope.is_none() {
+                    if let Some(inferred) =
+                        target.and_then(|node| self.chained_call_scope_hint(node, source))
+                    {
+                        return Some((name, CallType::Method, Some(inferred), true));
+                    }
+                }
+                Some((name, CallType::Method, scope, false))
             }
 
             "scoped_identifier" | "qualified_identifier" => {
@@ -869,7 +1083,7 @@ impl CallGraph {
                     .child_by_field_name("name")
                     .and_then(text_of)
                     .or_else(|| self.get_last_identifier(node, source))?;
-                Some((name, CallType::StaticMethod, scope))
+                Some((name, CallType::StaticMethod, scope, false))
             }
 
             _ => None,
@@ -880,23 +1094,21 @@ impl CallGraph {
     /// and turn it into an edge. Returns `None` for call shapes without a known
     /// callee field (BSL among them) so [`extract_call_edge`](Self::extract_call_edge)
     /// can fall back to its sibling scan.
-    fn extract_call_edge_by_fields(
-        &self,
-        node: Node,
-        source: &[u8],
-        path: &str,
-    ) -> Option<CallEdge> {
-        let kind = node.kind();
-
-        // `receiver` is set only for shapes where the callee node itself does
-        // not carry the receiver (Ruby `call`, Java/PHP method invocations).
-        let (callee, receiver) = match kind {
-            "call_expression" | "call" | "invocation_expression" | "function_call_expression" => {
+    /// The callee node of a call, plus a separate receiver node for the shapes
+    /// where the callee itself does not carry one (Ruby `call`, Java/PHP method
+    /// invocations). `None` for call shapes without a known callee field.
+    fn callee_slot(node: Node) -> Option<(Node, Option<Node>)> {
+        match node.kind() {
+            "call_expression"
+            | "call"
+            | "method_call_expression"
+            | "invocation_expression"
+            | "function_call_expression" => {
                 if let Some(function) = node.child_by_field_name("function") {
-                    (function, None)
+                    Some((function, None))
                 } else if let Some(method) = node.child_by_field_name("method") {
                     // Ruby: `(call receiver: (identifier) method: (identifier))`
-                    (method, node.child_by_field_name("receiver"))
+                    Some((method, node.child_by_field_name("receiver")))
                 } else {
                     // Kotlin/Swift: callee and `call_suffix` are unnamed children.
                     let mut walker = node.walk();
@@ -905,19 +1117,32 @@ impl CallGraph {
                             && !child.kind().contains("argument")
                             && child.kind() != "call_suffix"
                     })?;
-                    (callee, None)
+                    Some((callee, None))
                 }
             }
             // Java `obj.m()`, PHP `$obj->m()` and `Obj::m()`.
-            "method_invocation" | "member_call_expression" | "scoped_call_expression" => (
+            "method_invocation" | "member_call_expression" | "scoped_call_expression" => Some((
                 node.child_by_field_name("name")?,
                 node.child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("scope")),
-            ),
-            _ => return None,
-        };
+            )),
+            _ => None,
+        }
+    }
 
-        let (target, mut call_type, mut scope_hint) = self.describe_callee(callee, source)?;
+    /// The edge plus whether its scope hint was inferred rather than read; see
+    /// [`extract_call_edge`](Self::extract_call_edge).
+    fn extract_call_edge_by_fields(
+        &self,
+        node: Node,
+        source: &[u8],
+        path: &str,
+    ) -> Option<(CallEdge, bool)> {
+        let kind = node.kind();
+        let (callee, receiver) = Self::callee_slot(node)?;
+
+        let (target, mut call_type, mut scope_hint, mut scope_inferred) =
+            self.describe_callee(callee, source)?;
 
         if let Some(receiver) = receiver {
             call_type = if kind == "scoped_call_expression" {
@@ -926,23 +1151,36 @@ impl CallGraph {
                 CallType::Method
             };
             scope_hint = Self::scope_hint_from(receiver, source);
+            scope_inferred = false;
+            if scope_hint.is_none() {
+                if let Some(inferred) = self.chained_call_scope_hint(receiver, source) {
+                    scope_hint = Some(inferred);
+                    scope_inferred = true;
+                }
+            }
         }
 
-        Some(CallEdge {
-            target,
-            file_path: path.to_string(),
-            line: node.start_position().row + 1,
-            column: node.start_position().column + 1,
-            call_type,
-            scope_hint,
-            resolved: false,
-            resolution: CallResolution::Unknown,
-        })
+        Some((
+            CallEdge {
+                target,
+                file_path: path.to_string(),
+                line: node.start_position().row + 1,
+                column: node.start_position().column + 1,
+                call_type,
+                scope_hint,
+                resolved: false,
+                resolution: CallResolution::Unknown,
+            },
+            scope_inferred,
+        ))
     }
 
-    fn extract_call_edge(&self, node: Node, source: &[u8], path: &str) -> Option<CallEdge> {
-        if let Some(edge) = self.extract_call_edge_by_fields(node, source, path) {
-            return Some(edge);
+    /// The edge for a call site, plus whether its `scope_hint` was inferred
+    /// from a factory name instead of read off the call site — the flag
+    /// `resolve_callee` needs to label the match honestly.
+    fn extract_call_edge(&self, node: Node, source: &[u8], path: &str) -> Option<(CallEdge, bool)> {
+        if let Some(found) = self.extract_call_edge_by_fields(node, source, path) {
+            return Some(found);
         }
 
         let mut cursor = node.walk();
@@ -995,15 +1233,20 @@ impl CallGraph {
             }
         }
 
-        target.map(|name| CallEdge {
-            target: name,
-            file_path: path.to_string(),
-            line: node.start_position().row + 1,
-            column: node.start_position().column + 1,
-            call_type,
-            scope_hint,
-            resolved: false,
-            resolution: CallResolution::Unknown,
+        target.map(|name| {
+            (
+                CallEdge {
+                    target: name,
+                    file_path: path.to_string(),
+                    line: node.start_position().row + 1,
+                    column: node.start_position().column + 1,
+                    call_type,
+                    scope_hint,
+                    resolved: false,
+                    resolution: CallResolution::Unknown,
+                },
+                false,
+            )
         })
     }
 
@@ -1283,11 +1526,17 @@ impl CallGraph {
                 if let Some(key) = by_receiver {
                     return Some(key.clone());
                 }
+                let qualifier_path = Self::scope_path_fragment(qualifier);
                 let by_path = matches.iter().find(|key| {
-                    self.key_file_path(key)
-                        .map(|file_path| {
-                            file_path.ends_with(qualifier)
-                                || Self::scope_matches_file_path(qualifier, &file_path)
+                    let Some(file_path) = self.key_file_path(key) else {
+                        return false;
+                    };
+                    if file_path.ends_with(qualifier) {
+                        return true;
+                    }
+                    self.key_file_path_lower(key)
+                        .map(|file_path_lower| {
+                            Self::path_fragment_matches(&qualifier_path, &file_path_lower)
                         })
                         .unwrap_or(false)
                 });
@@ -3202,5 +3451,41 @@ mod tests {
         let (target, resolution) = graph.resolve_callee("gone", "src/main.rs", None);
         assert_eq!(target, "gone", "an edge must never carry an empty target");
         assert_eq!(resolution, CallResolution::Unresolved);
+    }
+
+    #[test]
+    fn test_factory_type_hint_follows_naming_conventions() {
+        for (name, expected) in [
+            ("SfxOperationUseFactory", Some("SfxOperationUse")),
+            ("sfx_operation_repo_factory", Some("SfxOperationRepo")),
+            ("NewGoSchedulerApplication", Some("GoSchedulerApplication")),
+            ("new_store", Some("Store")),
+            ("StoreProvider", Some("Store")),
+            ("RequestBuilder", Some("Request")),
+        ] {
+            assert_eq!(
+                CallGraph::factory_type_hint(name).as_deref(),
+                expected,
+                "hint for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_factory_type_hint_declines_names_without_a_convention() {
+        for name in [
+            // A plain lookup names no type.
+            "lookup", "get", "handle",
+            // `New` followed by a lowercase letter is one word, not a
+            // constructor: `NewsFeed` must not be read as type `SFeed`.
+            "NewsFeed", // Nothing left after stripping.
+            "Factory", "New",
+        ] {
+            assert_eq!(
+                CallGraph::factory_type_hint(name),
+                None,
+                "{name} must not produce a type hint"
+            );
+        }
     }
 }

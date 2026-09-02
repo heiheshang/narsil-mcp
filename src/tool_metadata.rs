@@ -344,13 +344,15 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
-                    "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex."},
+                    "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex — use 'name_regex' for that."},
                     "query": {"type": "string", "description": "Alias for 'pattern'"},
                     "name": {"type": "string", "description": "Alias for 'pattern'"},
+                    "name_regex": {"type": "string", "description": "Regex (case-insensitive) matched against symbol names, e.g. '^On[A-Z]' or 'Handler$'. Combine with 'pattern' to AND both; omit 'pattern' to match by shape alone."},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py'); a bare filename matches at any depth"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
-                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated"},
-                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
+                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated. Pass 0 for no limit — a genuine full enumeration."},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"},
+                    "compact": {"type": "boolean", "description": "Return a flat 'name (file:line)' list with no markdown headers, grouping, or signatures — cheaper to generate and parse when you just need the names (default: false)"}
                 },
                 "required": ["repo"]
             }),

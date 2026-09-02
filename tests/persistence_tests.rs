@@ -1,4 +1,5 @@
 use anyhow::Result;
+use narsil_mcp::index::FindSymbolsQuery;
 use narsil_mcp::lsp::LspConfig;
 use narsil_mcp::neural::NeuralConfig;
 use narsil_mcp::streaming::StreamingConfig;
@@ -122,14 +123,10 @@ async fn test_persistence_index_loading() -> Result<()> {
         engine.complete_initialization().await?;
 
         let symbols = engine
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("User"));
         assert!(symbols.contains("create_user"));
@@ -152,14 +149,10 @@ async fn test_persistence_index_loading() -> Result<()> {
 
         // Verify symbols are available (loaded from cache)
         let symbols = engine2
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("User"));
         assert!(symbols.contains("create_user"));
@@ -239,14 +232,11 @@ async fn test_persistence_stale_file_detection() -> Result<()> {
 
         // Verify the new struct is present
         let symbols = engine2
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                Some("Modified"),
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                pattern: Some("Modified"),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("ModifiedStruct"));
     }
@@ -292,14 +282,10 @@ async fn test_persistence_disabled() -> Result<()> {
 
     // Verify it still works, just doesn't persist
     let symbols = engine
-        .find_symbols(
-            repo.path().file_name().unwrap().to_str().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .find_symbols(FindSymbolsQuery {
+            repo: repo.path().file_name().unwrap().to_str().unwrap(),
+            ..Default::default()
+        })
         .await?;
     assert!(symbols.contains("test"));
 
@@ -360,14 +346,10 @@ async fn test_empty_persisted_index() -> Result<()> {
         engine2.complete_initialization().await?;
 
         let symbols = engine2
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("new_function"));
     }
@@ -674,14 +656,11 @@ async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
     // The new symbol must be visible — proves the watcher is alive and
     // processed the file change.
     let result = engine
-        .find_symbols(
-            &repo_name,
-            None,
-            Some("watcher_reindexed_me"),
-            None,
-            None,
-            None,
-        )
+        .find_symbols(FindSymbolsQuery {
+            repo: &repo_name,
+            pattern: Some("watcher_reindexed_me"),
+            ..Default::default()
+        })
         .await?;
     assert!(
         result.contains("watcher_reindexed_me"),
@@ -799,7 +778,11 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
     engine.complete_initialization().await?;
 
     let symbols = engine
-        .find_symbols(&repo_name, None, Some("calculate"), None, None, None)
+        .find_symbols(FindSymbolsQuery {
+            repo: &repo_name,
+            pattern: Some("calculate"),
+            ..Default::default()
+        })
         .await?;
     assert!(
         symbols.contains("calculate_invoice_total"),

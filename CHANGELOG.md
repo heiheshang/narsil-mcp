@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Call-graph edges through DI factories and constructors.** A call chained
+  onto a factory call — `self.Depend.SfxOperationUseFactory(self.C).ProcessNewOperation(op)`,
+  the dominant shape in dependency-injected Go services, or plainly
+  `NewGoSchedulerApplication(cfg).Run()` — spells no receiver type at the call
+  site, so `resolve_callee` had nothing to work with and fell through to its
+  last resort: the alphabetically smallest namesake. The edge existed but
+  pointed at an unrelated type, and `get_callers` on the real target showed
+  nothing. The factory's own name carries the type, so it is now used as a
+  scope hint (`XFactory`/`XProvider`/`XBuilder`, `NewX`/`MakeX`, snake_case
+  included), and the target is looked up among the namesakes defined on type
+  `X`. The hint is kept only when exactly one namesake matches, and such edges
+  are reported as `receiver inferred from factory name` — a naming convention
+  is evidence, not proof, so the resolution is deliberately not counted as
+  certain. On a 3,232-file Go corpus this hinted 9,460 edges, of which ~4,700
+  previously resolved to the wrong type. Dispatch through an interface value
+  held in a variable or field remains unresolved.
+
 ## [1.9.4] - 2026-08-27
 
 ### Added

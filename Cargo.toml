@@ -119,6 +119,7 @@ lazy_static = "1.5"
 parking_lot = "0.12"
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
+ahash = "0.8"  # Fast non-cryptographic hasher for index-time maps keyed by on-disk data. Not SipHash's DoS resistance: narsil-mcp's own supply-chain/dependency-audit use case means that data can be adversarial (a hostile vendored dependency), so this trades worst-case collision resistance for real speed on the common case — see the longer note above CallGraph's field declarations.
 uuid = { version = "1.0", features = ["v4"] }  # For generating unique streaming tokens
 chrono = "0.4"  # Date/time handling for SBOM generation
 url = "2.5"  # URL parsing and validation
