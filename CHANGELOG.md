@@ -40,6 +40,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under the +50% budget by noting declarations during the existing walk instead
   of sweeping each function body a second time.
 
+- **Field chains, struct embedding and interfaces resolved.** The rest of the
+  staged plan in `docs/callgraph-resolution-plan.md`:
+  - A receiver written as a chain of fields (`self.C`,
+    `self.Depend.CustomerDocumentExtService`) is typed from the struct
+    declarations, up to four links; and where the middle of a chain is a method
+    call, its result comes from the interface declaration when the field is an
+    interface — an interface method has no body and so no graph node, but it
+    does state what it returns. That is `self.C.Logger().SendError(err)`
+    resolved end to end.
+  - Go promotes an embedded type's methods onto the outer type, so
+    `self.HandleError(err)` inside a method of `CustomerRepo { base.SimpleQuery }`
+    is `SimpleQuery::HandleError`. Reported as `Receiver`: promotion is a rule
+    of the language. An ambiguity across two embedded types is left alone —
+    that is a compile error in Go, so it means the reading is off.
+  - A receiver whose type is an interface resolves to the one indexed type
+    carrying every method the interface declares, reported as
+    `single implementation of the interface` and deliberately not certain:
+    dispatch is dynamic and another implementation could be injected. An
+    interface with fewer than two methods is not narrowed at all (half a corpus
+    satisfies `Error()`), and a mock in the test tree loses to production code.
+  - A name declared as a builtin, a container, or a type from a package outside
+    the index is recorded as foreign, so `err.Error()` and `wg.Add(1)` leave
+    the graph instead of collecting some namesake of this repository.
+    Package-level `var` declarations count as declarations too.
+
+- **`## Call Edge Resolution` in `get_index_status`**, counting how the edges
+  were resolved. Resolution quality was otherwise invisible: a corpus whose
+  calls stop resolving yields the same number of edges pointing at worse
+  targets, and only a hand-written measurement would notice. Plus a
+  `call_graph_build_50_go_files` benchmark over a DI-shaped Go corpus, and
+  `tests/callgraph_corpus_measure.rs` (`#[ignore]`, `NARSIL_GO_CORPUS=<path>`)
+  for measuring a real one.
+
+  Final tally on the 3,232-file corpus, against where this started:
+  name-only guesses 16,698 -> 2,725 (11% of edges -> 1.8%), receiver matches
+  25 -> 33,020, `SameFile` fallbacks 3,125 -> 276, and ~3,400 edges that
+  pointed at unrelated functions now honestly absent. Graph construction
+  1,05 s -> 1,76 s (+68%, over the +50% budget the plan set — the cost is
+  reading declarations and checking interface implementations; memoized per
+  interface/type pair and bounded, but not free).
+
 ### Added
 
 - **Call-graph edges through DI factories and constructors.** A call chained

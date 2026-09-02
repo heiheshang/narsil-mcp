@@ -1,3 +1,17 @@
+//! Resolution quality over a real corpus, not a fixture.
+//!
+//! Ignored by default and driven by `NARSIL_GO_CORPUS=<path to a Go repo>`:
+//!
+//! ```text
+//! NARSIL_GO_CORPUS=~/src/some-go-service \
+//!     cargo test --release --test callgraph_corpus_measure -- --ignored --nocapture
+//! ```
+//!
+//! Prints the mix of resolutions and, for the edges that are still a guess,
+//! what shape their call site had. Fixtures prove one shape resolves; this is
+//! what says whether the shapes that dominate real code do — and it is how
+//! every figure in `docs/callgraph-resolution-plan.md` was obtained.
+
 use narsil_mcp::callgraph::CallGraph;
 use narsil_mcp::parser::LanguageParser;
 use std::collections::HashMap;

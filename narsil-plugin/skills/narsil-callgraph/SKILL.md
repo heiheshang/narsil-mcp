@@ -46,6 +46,7 @@ Each entry says what its target was matched on:
 |---|---|---|
 | *(no marker)* | Unique name, receiver type, or module scope matched | A fact |
 | `receiver inferred from factory name` | The call was chained onto a factory or constructor (`XFactory(c).M()`, `NewX().M()`) and exactly one namesake is defined on type `X` | Strong candidate - the type came from a naming convention, not from the call site |
+| `single implementation of the interface` | The receiver's type is an interface, and exactly one type in the index carries every method it declares | Strong candidate - dispatch is dynamic, another implementation could be injected |
 | `same-file match` | Namesakes exist; the one in the caller's file was taken | Likely, say so |
 | `name match only` | Namesakes exist and nothing distinguished them | A candidate - verify before acting |
 | `not in graph` | Third-party, stdlib, unindexed - or a qualifier that names an imported package outside this repo (`assert.Len`), or a Go type conversion (`account_model.AccountUuid(x)`), which is no call at all | Not project code; usually noise |
@@ -81,21 +82,33 @@ checker, so what is covered is what is written nearby:
 | Call site | How it resolves |
 |---|---|
 | `self.Logger()` / `this.save()` | On the enclosing method's own receiver type - exact, `Receiver` |
-| `svc.Create(dto)` where `svc` is a parameter, `var svc T`, `svc := NewT()` or `svc := &T{}` | On that declared type - `Receiver`, and dropped silently if no namesake is defined on it |
+| `self.HandleError(err)` where the method sits on an embedded type | Promoted from the embedded type, `Receiver` - a rule of Go, not a guess |
+| `svc.Create(dto)` where `svc` is a parameter, `var svc T`, `svc := NewT()`, `svc := &T{}`, or `svc, err := build()` | On the declared type, `Receiver`; a package-level `var` counts too |
+| `accountRepo(ctx).FindByUuid(id)` | On the declared **result type** of the inner call, `Receiver`; when the inner call is one of several namesakes, only if they all declare the same result type |
+| `self.C.Logger().SendError(err)` | Field type from the struct declaration, then the method's result type - from the interface declaration when the field is an interface |
 | `XFactory(c).M()`, `NewX().M()` | On type `X` from the factory/constructor name - `receiver inferred from factory name`; fires for `Factory`/`Provider`/`Builder` suffixes and `New`/`Make` prefixes, snake_case included |
-| `config.Get()` where `config` is an imported package of this repo | Narrowed to that package's directory - `Scope` |
-| `assert.Len(t, x, 3)` where the package is third-party | **No target at all** - `not in graph`, instead of some `Len` of this repo |
+| `self.Provider.Deliver(to)` where the field is an interface | The one indexed type carrying every method the interface declares - `single implementation of the interface`; a mock in the test tree loses to production code |
+| `config.Get()` where `config` is an imported package of this repo | Narrowed to that package's own directory (not its subpackages), package-level functions only - `Scope` |
+| `assert.Len(t, x, 3)`, `err.Error()`, `wg.Add(1)` - a third-party package, or a name declared as a builtin, container or foreign type | **No target at all** - `not in graph`, instead of some namesake of this repo |
+
+`get_index_status` reports the mix (`## Call Edge Resolution`), which is how you
+tell a corpus that resolves well from one that mostly guesses.
 
 Still unresolved, and still needing a manual check:
 
-- dispatch through an interface value in a **struct field** (`self.Repo.Find()`)
-  or one whose implementing type is named differently from the interface;
-- a value from a multi-value assignment (`svc, err := build()`), a map, or a
-  slice element;
-- methods reached through Go **struct embedding**;
+- an interface with several implementations in the index (the graph will not
+  pick one), or one implemented outside it;
+- a value out of a map, a slice element, a channel, or a multi-value assignment
+  where more than one name carries a meaningful value;
+- a variable reassigned to a different type between declaration and call - the
+  reading is shallow: no flow analysis, last declaration wins;
 - reflection, callbacks stored in variables, and platform-invoked handlers. A
   BSL handler such as `ПриДобавленииОбработчиковОбновления` legitimately shows
   zero callers - the platform calls it, not the code.
+
+All of the above is read from Go declarations. Other languages keep the
+`self`/`this`, factory-name and same-file resolution, but not the field, result
+type or interface steps.
 
 Therefore: **"0 callers" is never proof that code is dead.** Cross-check with
 `find_references`, `find_symbol_usages`, and a plain string search of the name

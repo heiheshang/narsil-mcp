@@ -42,6 +42,16 @@ pub struct Field {
     pub embedded: bool,
 }
 
+/// One method an interface requires, with the type it returns — which is how a
+/// chain through an interface value (`self.C.Logger().SendError(err)`) gets a
+/// type for its second hop: the interface declares `Logger() *Logger`, and no
+/// implementation has to be found to know that.
+#[derive(Debug, Clone)]
+pub struct InterfaceMethod {
+    pub name: String,
+    pub result: Option<String>,
+}
+
 /// A declared type, stripped to what resolution can act on.
 #[derive(Debug, Clone)]
 pub struct TypeDecl {
@@ -50,7 +60,7 @@ pub struct TypeDecl {
     pub kind: TypeKind,
     pub fields: Vec<Field>,
     /// Method names an interface requires; empty for a struct or alias.
-    pub methods: Vec<String>,
+    pub methods: Vec<InterfaceMethod>,
     /// The aliased type, for `TypeKind::Alias`.
     pub aliased: Option<String>,
 }
@@ -136,30 +146,46 @@ impl TypeIndex {
         }
     }
 
-    /// The single declaration of `name`, or `None` when the name is unknown or
-    /// declared more than once. Two types of one name in a corpus (a `Config`
-    /// per module, say) cannot be told apart here, and picking one would put a
-    /// wrong type into resolution — where the whole point is to replace a
-    /// guess with something read.
-    fn unique_decl(&self, name: &str) -> Option<Arc<TypeDecl>> {
+    /// The declaration of `name` to read, or `None` when the name is unknown
+    /// or ambiguous.
+    ///
+    /// A single declaration answers directly. When a corpus declares the name
+    /// more than once — `CustomerRepo` in two modules, a `Config` per package —
+    /// the one in `prefer_dir` wins, that being the directory of the file
+    /// asking. A Go package is one directory and a type is visible unqualified
+    /// only inside its own, so this is the declaration the source meant. With
+    /// no such declaration the answer is `None`: picking one would put a wrong
+    /// type into resolution, where the whole point is to replace a guess with
+    /// something read.
+    fn decl_for(&self, name: &str, prefer_dir: Option<&str>) -> Option<Arc<TypeDecl>> {
         let entry = self.by_name.get(name)?;
-        match entry.len() {
-            1 => Some(entry[0].clone()),
-            _ => None,
+        if entry.len() == 1 {
+            return Some(entry[0].clone());
         }
+        let dir = prefer_dir?;
+        let mut in_dir = entry
+            .iter()
+            .filter(|decl| directory_of(&decl.file_path) == dir);
+        let first = in_dir.next()?;
+        in_dir.next().is_none().then(|| first.clone())
     }
 
     /// The type of `type_name`'s field `field`, following aliases and embedded
     /// types (Go promotes an embedded type's fields as well as its methods).
-    pub fn field_type(&self, type_name: &str, field: &str) -> Option<String> {
-        self.walk_from(type_name, 4, &mut |decl| {
+    pub fn field_type(
+        &self,
+        type_name: &str,
+        field: &str,
+        prefer_dir: Option<&str>,
+    ) -> Option<String> {
+        self.walk_from(type_name, 4, prefer_dir, &mut |decl| {
             decl.field_type(field).map(|found| found.to_string())
         })
     }
 
     /// Names of the types `type_name` embeds, outermost first, following
     /// embedded types transitively. Empty when the type is unknown.
-    pub fn embedded_chain(&self, type_name: &str) -> Vec<String> {
+    pub fn embedded_chain(&self, type_name: &str, prefer_dir: Option<&str>) -> Vec<String> {
         let mut found = Vec::new();
         let mut queue = vec![(type_name.to_string(), 0usize)];
         let mut seen = vec![type_name.to_string()];
@@ -167,7 +193,7 @@ impl TypeIndex {
             if depth >= 3 {
                 continue;
             }
-            let Some(decl) = self.unique_decl(&current) else {
+            let Some(decl) = self.decl_for(&current, prefer_dir) else {
                 continue;
             };
             for field in decl.fields.iter().filter(|field| field.embedded) {
@@ -183,17 +209,39 @@ impl TypeIndex {
     }
 
     /// Is `type_name` an interface?
-    pub fn is_interface(&self, type_name: &str) -> bool {
-        self.unique_decl(type_name)
+    pub fn is_interface(&self, type_name: &str, prefer_dir: Option<&str>) -> bool {
+        self.decl_for(type_name, prefer_dir)
             .map(|decl| decl.kind == TypeKind::Interface)
             .unwrap_or(false)
     }
 
-    /// The methods an interface requires, for matching an implementing type.
-    pub fn interface_methods(&self, type_name: &str) -> Vec<String> {
-        self.unique_decl(type_name)
-            .map(|decl| decl.methods.clone())
+    /// The names of the methods an interface requires, for matching an
+    /// implementing type.
+    pub fn interface_methods(&self, type_name: &str, prefer_dir: Option<&str>) -> Vec<String> {
+        self.decl_for(type_name, prefer_dir)
+            .map(|decl| {
+                decl.methods
+                    .iter()
+                    .map(|method| method.name.clone())
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// The type an interface's method declares it returns. Follows embedded
+    /// interfaces, since Go promotes their methods too.
+    pub fn interface_method_result(
+        &self,
+        type_name: &str,
+        method: &str,
+        prefer_dir: Option<&str>,
+    ) -> Option<String> {
+        self.walk_from(type_name, 4, prefer_dir, &mut |decl| {
+            decl.methods
+                .iter()
+                .find(|candidate| candidate.name == method)
+                .and_then(|found| found.result.clone())
+        })
     }
 
     /// Every struct whose declaration is known, as `(name, method names it
@@ -214,22 +262,23 @@ impl TypeIndex {
         &self,
         type_name: &str,
         depth: usize,
+        prefer_dir: Option<&str>,
         probe: &mut dyn FnMut(&TypeDecl) -> Option<T>,
     ) -> Option<T> {
         if depth == 0 {
             return None;
         }
-        let decl = self.unique_decl(type_name)?;
+        let decl = self.decl_for(type_name, prefer_dir)?;
         if let Some(found) = probe(&decl) {
             return Some(found);
         }
         if let Some(aliased) = decl.aliased.as_deref() {
-            if let Some(found) = self.walk_from(aliased, depth - 1, probe) {
+            if let Some(found) = self.walk_from(aliased, depth - 1, prefer_dir, probe) {
                 return Some(found);
             }
         }
         for embedded in decl.fields.iter().filter(|field| field.embedded) {
-            if let Some(found) = self.walk_from(&embedded.type_name, depth - 1, probe) {
+            if let Some(found) = self.walk_from(&embedded.type_name, depth - 1, prefer_dir, probe) {
                 return Some(found);
             }
         }
@@ -372,7 +421,7 @@ fn field_names(declaration: Node, source: &[u8]) -> Vec<String> {
     names
 }
 
-fn interface_methods(interface_type: Node, source: &[u8]) -> Vec<String> {
+fn interface_methods(interface_type: Node, source: &[u8]) -> Vec<InterfaceMethod> {
     let mut methods = Vec::new();
     let mut cursor = interface_type.walk();
     for child in interface_type.children(&mut cursor) {
@@ -380,11 +429,34 @@ fn interface_methods(interface_type: Node, source: &[u8]) -> Vec<String> {
         // grammars; an embedded interface arrives as a bare type instead.
         if matches!(child.kind(), "method_elem" | "method_spec") {
             if let Some(name) = field_text(child, "name", source) {
-                methods.push(name);
+                methods.push(InterfaceMethod {
+                    name,
+                    result: child
+                        .child_by_field_name("result")
+                        .and_then(|result| result_type_name(result, source)),
+                });
             }
         }
     }
     methods
+}
+
+/// The type a `result` field names: one type, or the first non-primitive entry
+/// of a `(T, error)` parameter list.
+fn result_type_name(result: Node, source: &[u8]) -> Option<String> {
+    if result.kind() != "parameter_list" {
+        return type_name_of(result, source);
+    }
+    let mut cursor = result.walk();
+    let declarations: Vec<Node> = result
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "parameter_declaration")
+        .collect();
+    declarations.into_iter().find_map(|declaration| {
+        declaration
+            .child_by_field_name("type")
+            .and_then(|declared| type_name_of(declared, source))
+    })
 }
 
 /// The name of a type as written, reduced to the identifier resolution
@@ -408,6 +480,64 @@ pub fn type_name_of(node: Node, source: &[u8]) -> Option<String> {
             type_name_of(inner, source)
         }
         _ => None,
+    }
+}
+
+/// What a written type means for resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeRef {
+    /// A named type, with the package qualifier it was written with, if any.
+    Named {
+        name: String,
+        package: Option<String>,
+    },
+    /// A type on which no method of this repository can ever be found: a
+    /// builtin, or a container the call site cannot even be written on. Worth
+    /// recording rather than discarding, because "no project method" is a
+    /// better answer than a namesake picked by sort order — `err.Error()` is
+    /// not a call to whatever `Error` this corpus happens to define.
+    Foreign,
+    /// Nothing readable — resolution carries on as before.
+    Unknown,
+}
+
+/// Read a written type into a [`TypeRef`].
+pub fn classify_type(node: Node, source: &[u8]) -> TypeRef {
+    match node.kind() {
+        "type_identifier" | "identifier" => match node.utf8_text(source) {
+            Ok(text) if is_primitive(text) => TypeRef::Foreign,
+            Ok(text) => TypeRef::Named {
+                name: text.to_string(),
+                package: None,
+            },
+            Err(_) => TypeRef::Unknown,
+        },
+        "qualified_type" => {
+            let package = node
+                .child_by_field_name("package")
+                .and_then(|package| package.utf8_text(source).ok())
+                .map(|text| text.to_string());
+            match node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+            {
+                Some(name) => TypeRef::Named {
+                    name: name.to_string(),
+                    package,
+                },
+                None => TypeRef::Unknown,
+            }
+        }
+        "pointer_type" | "parenthesized_type" => match node.named_child(0) {
+            Some(inner) => classify_type(inner, source),
+            None => TypeRef::Unknown,
+        },
+        // A call cannot be made on the container itself, and its element type
+        // is not what the qualifier names.
+        "slice_type" | "array_type" | "map_type" | "channel_type" | "function_type" => {
+            TypeRef::Foreign
+        }
+        _ => TypeRef::Unknown,
     }
 }
 
@@ -438,6 +568,15 @@ fn is_primitive(name: &str) -> bool {
             | "complex64"
             | "complex128"
     )
+}
+
+/// The directory part of a path, with its trailing separator — the identity of
+/// a Go package as far as this index is concerned.
+pub fn directory_of(file_path: &str) -> &str {
+    match file_path.rfind('/') {
+        Some(end) => &file_path[..=end],
+        None => "",
+    }
 }
 
 fn field_text(node: Node, field: &str, source: &[u8]) -> Option<String> {
@@ -494,12 +633,14 @@ type Uuid = string
     fn test_struct_fields_drop_the_package_qualifier() {
         let index = index();
         assert_eq!(
-            index.field_type("AccountInterest", "Depend").as_deref(),
+            index
+                .field_type("AccountInterest", "Depend", None)
+                .as_deref(),
             Some("AccountInterestDepend")
         );
         assert_eq!(
             index
-                .field_type("AccountInterestDepend", "InterestUseFactory")
+                .field_type("AccountInterestDepend", "InterestUseFactory", None)
                 .as_deref(),
             Some("InterestUseFactory"),
             "the receiver of a method is never written with its package"
@@ -510,12 +651,12 @@ type Uuid = string
     fn test_primitive_and_container_fields_are_not_indexed() {
         let index = index();
         assert_eq!(
-            index.field_type("AccountInterest", "name"),
+            index.field_type("AccountInterest", "name", None),
             None,
             "no method is ever looked up on `string`"
         );
         assert_eq!(
-            index.field_type("AccountInterest", "rows"),
+            index.field_type("AccountInterest", "rows", None),
             None,
             "a call cannot be made on the slice itself"
         );
@@ -525,21 +666,28 @@ type Uuid = string
     fn test_embedded_field_is_marked_and_chained() {
         let index = index();
         assert_eq!(
-            index.embedded_chain("AccountInterest"),
+            index.embedded_chain("AccountInterest", None),
             vec!["BaseCronScheduler".to_string()],
             "the anonymous field's type is what gets promoted"
         );
-        assert!(index.embedded_chain("BaseCronScheduler").is_empty());
+        assert!(index.embedded_chain("BaseCronScheduler", None).is_empty());
     }
 
     #[test]
     fn test_interface_is_recognised_with_its_methods() {
         let index = index();
-        assert!(index.is_interface("Ctx"));
-        assert!(!index.is_interface("AccountInterest"));
+        assert!(index.is_interface("Ctx", None));
+        assert!(!index.is_interface("AccountInterest", None));
         assert_eq!(
-            index.interface_methods("Ctx"),
+            index.interface_methods("Ctx", None),
             vec!["Logger".to_string(), "Db".to_string()]
+        );
+        assert_eq!(
+            index
+                .interface_method_result("Ctx", "Logger", None)
+                .as_deref(),
+            Some("Logger"),
+            "the interface declares what its method returns"
         );
     }
 
@@ -558,7 +706,9 @@ type Uuid = string
         );
         assert_eq!(index.len(), before);
         assert_eq!(
-            index.field_type("AccountInterest", "Depend").as_deref(),
+            index
+                .field_type("AccountInterest", "Depend", None)
+                .as_deref(),
             Some("AccountInterestDepend"),
             "a duplicate declaration makes every lookup bail out"
         );

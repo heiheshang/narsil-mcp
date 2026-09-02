@@ -84,6 +84,12 @@ pub enum CallResolution {
     /// one namesake is defined on that type, so this is a strong candidate —
     /// but the type was inferred from a naming convention, not read.
     FactoryReceiver,
+    /// The qualifier named an interface, and exactly one type in the index
+    /// implements it — carries every method the interface declares — so the
+    /// call was resolved on that type. Dispatch is dynamic: another
+    /// implementation could be introduced, or injected from outside the index,
+    /// which is why this is a strong candidate rather than a fact.
+    InterfaceImpl,
     /// The qualifier matched the target's module or file path.
     Scope,
     /// Several namesakes; the one in the caller's own file was taken.
@@ -105,6 +111,7 @@ impl CallResolution {
     pub fn caveat(self) -> Option<&'static str> {
         match self {
             Self::FactoryReceiver => Some("receiver inferred from factory name"),
+            Self::InterfaceImpl => Some("single implementation of the interface"),
             Self::SameFile => Some("same-file match"),
             Self::NameOnly => Some("name match only"),
             Self::Unresolved => Some("not in graph"),
@@ -178,6 +185,16 @@ pub struct CallGraph {
     /// interface methods. What lets a qualifier naming a field or a value be
     /// resolved on a type that was written down rather than guessed at.
     types: types::TypeIndex,
+    /// `interface + \u{1} + type -> does that type carry every method the interface
+    /// declares`. Memoized because the check walks the interface's whole
+    /// method set through `name_index`, and the same handful of interfaces is
+    /// asked about at thousands of call sites. Cleared with the type index,
+    /// since both answers depend on the set of indexed files.
+    implements_cache: FastMap<String, bool>,
+    /// Interface name -> the method names it declares. Read on every
+    /// interface-qualified call site, and `TypeIndex` has to clone the vector
+    /// to hand it out; once per interface is enough.
+    interface_methods_cache: FastMap<String, Arc<Vec<String>>>,
 }
 
 impl Default for CallGraph {
@@ -195,14 +212,66 @@ struct FileScope<'a> {
     imports: &'a HashMap<String, String>,
 }
 
+/// What a name in the enclosing function stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalKind {
+    /// Declared as this type.
+    Type(String),
+    /// Declared as something no method of this repository can sit on: a
+    /// builtin, a container, a type from a package outside the index. Recorded
+    /// rather than dropped, because `err.Error()` and `wg.Add(1)` are calls
+    /// into someone else's code, and the honest answer for them is "not in the
+    /// graph" — not this corpus's first `Error` by sort order.
+    Foreign,
+}
+
 /// What the walk knows about the function it is currently inside: its graph
-/// key, the type it is defined on (for `self` call sites), and the declared
-/// types of its parameters and local variables.
+/// key, the type it is defined on (for `self` call sites), and what the names
+/// in it stand for.
 #[derive(Default)]
 struct FnScope {
     function: Option<String>,
     receiver: Option<String>,
-    locals: HashMap<String, String>,
+    locals: HashMap<String, LocalKind>,
+}
+
+/// Everything resolution can use about the place a call was written: the file
+/// (a tiebreaker among namesakes), the enclosing method's receiver type (for
+/// `self`), the names declared around it, and the file's imports (to tell a
+/// package qualifier from a variable). Passed as one value because these
+/// travel together through callee description, chained-call typing and local
+/// declaration reading.
+#[derive(Clone, Copy)]
+struct CallCtx<'a> {
+    file: &'a str,
+    self_type: Option<&'a str>,
+    locals: &'a HashMap<String, LocalKind>,
+    /// Declarations at the file's own top level. Kept apart from `locals`
+    /// because those are cleared on entering each function, while a
+    /// package-level `var limiter = ...` is in scope for all of them.
+    file_locals: &'a HashMap<String, LocalKind>,
+    imports: &'a HashMap<String, String>,
+}
+
+impl<'a> CallCtx<'a> {
+    /// The declared type of a name in scope, if it is one that can carry a
+    /// project method.
+    fn local_type(&self, name: &str) -> Option<&'a str> {
+        match self.declared(name) {
+            Some(LocalKind::Type(type_name)) => Some(type_name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_foreign_local(&self, name: &str) -> bool {
+        matches!(self.declared(name), Some(LocalKind::Foreign))
+    }
+
+    /// A function's own declaration shadows the package-level one, as in the
+    /// language itself.
+    fn declared(&self, name: &str) -> Option<&'a LocalKind> {
+        self.locals.get(name).or_else(|| self.file_locals.get(name))
+    }
 }
 
 impl CallGraph {
@@ -214,6 +283,8 @@ impl CallGraph {
             file_path_lower_cache: DashMap::default(),
             import_dir_cache: DashMap::default(),
             types: types::TypeIndex::new(),
+            implements_cache: DashMap::default(),
+            interface_methods_cache: DashMap::default(),
         }
     }
 
@@ -235,6 +306,8 @@ impl CallGraph {
         // A "package not in the index" answer cached before this batch may be
         // wrong now, and a directory answer may have become ambiguous.
         self.import_dir_cache.clear();
+        self.implements_cache.clear();
+        self.interface_methods_cache.clear();
         Ok(())
     }
 
@@ -252,6 +325,8 @@ impl CallGraph {
     /// Call this before re-indexing a file to clean up stale function definitions.
     pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {
         self.import_dir_cache.clear();
+        self.implements_cache.clear();
+        self.interface_methods_cache.clear();
         self.types.remove_file(path);
         if let Some((_, function_keys)) = self.file_functions.remove(path) {
             for key in function_keys {
@@ -533,7 +608,7 @@ impl CallGraph {
     fn call_result_type(
         &self,
         described: &(String, CallType, Option<String>, bool),
-        caller_file: &str,
+        ctx: CallCtx,
     ) -> Option<String> {
         let (name, _, scope_hint, scope_inferred) = described;
         // Resolution is the expensive half; a callee that is not in the graph
@@ -543,13 +618,38 @@ impl CallGraph {
             return None;
         }
         let (key, resolution) =
-            self.resolve_scoped_callee(name, caller_file, scope_hint.as_deref(), *scope_inferred);
-        if !resolution.is_certain() && resolution != CallResolution::FactoryReceiver {
+            self.resolve_scoped_callee(name, ctx.file, scope_hint.as_deref(), *scope_inferred);
+        if resolution.is_certain() || resolution == CallResolution::FactoryReceiver {
+            return self
+                .nodes
+                .get(key.as_str())
+                .and_then(|node| node.result_type.clone());
+        }
+        // The target is one namesake out of several, so its result type cannot
+        // be read off — unless every namesake declares the same one. A corpus
+        // full of per-package test helpers named `accountRepo` is exactly that
+        // case: whichever one the call meant, the type it hands back is the
+        // same.
+        let candidates = self.name_index.get(name)?;
+        // Consensus is for a handful of per-package helpers of one name. Past
+        // that the scan costs more than the answer is worth, and a name shared
+        // by dozens of functions is not one helper written repeatedly.
+        if candidates.len() > 8 {
             return None;
         }
-        self.nodes
-            .get(key.as_str())
-            .and_then(|node| node.result_type.clone())
+        let mut agreed: Option<String> = None;
+        for candidate in candidates.iter() {
+            let declared = self
+                .nodes
+                .get(candidate.as_str())
+                .and_then(|node| node.result_type.clone())?;
+            match &agreed {
+                Some(held) if held != &declared => return None,
+                Some(_) => {}
+                None => agreed = Some(declared),
+            }
+        }
+        agreed
     }
 
     /// Variable name -> declared type, for the parameters and local variables
@@ -568,20 +668,31 @@ impl CallGraph {
         &self,
         current: Node,
         source: &[u8],
-        caller_file: &str,
-        self_type: Option<&str>,
-        types: &mut HashMap<String, String>,
+        ctx: CallCtx,
+        locals: &mut HashMap<String, LocalKind>,
     ) {
         {
             match current.kind() {
                 // `func f(svc sfx_use.SfxOperationUse)`, and Go's `var x T`.
                 "parameter_declaration" | "var_spec" | "const_spec" => {
-                    if let Some(type_name) = current
-                        .child_by_field_name("type")
-                        .and_then(|node| Self::first_type_identifier(node, source))
-                    {
+                    if let Some(declared) = current.child_by_field_name("type") {
+                        // A parameter typed `error`, `[]byte` or
+                        // `sync.WaitGroup` is worth recording as foreign: it
+                        // says a call on that name is not a call into this
+                        // repository at all.
+                        let kind = match types::classify_type(declared, source) {
+                            types::TypeRef::Named { name, package } => {
+                                if self.package_is_indexed(package.as_deref(), ctx) {
+                                    LocalKind::Type(name)
+                                } else {
+                                    LocalKind::Foreign
+                                }
+                            }
+                            types::TypeRef::Foreign => LocalKind::Foreign,
+                            types::TypeRef::Unknown => return,
+                        };
                         for name in Self::declared_names(current, source) {
-                            types.insert(name, type_name.clone());
+                            locals.insert(name, kind.clone());
                         }
                     }
                 }
@@ -613,10 +724,8 @@ impl CallGraph {
                             .iter()
                             .all(|name| matches!(name.as_str(), "err" | "ok" | "_"));
                     if values.len() == 1 && single_meaningful_name {
-                        if let Some(type_name) =
-                            self.expression_type_hint(values[0], source, caller_file, self_type)
-                        {
-                            types.insert(names[0].clone(), type_name);
+                        if let Some(type_name) = self.expression_type_hint(values[0], source, ctx) {
+                            locals.insert(names[0].clone(), LocalKind::Type(type_name));
                         }
                     }
                 }
@@ -657,13 +766,7 @@ impl CallGraph {
     /// off the syntax: a composite literal names it outright, a factory or
     /// constructor call names it through
     /// [`factory_type_hint`](Self::factory_type_hint).
-    fn expression_type_hint(
-        &self,
-        node: Node,
-        source: &[u8],
-        caller_file: &str,
-        self_type: Option<&str>,
-    ) -> Option<String> {
+    fn expression_type_hint(&self, node: Node, source: &[u8], ctx: CallCtx) -> Option<String> {
         match node.kind() {
             "composite_literal" => node
                 .child_by_field_name("type")
@@ -674,12 +777,12 @@ impl CallGraph {
                     .child_by_field_name("operand")
                     .or_else(|| node.child_by_field_name("argument"))
                     .or_else(|| node.named_child(0))?;
-                self.expression_type_hint(inner, source, caller_file, self_type)
+                self.expression_type_hint(inner, source, ctx)
             }
             kind if Self::is_call_kind(kind) => {
                 let (callee, _) = Self::callee_slot(node)?;
-                let described = self.describe_callee_in(callee, source, caller_file, self_type)?;
-                if let Some(declared) = self.call_result_type(&described, caller_file) {
+                let described = self.describe_callee_in(callee, source, ctx)?;
+                if let Some(declared) = self.call_result_type(&described, ctx) {
                     return Some(declared);
                 }
                 Self::factory_type_hint(&described.0)
@@ -783,6 +886,25 @@ impl CallGraph {
         found
     }
 
+    /// Is the package a written type came from part of this index?
+    ///
+    /// `sync.WaitGroup` and `gorm.DB` name types no method of this repository
+    /// sits on, and the import list is what says so. A type written without a
+    /// package is local to the file's own package, hence indexed by
+    /// definition.
+    fn package_is_indexed(&self, package: Option<&str>, ctx: CallCtx) -> bool {
+        let Some(package) = package else {
+            return true;
+        };
+        match ctx.imports.get(package) {
+            Some(import_path) => self.package_dir_for(import_path).is_some(),
+            // Not an import at all: a package name that came from somewhere
+            // this reading does not model. Left alone rather than declared
+            // foreign.
+            None => true,
+        }
+    }
+
     /// Resolve `pkg.Func()` using the file's import of `pkg`.
     ///
     /// Two outcomes, both better than the name match this replaces: a package
@@ -846,7 +968,15 @@ impl CallGraph {
             imports: &imports,
         };
         let mut scope = FnScope::default();
-        self.walk_for_calls(&mut cursor, source, &file, &mut scope, "");
+        let mut package_locals = HashMap::new();
+        self.walk_for_calls(
+            &mut cursor,
+            source,
+            &file,
+            &mut scope,
+            &mut package_locals,
+            "",
+        );
 
         Ok(())
     }
@@ -861,6 +991,7 @@ impl CallGraph {
         source: &[u8],
         file: &FileScope,
         scope: &mut FnScope,
+        package_locals: &mut HashMap<String, LocalKind>,
         parent_kind: &str,
     ) {
         loop {
@@ -894,13 +1025,36 @@ impl CallGraph {
             // subtree — which doubled the work over every function body. The
             // walk is in source order, so a declaration is seen before the
             // calls below it, which is also the only place its type can apply.
-            self.note_local_types(
-                node,
-                source,
-                file.path,
-                scope.receiver.as_deref(),
-                &mut scope.locals,
-            );
+            // Noted into a separate map first: reading a declaration may
+            // itself consult what is already in scope, and the borrow checker
+            // will not have the table read and written at once.
+            let noted = {
+                let ctx = CallCtx {
+                    file: file.path,
+                    self_type: scope.receiver.as_deref(),
+                    locals: &scope.locals,
+                    file_locals: package_locals,
+                    imports: file.imports,
+                };
+                let mut noted = HashMap::new();
+                self.note_local_types(node, source, ctx, &mut noted);
+                noted
+            };
+            // Outside any function the declaration belongs to the package and
+            // stays in scope for every function in the file.
+            if scope.function.is_none() {
+                package_locals.extend(noted);
+            } else {
+                scope.locals.extend(noted);
+            }
+
+            let ctx = CallCtx {
+                file: file.path,
+                self_type: scope.receiver.as_deref(),
+                locals: &scope.locals,
+                file_locals: package_locals,
+                imports: file.imports,
+            };
 
             // Check for call expressions. BSL `method_call` is a simple call
             // (`Func()`); the one nested inside a `call_expression` (qualified
@@ -920,27 +1074,32 @@ impl CallGraph {
             ) || (kind == "method_call" && parent_kind != "call_expression");
             if is_call {
                 if let Some(ref caller_key) = scope.function {
-                    if let Some((edge, scope_inferred)) =
-                        self.extract_call_edge(node, source, file.path, scope.receiver.as_deref())
+                    if let Some((edge, scope_inferred)) = self.extract_call_edge(node, source, ctx)
                     {
                         // A qualifier naming a local variable or parameter
                         // carries its declared type a few lines up. Taken only
                         // when a namesake really is defined on that type — the
                         // reading of the declaration is shallow (see
                         // `collect_local_types`), so a miss must cost nothing.
-                        let by_local = edge
-                            .scope_hint
-                            .as_deref()
-                            .and_then(|hint| scope.locals.get(hint))
+                        let hint = edge.scope_hint.as_deref();
+                        let by_local = hint
+                            .and_then(|hint| ctx.local_type(hint))
                             .map(|declared| {
                                 self.resolve_scoped_callee(
                                     &edge.target,
-                                    file.path,
+                                    ctx.file,
                                     Some(declared),
                                     false,
                                 )
                             })
-                            .filter(|(_, resolution)| *resolution == CallResolution::Receiver);
+                            .filter(|(_, resolution)| *resolution == CallResolution::Receiver)
+                            // A name declared as something outside this
+                            // repository answers the question by itself: the
+                            // call leaves the graph.
+                            .or_else(|| {
+                                hint.filter(|hint| ctx.is_foreign_local(hint))
+                                    .map(|_| (edge.target.clone(), CallResolution::Unresolved))
+                            });
 
                         // A qualifier that is not a shadowing local names an
                         // imported package: `config.Get()` is a call into this
@@ -1003,7 +1162,7 @@ impl CallGraph {
 
             // Recurse
             if cursor.goto_first_child() {
-                self.walk_for_calls(cursor, source, file, scope, node.kind());
+                self.walk_for_calls(cursor, source, file, scope, package_locals, node.kind());
                 cursor.goto_parent();
             }
 
@@ -1154,6 +1313,98 @@ impl CallGraph {
         }
     }
 
+    /// Among `candidates` (the namesakes of one method), the one whose
+    /// receiver type implements `interface_name` — provided exactly one does.
+    ///
+    /// "Implements" is Go's own rule read off the index: the type carries a
+    /// method of every name the interface declares. Signatures are not
+    /// compared, so a type could satisfy this by coincidence; requiring a
+    /// single match across the whole namesake set is what keeps that from
+    /// mattering in practice.
+    fn only_implementor_among(
+        &self,
+        interface_name: &str,
+        candidates: &[String],
+    ) -> Option<String> {
+        let required = match self.interface_methods_cache.get(interface_name) {
+            Some(cached) => cached.clone(),
+            None => {
+                let methods = Arc::new(self.types.interface_methods(interface_name, None));
+                self.interface_methods_cache
+                    .insert(interface_name.to_string(), methods.clone());
+                methods
+            }
+        };
+        // An interface with one common method (`Error`, `String`) is satisfied
+        // by half a corpus; there is nothing to narrow with.
+        if required.len() < 2 {
+            return None;
+        }
+        let implementors: Vec<&String> = candidates
+            .iter()
+            .filter(|key| {
+                self.nodes
+                    .get(key.as_str())
+                    .and_then(|node| node.receiver.clone())
+                    .map(|receiver| self.type_implements(interface_name, &receiver, &required))
+                    .unwrap_or(false)
+            })
+            .collect();
+        match implementors.len() {
+            0 => None,
+            1 => Some(implementors[0].clone()),
+            // A mock in the test tree implements the same interface as the
+            // real thing. Production code is what a caller outside the tests
+            // reaches, so it wins — and if the remaining choice is still not
+            // single, nothing here can make it.
+            _ => {
+                let mut production = implementors.iter().filter(|key| !Self::is_test_path(key));
+                let first = production.next()?;
+                production.next().is_none().then(|| (*first).clone())
+            }
+        }
+    }
+
+    /// Is this graph key from test or mock code? Read off the path, which is
+    /// where every language convention for it shows up.
+    fn is_test_path(key: &str) -> bool {
+        let lower = key.to_lowercase();
+        lower.contains("/test/")
+            || lower.contains("/tests/")
+            || lower.contains("/mock/")
+            || lower.contains("/mocks/")
+            || lower.contains("_test.")
+            || lower.contains("test_helper")
+            || lower.starts_with("test/")
+    }
+
+    /// Does a type carry a method of every one of these names? Memoized per
+    /// `interface + type` pair: the walk below touches every namesake of every
+    /// method the interface declares, and the same pairs recur across a corpus.
+    fn type_implements(&self, interface_name: &str, type_name: &str, methods: &[String]) -> bool {
+        let cache_key = format!("{interface_name}\u{1}{type_name}");
+        if let Some(cached) = self.implements_cache.get(&cache_key) {
+            return *cached;
+        }
+        let answer = self.type_has_all_methods(type_name, methods);
+        self.implements_cache.insert(cache_key, answer);
+        answer
+    }
+
+    /// Does a type carry a method of every one of these names?
+    fn type_has_all_methods(&self, type_name: &str, methods: &[String]) -> bool {
+        methods.iter().all(|method| {
+            self.name_index
+                .get(method)
+                .map(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|key| self.receiver_matches(key, type_name, true))
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Resolve a callee name to a qualified key.
     /// Prefers a receiver-type match on the scope qualifier, then the caller's
     /// own file, then a scope hint matching the file path, and finally a
@@ -1194,6 +1445,47 @@ impl CallGraph {
                             CallResolution::Receiver
                         };
                         return (first.clone(), resolution);
+                    }
+                }
+
+                // 0c. The qualifier names an interface: dispatch is dynamic,
+                //     but if exactly one type in the index carries every
+                //     method the interface declares, that is where the call
+                //     goes. Checked against the namesakes rather than against
+                //     every struct — there are a handful of those and
+                //     thousands of these.
+                if self
+                    .types
+                    .is_interface(scope, Some(types::directory_of(caller_file)))
+                {
+                    if let Some(key) = self.only_implementor_among(scope, &candidates) {
+                        return (key, CallResolution::InterfaceImpl);
+                    }
+                }
+
+                // 0b. Go promotes the methods of an embedded type onto the
+                //     outer one, so `self.HandleError(err)` inside a method of
+                //     `CustomerRepo { BaseRepo }` is `BaseRepo::HandleError`.
+                //     The receiver type is right, the method just lives one
+                //     level in — a rule of the language, not a guess, hence
+                //     the same resolution as a direct receiver match.
+                let prefer_dir = types::directory_of(caller_file);
+                for embedded in self.types.embedded_chain(scope, Some(prefer_dir)) {
+                    let mut promoted = candidates
+                        .iter()
+                        .filter(|key| self.receiver_matches(key, &embedded, true));
+                    if let Some(first) = promoted.next() {
+                        // Two embedded types carrying the same method is a
+                        // compile error in Go, so an ambiguity here means the
+                        // reading is off; leave it to the steps below.
+                        if promoted.next().is_none() {
+                            let resolution = if scope_inferred {
+                                CallResolution::FactoryReceiver
+                            } else {
+                                CallResolution::Receiver
+                            };
+                            return (first.clone(), resolution);
+                        }
                     }
                 }
             }
@@ -1451,12 +1743,93 @@ impl CallGraph {
     /// expression rather than a name and [`scope_hint_from`](Self::scope_hint_from)
     /// has nothing to offer. Falls back to the callee name of the inner call,
     /// turned into a type name by [`factory_type_hint`](Self::factory_type_hint).
+    /// The type of a selector chain used as a receiver: `self.C`,
+    /// `self.Depend.CustomerDocumentExtService`, `svc.Repo`.
+    ///
+    /// The base is either `self` — whose type the enclosing method declares —
+    /// or a name in scope, and each step after it is a field whose type the
+    /// struct declaration names. This is the shape behind
+    /// `self.C.Logger().SendError(err)`: nothing at the call site says what
+    /// `self.C` is, but the struct says `C ctx.Ctx` and the interface says
+    /// `Logger() *Logger`.
+    ///
+    /// Bounded at four links: a longer chain is not worth a walk on every call
+    /// site of a large corpus, and does not occur in practice.
+    fn selector_chain_type(&self, node: Node, source: &[u8], ctx: CallCtx) -> Option<String> {
+        let mut steps: Vec<String> = Vec::new();
+        let mut current = node;
+        loop {
+            match current.kind() {
+                "selector_expression" | "field_expression" | "member_expression" => {
+                    if steps.len() >= 4 {
+                        return None;
+                    }
+                    let field = current
+                        .child_by_field_name("field")
+                        .or_else(|| current.child_by_field_name("property"))
+                        .or_else(|| current.child_by_field_name("name"))?;
+                    steps.push(field.utf8_text(source).ok()?.to_string());
+                    current = current
+                        .child_by_field_name("operand")
+                        .or_else(|| current.child_by_field_name("object"))
+                        .or_else(|| current.child_by_field_name("argument"))?;
+                }
+                // The base of the chain.
+                "identifier" | "field_identifier" => {
+                    let base = current.utf8_text(source).ok()?;
+                    let mut type_name = match base {
+                        "self" | "this" | "Self" => ctx.self_type?.to_string(),
+                        name => ctx.local_type(name)?.to_string(),
+                    };
+                    // Walked outermost-first, so the fields apply in reverse.
+                    for field in steps.iter().rev() {
+                        type_name = self.types.field_type(
+                            &type_name,
+                            field,
+                            Some(types::directory_of(ctx.file)),
+                        )?;
+                    }
+                    return Some(type_name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The type a method call on `receiver_type` produces, for the middle of a
+    /// chain: the graph's own node when the type is a struct, and the
+    /// interface's declaration when it is an interface — an interface method
+    /// has no body and therefore no node, but it does state its result type.
+    fn method_result_type(
+        &self,
+        receiver_type: &str,
+        method: &str,
+        prefer_dir: Option<&str>,
+    ) -> Option<String> {
+        if let Some(declared) =
+            self.types
+                .interface_method_result(receiver_type, method, prefer_dir)
+        {
+            return Some(declared);
+        }
+        let candidates = self.name_index.get(method)?;
+        let mut on_receiver = candidates
+            .iter()
+            .filter(|key| self.receiver_matches(key, receiver_type, true));
+        let first = on_receiver.next()?;
+        if on_receiver.next().is_some() {
+            return None;
+        }
+        self.nodes
+            .get(first.as_str())
+            .and_then(|node| node.result_type.clone())
+    }
+
     fn chained_call_scope_hint(
         &self,
         operand: Node,
         source: &[u8],
-        caller_file: &str,
-        self_type: Option<&str>,
+        ctx: CallCtx,
     ) -> Option<(String, bool)> {
         if !Self::is_call_kind(operand.kind()) {
             return None;
@@ -1467,11 +1840,23 @@ impl CallGraph {
         // convention stays as the answer for calls the graph cannot identify
         // — a factory held in a struct field, most of this corpus.
         let (callee, _) = Self::callee_slot(operand)?;
-        let described = self.describe_callee_in(callee, source, caller_file, self_type)?;
+        let described = self.describe_callee_in(callee, source, ctx)?;
         // A declared result type was read; a factory name was only inferred.
         // The flag is what keeps the two apart in the reported resolution.
-        if let Some(declared) = self.call_result_type(&described, caller_file) {
+        if let Some(declared) = self.call_result_type(&described, ctx) {
             return Some((declared, false));
+        }
+        // The inner call sits on a typed receiver of its own
+        // (`self.C.Logger()`), so its result can be read off that type's
+        // declaration even when the method itself is not a graph node.
+        if let Some(receiver_type) = described.2.as_deref() {
+            if let Some(declared) = self.method_result_type(
+                receiver_type,
+                &described.0,
+                Some(types::directory_of(ctx.file)),
+            ) {
+                return Some((declared, false));
+            }
         }
         Self::factory_type_hint(&described.0).map(|inferred| (inferred, true))
     }
@@ -1492,8 +1877,7 @@ impl CallGraph {
         &self,
         node: Node,
         source: &[u8],
-        caller_file: &str,
-        self_type: Option<&str>,
+        ctx: CallCtx,
     ) -> Option<(String, CallType, Option<String>, bool)> {
         let kind = node.kind();
         let text_of = |n: Node| n.utf8_text(source).ok().map(|s| s.to_string());
@@ -1528,12 +1912,19 @@ impl CallGraph {
                     .or_else(|| node.child_by_field_name("value"))
                     .or_else(|| node.child_by_field_name("argument"));
                 let scope =
-                    receiver.and_then(|node| Self::scope_hint_from(node, source, self_type));
+                    receiver.and_then(|node| Self::scope_hint_from(node, source, ctx.self_type));
                 if scope.is_none() {
-                    if let Some((chained, inferred)) = receiver.and_then(|node| {
-                        self.chained_call_scope_hint(node, source, caller_file, self_type)
-                    }) {
+                    if let Some((chained, inferred)) =
+                        receiver.and_then(|node| self.chained_call_scope_hint(node, source, ctx))
+                    {
                         return Some((name, CallType::Method, Some(chained), inferred));
+                    }
+                    // `self.Depend.X.M()`: the receiver is a chain of fields,
+                    // and every link's type is declared somewhere.
+                    if let Some(declared) =
+                        receiver.and_then(|node| self.selector_chain_type(node, source, ctx))
+                    {
+                        return Some((name, CallType::Method, Some(declared), false));
                     }
                 }
                 Some((name, CallType::Method, scope, false))
@@ -1551,11 +1942,12 @@ impl CallGraph {
                 let target = node
                     .child_by_field_name("target")
                     .or_else(|| node.named_child(0));
-                let scope = target.and_then(|node| Self::scope_hint_from(node, source, self_type));
+                let scope =
+                    target.and_then(|node| Self::scope_hint_from(node, source, ctx.self_type));
                 if scope.is_none() {
-                    if let Some((chained, inferred)) = target.and_then(|node| {
-                        self.chained_call_scope_hint(node, source, caller_file, self_type)
-                    }) {
+                    if let Some((chained, inferred)) =
+                        target.and_then(|node| self.chained_call_scope_hint(node, source, ctx))
+                    {
                         return Some((name, CallType::Method, Some(chained), inferred));
                     }
                 }
@@ -1621,14 +2013,13 @@ impl CallGraph {
         &self,
         node: Node,
         source: &[u8],
-        path: &str,
-        self_type: Option<&str>,
+        ctx: CallCtx,
     ) -> Option<(CallEdge, bool)> {
         let kind = node.kind();
         let (callee, receiver) = Self::callee_slot(node)?;
 
         let (target, mut call_type, mut scope_hint, mut scope_inferred) =
-            self.describe_callee_in(callee, source, path, self_type)?;
+            self.describe_callee_in(callee, source, ctx)?;
 
         if let Some(receiver) = receiver {
             call_type = if kind == "scoped_call_expression" {
@@ -1636,11 +2027,11 @@ impl CallGraph {
             } else {
                 CallType::Method
             };
-            scope_hint = Self::scope_hint_from(receiver, source, self_type);
+            scope_hint = Self::scope_hint_from(receiver, source, ctx.self_type);
             scope_inferred = false;
             if scope_hint.is_none() {
                 if let Some((chained, inferred)) =
-                    self.chained_call_scope_hint(receiver, source, path, self_type)
+                    self.chained_call_scope_hint(receiver, source, ctx)
                 {
                     scope_hint = Some(chained);
                     scope_inferred = inferred;
@@ -1651,7 +2042,7 @@ impl CallGraph {
         Some((
             CallEdge {
                 target,
-                file_path: path.to_string(),
+                file_path: ctx.file.to_string(),
                 line: node.start_position().row + 1,
                 column: node.start_position().column + 1,
                 call_type,
@@ -1670,10 +2061,9 @@ impl CallGraph {
         &self,
         node: Node,
         source: &[u8],
-        path: &str,
-        self_type: Option<&str>,
+        ctx: CallCtx,
     ) -> Option<(CallEdge, bool)> {
-        if let Some(found) = self.extract_call_edge_by_fields(node, source, path, self_type) {
+        if let Some(found) = self.extract_call_edge_by_fields(node, source, ctx) {
             return Some(found);
         }
 
@@ -1731,7 +2121,7 @@ impl CallGraph {
             (
                 CallEdge {
                     target: name,
-                    file_path: path.to_string(),
+                    file_path: ctx.file.to_string(),
                     line: node.start_position().row + 1,
                     column: node.start_position().column + 1,
                     call_type,
@@ -2555,6 +2945,41 @@ impl CallGraph {
     }
 
     /// Get the number of nodes in the call graph
+    /// How many edges were resolved each way, most certain first.
+    ///
+    /// Resolution quality is otherwise invisible: a corpus whose calls stop
+    /// resolving (a grammar change, a naming convention this reading does not
+    /// cover) produces exactly the same number of edges, pointing at worse
+    /// targets. This is what makes that visible in `get_index_status`.
+    pub fn resolution_stats(&self) -> Vec<(&'static str, usize)> {
+        let mut counts = [0usize; 8];
+        for node in self.nodes.iter() {
+            for edge in &node.calls {
+                let slot = match edge.resolution {
+                    CallResolution::Unique => 0,
+                    CallResolution::Receiver => 1,
+                    CallResolution::Scope => 2,
+                    CallResolution::InterfaceImpl => 3,
+                    CallResolution::FactoryReceiver => 4,
+                    CallResolution::SameFile => 5,
+                    CallResolution::NameOnly => 6,
+                    CallResolution::Unresolved | CallResolution::Unknown => 7,
+                };
+                counts[slot] += 1;
+            }
+        }
+        vec![
+            ("unique name", counts[0]),
+            ("receiver type read", counts[1]),
+            ("package or module scope", counts[2]),
+            ("single interface implementation", counts[3]),
+            ("receiver inferred from factory name", counts[4]),
+            ("same file as caller", counts[5]),
+            ("name match only", counts[6]),
+            ("not in graph", counts[7]),
+        ]
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }

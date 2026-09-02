@@ -1571,3 +1571,252 @@ func build() *Service {
         "the calls in the body must still be recorded"
     );
 }
+
+/// Go promotes an embedded type's methods onto the outer type, so
+/// `self.HandleError(err)` inside a method of `CustomerRepo { base.SimpleQuery }`
+/// is `SimpleQuery::HandleError` — the most common single shape in a repository
+/// built on a shared base struct.
+#[test]
+fn test_promoted_method_of_an_embedded_type_resolves() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/model/customer/repository/impl/customer.go",
+            r#"
+package impl
+
+type CustomerRepo struct {
+	base.SimpleQuery
+}
+
+func (self *CustomerRepo) FindByUuid(uuid string) error {
+	return self.HandleError(err)
+}
+"#,
+        ),
+        (
+            "internal/model/base/base.go",
+            "package base\n\ntype SimpleQuery struct{}\n\nfunc (self *SimpleQuery) HandleError(err error) error {\n\treturn err\n}\n",
+        ),
+        (
+            "internal/extservice/flash/impl/flash.go",
+            "package impl\n\ntype FlashExtService struct{}\n\nfunc (self *FlashExtService) HandleError(err error) error {\n\treturn err\n}\n",
+        ),
+        (
+            "internal/deployer/deploy/runner.go",
+            "package deploy\n\ntype Runner struct{}\n\nfunc (self *Runner) HandleError(err error) error {\n\treturn err\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("CustomerRepo.FindByUuid")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::HandleError"))
+        .expect("self.HandleError() should produce an edge");
+    assert_eq!(
+        edge.target, "internal/model/base/base.go::SimpleQuery::HandleError",
+        "the method is promoted from the embedded type"
+    );
+    assert_eq!(
+        edge.resolution,
+        CallResolution::Receiver,
+        "promotion is a rule of the language, not a guess"
+    );
+}
+
+/// `self.C.Logger().SendError(err)`: nothing at the call site says what
+/// `self.C` is, but the struct declares the field and the interface declares
+/// what its method returns — two hops, both read.
+#[test]
+fn test_chain_through_a_field_and_an_interface_method() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/account/impl/account.go",
+            r#"
+package impl
+
+type AccountUseCase struct {
+	C solcontext.IContext
+}
+
+func (self *AccountUseCase) Pay(id string) error {
+	self.C.Logger().SendError(err)
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/lib/solcontext/context.go",
+            "package solcontext\n\ntype IContext interface {\n\tLogger() log.ILogger\n\tDb() *gorm.DB\n}\n",
+        ),
+        (
+            "internal/lib/logger/logger.go",
+            "package log\n\ntype ILogger interface {\n\tSendError(err error)\n\tSendInfo(msg string)\n}\n",
+        ),
+        (
+            "internal/lib/logger/impl/logger.go",
+            "package impl\n\ntype Logger struct{}\n\nfunc (self *Logger) SendError(err error) {}\n\nfunc (self *Logger) SendInfo(msg string) {}\n",
+        ),
+        (
+            "internal/extservice/sentry/impl/sentry.go",
+            "package impl\n\ntype SentryClient struct{}\n\nfunc (self *SentryClient) SendError(err error) {}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("AccountUseCase.Pay")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::SendError"))
+        .expect("the chained call should produce an edge");
+    assert!(
+        edge.target
+            .ends_with("logger/impl/logger.go::Logger::SendError"),
+        "got {} — the only type implementing ILogger",
+        edge.target
+    );
+    assert_eq!(
+        edge.resolution,
+        CallResolution::InterfaceImpl,
+        "dispatch is dynamic; one implementation is a candidate, not a fact"
+    );
+    assert!(!edge.resolution.is_certain());
+    assert_eq!(
+        edge.resolution.caveat(),
+        Some("single implementation of the interface")
+    );
+}
+
+/// A mock in the test tree implements the same interface as the real thing.
+/// Production code is what a caller outside the tests reaches.
+#[test]
+fn test_interface_resolution_prefers_production_over_a_mock() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/sms/impl/sms.go",
+            r#"
+package impl
+
+type SmsUseCase struct {
+	Provider sms.IProvider
+}
+
+func (self *SmsUseCase) Send(to string) error {
+	return self.Provider.Deliver(to)
+}
+"#,
+        ),
+        (
+            "internal/extservice/sms/provider.go",
+            "package sms\n\ntype IProvider interface {\n\tDeliver(to string) error\n\tBalance() int\n}\n",
+        ),
+        (
+            "internal/extservice/sms/impl/provider.go",
+            "package impl\n\ntype Provider struct{}\n\nfunc (self *Provider) Deliver(to string) error {\n\treturn nil\n}\n\nfunc (self *Provider) Balance() int {\n\treturn 0\n}\n",
+        ),
+        (
+            "internal/extservice/sms/mock/provider.go",
+            "package mock\n\ntype ProviderMock struct{}\n\nfunc (self *ProviderMock) Deliver(to string) error {\n\treturn nil\n}\n\nfunc (self *ProviderMock) Balance() int {\n\treturn 0\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("SmsUseCase.Send")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Deliver"))
+        .expect("self.Provider.Deliver() should produce an edge");
+    assert!(
+        edge.target
+            .ends_with("sms/impl/provider.go::Provider::Deliver"),
+        "got {}",
+        edge.target
+    );
+}
+
+/// A name declared as something outside this repository answers the question
+/// by itself. `err.Error()` is not a call to whatever `Error` method this
+/// corpus happens to define.
+#[test]
+fn test_call_on_a_foreign_typed_variable_leaves_the_graph() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/system_event/impl/handler.go",
+            r#"
+package impl
+
+import (
+	"sync"
+)
+
+func describe(err error, wg sync.WaitGroup) string {
+	wg.Add(1)
+	return err.Error()
+}
+"#,
+        ),
+        (
+            "internal/model/report/impl/report.go",
+            "package impl\n\ntype Report struct{}\n\nfunc (self *Report) Error() string {\n\treturn \"\"\n}\n\nfunc (self *Report) Add(n int) {}\n",
+        ),
+        (
+            "internal/model/audit/impl/audit.go",
+            "package impl\n\ntype Audit struct{}\n\nfunc (self *Audit) Error() string {\n\treturn \"\"\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = call_graph.get_callees("internal/usecase/system_event/impl/handler.go::describe");
+    for edge in &callees {
+        assert_eq!(
+            edge.resolution,
+            CallResolution::Unresolved,
+            "{} is a call into someone else's code",
+            edge.target
+        );
+    }
+    assert!(
+        call_graph.get_callers("Report.Error").is_empty(),
+        "a builtin `error` must not collect callers for this repository's types"
+    );
+}

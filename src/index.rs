@@ -3174,6 +3174,39 @@ impl CodeIntelEngine {
             }
         ));
 
+        // How the call graph's edges were resolved. Without this, resolution
+        // quality is invisible: a corpus whose calls stop resolving yields the
+        // same edge count pointing at worse targets, and only a hand-written
+        // measurement would notice.
+        if self.options.call_graph_enabled {
+            let mut totals: Vec<(&'static str, usize)> = Vec::new();
+            for entry in self.call_graphs.iter() {
+                for (label, count) in entry.value().resolution_stats() {
+                    match totals.iter_mut().find(|(held, _)| *held == label) {
+                        Some((_, held)) => *held += count,
+                        None => totals.push((label, count)),
+                    }
+                }
+            }
+            let edges: usize = totals.iter().map(|(_, count)| count).sum();
+            if edges > 0 {
+                output.push_str("## Call Edge Resolution\n\n");
+                output.push_str(&format!("- **Edges**: {}\n", edges));
+                for (label, count) in totals {
+                    if count == 0 {
+                        continue;
+                    }
+                    output.push_str(&format!(
+                        "- {}: {} ({:.1}%)\n",
+                        label,
+                        count,
+                        100.0 * count as f64 / edges as f64
+                    ));
+                }
+                output.push('\n');
+            }
+        }
+
         output.push_str("## Document Types\n\n");
         for (doc_type, count) in &stats.doc_types {
             output.push_str(&format!("- {:?}: {}\n", doc_type, count));
