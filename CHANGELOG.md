@@ -50,7 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches 25 -> 13,126, and ~3,400 edges that pointed at unrelated functions
   are now honestly absent. Still unresolved: interface values held in struct
   fields, values out of multi-value assignments, Go struct embedding,
-  reflection and platform-invoked handlers.
+  reflection and platform-invoked handlers — see
+  `docs/callgraph-resolution-plan.md` for the staged plan that closes them.
+
+### Fixed
+
+- **Package-qualified calls no longer reach into subpackages, and no longer
+  land on methods.** A Go package is exactly one directory, so the
+  `starts_with(dir)` filter added with the import handling was too loose:
+  `config.Get()` saw the `Get` of `internal/config/settings/repository` as a
+  rival to `internal/config`'s own and fell back to a name match. And
+  `pkg.Name()` always names a package-level function — a method needs a value
+  in front of it — so methods are now excluded from the candidates. Name-only
+  guesses on the reference corpus: 9,593 -> 8,449.
 
 ## [1.9.4] - 2026-08-27
 

@@ -706,8 +706,21 @@ impl CallGraph {
         let in_package: Vec<&String> = candidates
             .iter()
             .filter(|key| {
-                self.key_file_path(key)
-                    .map(|file_path| file_path.starts_with(dir.as_ref()))
+                // A Go package is exactly one directory: a subdirectory is a
+                // different package, so `config.Get()` must not see the `Get`
+                // of `internal/config/settings/repository`. And `pkg.Name()`
+                // names a package-level function, never a method — a method
+                // needs a value in front of it.
+                self.nodes
+                    .get(key.as_str())
+                    .map(|node| {
+                        node.receiver.is_none()
+                            && node
+                                .file_path
+                                .rfind('/')
+                                .map(|end| &node.file_path[..=end] == dir.as_ref())
+                                .unwrap_or(false)
+                    })
                     .unwrap_or(false)
             })
             .collect();
@@ -716,9 +729,9 @@ impl CallGraph {
             // one of its types reached through a value, or an unindexed file.
             0 => Some((bare_name.to_string(), CallResolution::Unresolved)),
             1 => Some((in_package[0].clone(), CallResolution::Scope)),
-            // Namesakes within one package (methods of different types), which
-            // the qualifier cannot separate — but the pick is at least from
-            // the right package now.
+            // Two package-level functions of one name cannot both exist in Go,
+            // so this means the package directory was matched loosely (a
+            // vendored copy, say). The pick is at least from one package.
             _ => Some((
                 in_package.iter().min().map(|key| (*key).clone())?,
                 CallResolution::NameOnly,
