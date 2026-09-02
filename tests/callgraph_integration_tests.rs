@@ -1429,3 +1429,145 @@ func handleFromConstructor() error {
         from_ctor.target
     );
 }
+
+/// A helper whose name says nothing (`accountRepo(ctx)`) but whose result list
+/// says everything. This is the shape that made up a quarter of the remaining
+/// guesses: a call chained onto a call that is not named like a factory.
+#[test]
+fn test_chained_call_uses_the_declared_result_type() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/transaction/test/fee_test.go",
+            r#"
+package test
+
+func accountRepo(c ctx.Ctx) *account_repo.AccountRepo {
+	return nil
+}
+
+func TestFee(t *testing.T) {
+	account, err := accountRepo(context.C).FindByUuid(uuid)
+}
+"#,
+        ),
+        (
+            "internal/model/account/repository/impl/account.go",
+            "package impl\n\ntype AccountRepo struct{}\n\nfunc (self *AccountRepo) FindByUuid(uuid string) error {\n\treturn nil\n}\n",
+        ),
+        (
+            "internal/model/card/repository/impl/card.go",
+            "package impl\n\ntype CardRepo struct{}\n\nfunc (self *CardRepo) FindByUuid(uuid string) error {\n\treturn nil\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("internal/usecase/transaction/test/fee_test.go::TestFee")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::FindByUuid"))
+        .expect("the chained call should produce an edge");
+    assert!(
+        edge.target.ends_with("::AccountRepo::FindByUuid"),
+        "got {}",
+        edge.target
+    );
+    assert_eq!(edge.resolution, CallResolution::Receiver);
+}
+
+/// `value, err := f()` is how Go returns anything at all, so a variable's type
+/// is usually only readable through the result list of a multi-value call.
+#[test]
+fn test_multi_value_declaration_types_its_first_name() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/module/payout/usecase/test/execution_test.go",
+            r#"
+package test
+
+func buildBatchService() (*payout_use.PayoutBatchUse, error) {
+	return nil, nil
+}
+
+func TestExecution(t *testing.T) {
+	batchService, err := buildBatchService()
+	_, err = batchService.Submit("")
+}
+"#,
+        ),
+        (
+            "internal/module/payout/usecase/impl/payout_batch.go",
+            "package impl\n\ntype PayoutBatchUse struct{}\n\nfunc (self *PayoutBatchUse) Submit(id string) error {\n\treturn nil\n}\n",
+        ),
+        (
+            "internal/module/payout/usecase/impl/payout_line.go",
+            "package impl\n\ntype PayoutLineUse struct{}\n\nfunc (self *PayoutLineUse) Submit(id string) error {\n\treturn nil\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("internal/module/payout/usecase/test/execution_test.go::TestExecution")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Submit"))
+        .expect("batchService.Submit() should produce an edge");
+    assert!(
+        edge.target.ends_with("::PayoutBatchUse::Submit"),
+        "got {}",
+        edge.target
+    );
+    assert_eq!(edge.resolution, CallResolution::Receiver);
+}
+
+/// The reading of declarations must not invent a name where there is none:
+/// `self.field = f()` binds no identifier, and used to panic on the empty
+/// name list.
+#[test]
+fn test_assignment_to_a_field_declares_no_local() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+    let code = r#"
+package impl
+
+type Handler struct {
+	svc *Service
+}
+
+func (self *Handler) setup() {
+	self.svc = build()
+	self.svc.Run()
+}
+
+func build() *Service {
+	return nil
+}
+"#;
+    let tree = parser.parse_to_tree(Path::new("handler.go"), code).unwrap();
+    call_graph
+        .build_from_files(&[("handler.go".to_string(), code.to_string(), tree)])
+        .unwrap();
+
+    assert!(
+        !call_graph.get_callees("Handler.setup").is_empty(),
+        "the calls in the body must still be recorded"
+    );
+}

@@ -2,6 +2,8 @@
 //!
 //! This is critical for AI understanding of code flow and impact analysis.
 
+pub mod types;
+
 use crate::FastMap;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -29,6 +31,13 @@ pub struct CallNode {
     /// same-named methods apart.
     #[serde(default)]
     pub receiver: Option<String>,
+    /// The type this function returns, as written in its declaration: Go's
+    /// first non-`error` result, a Rust `-> T`, a TS annotation. What lets a
+    /// call on the value a call produced (`accountRepo(ctx).FindByUuid(id)`,
+    /// `svc := build()` then `svc.Run()`) be resolved on a type rather than
+    /// guessed among namesakes.
+    #[serde(default)]
+    pub result_type: Option<String>,
 }
 
 /// An edge in the call graph
@@ -165,6 +174,10 @@ pub struct CallGraph {
     /// cleared whenever the set of indexed files changes, since both answers
     /// depend on it. See [`package_dir_for`](CallGraph::package_dir_for).
     import_dir_cache: FastMap<String, Option<Arc<str>>>,
+    /// Declared types of the indexed sources: fields, embedded types,
+    /// interface methods. What lets a qualifier naming a field or a value be
+    /// resolved on a type that was written down rather than guessed at.
+    types: types::TypeIndex,
 }
 
 impl Default for CallGraph {
@@ -200,6 +213,7 @@ impl CallGraph {
             name_index: DashMap::default(),
             file_path_lower_cache: DashMap::default(),
             import_dir_cache: DashMap::default(),
+            types: types::TypeIndex::new(),
         }
     }
 
@@ -238,6 +252,7 @@ impl CallGraph {
     /// Call this before re-indexing a file to clean up stale function definitions.
     pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {
         self.import_dir_cache.clear();
+        self.types.remove_file(path);
         if let Some((_, function_keys)) = self.file_functions.remove(path) {
             for key in function_keys {
                 self.nodes.remove(&key);
@@ -302,6 +317,12 @@ impl CallGraph {
         let source = content.as_bytes();
         let mut cursor = tree.walk();
         let mut functions = Vec::new();
+
+        // Declarations first: a re-indexed file must not leave the old ones
+        // behind, and the walk below is where the file's own types stop being
+        // whatever a previous version of it said.
+        self.types.remove_file(path);
+        self.types.ingest_file(path, tree.root_node(), source);
 
         self.walk_for_functions(&mut cursor, source, path, &mut functions);
 
@@ -471,7 +492,64 @@ impl CallGraph {
             calls: Vec::new(),
             metrics,
             receiver: Self::extract_receiver_type(node, source),
+            result_type: Self::extract_result_type(node, source),
         })
+    }
+
+    /// The declared return type of a function, reduced to the identifier a
+    /// receiver is compared against.
+    ///
+    /// Go writes results in a `result` field — one type, or a `parameter_list`
+    /// for `(T, error)`, where the first non-`error` entry is the value a
+    /// caller chains onto. Rust and TypeScript name the field `return_type`.
+    /// Anything else (a tuple of two meaningful values, a container) yields
+    /// `None` rather than a type the call site never had.
+    fn extract_result_type(node: Node, source: &[u8]) -> Option<String> {
+        let result = node
+            .child_by_field_name("result")
+            .or_else(|| node.child_by_field_name("return_type"))?;
+        if result.kind() != "parameter_list" {
+            return types::type_name_of(result, source);
+        }
+        let mut cursor = result.walk();
+        let declarations: Vec<Node> = result
+            .children(&mut cursor)
+            .filter(|child| child.kind() == "parameter_declaration")
+            .collect();
+        declarations.into_iter().find_map(|declaration| {
+            declaration
+                .child_by_field_name("type")
+                .and_then(|declared| types::type_name_of(declared, source))
+        })
+    }
+
+    /// The type a call produces: resolve the callee, then read its declared
+    /// result type.
+    ///
+    /// Only a target the graph actually identified is trusted here. Reading
+    /// the result type off a name match would compound one guess into another
+    /// — the wrong namesake's return type, applied with the confidence of
+    /// something that was read.
+    fn call_result_type(
+        &self,
+        described: &(String, CallType, Option<String>, bool),
+        caller_file: &str,
+    ) -> Option<String> {
+        let (name, _, scope_hint, scope_inferred) = described;
+        // Resolution is the expensive half; a callee that is not in the graph
+        // (stdlib, third party, a type conversion) can be dismissed on an
+        // O(1) name lookup instead.
+        if !self.name_index.contains_key(name) {
+            return None;
+        }
+        let (key, resolution) =
+            self.resolve_scoped_callee(name, caller_file, scope_hint.as_deref(), *scope_inferred);
+        if !resolution.is_certain() && resolution != CallResolution::FactoryReceiver {
+            return None;
+        }
+        self.nodes
+            .get(key.as_str())
+            .and_then(|node| node.result_type.clone())
     }
 
     /// Variable name -> declared type, for the parameters and local variables
@@ -486,11 +564,15 @@ impl CallGraph {
     /// no shadowing, last declaration of a name wins), which is why the type it
     /// yields is only ever *offered* to `resolve_scoped_callee`: it is used
     /// when a namesake is actually defined on that type, and dropped otherwise.
-    fn collect_local_types(&self, node: Node, source: &[u8]) -> HashMap<String, String> {
-        let mut types = HashMap::new();
-        let mut cursor = node.walk();
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
+    fn note_local_types(
+        &self,
+        current: Node,
+        source: &[u8],
+        caller_file: &str,
+        self_type: Option<&str>,
+        types: &mut HashMap<String, String>,
+    ) {
+        {
             match current.kind() {
                 // `func f(svc sfx_use.SfxOperationUse)`, and Go's `var x T`.
                 "parameter_declaration" | "var_spec" | "const_spec" => {
@@ -519,23 +601,28 @@ impl CallGraph {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // Only the one-to-one case: a multi-value call
-                    // (`a, b := f()`) says nothing about which value is which.
-                    if names.len() == 1 && values.len() == 1 {
-                        if let Some(type_name) = self.expression_type_hint(values[0], source) {
+                    // One call on the right, and either one name or the Go
+                    // idiom `value, err := f()` — where the extra names are
+                    // the error and the discards, so the declared result type
+                    // belongs to the first. Any other multi-value shape says
+                    // nothing about which value is which.
+                    // `self.field = f()` binds no plain identifier, so the
+                    // name list can be empty — check that before slicing it.
+                    let single_meaningful_name = !names.is_empty()
+                        && names[1..]
+                            .iter()
+                            .all(|name| matches!(name.as_str(), "err" | "ok" | "_"));
+                    if values.len() == 1 && single_meaningful_name {
+                        if let Some(type_name) =
+                            self.expression_type_hint(values[0], source, caller_file, self_type)
+                        {
                             types.insert(names[0].clone(), type_name);
                         }
                     }
                 }
                 _ => {}
             }
-            for child in current.children(&mut cursor) {
-                if child.is_named() {
-                    stack.push(child);
-                }
-            }
         }
-        types
     }
 
     /// The identifiers a declaration or assignment target binds.
@@ -570,23 +657,32 @@ impl CallGraph {
     /// off the syntax: a composite literal names it outright, a factory or
     /// constructor call names it through
     /// [`factory_type_hint`](Self::factory_type_hint).
-    fn expression_type_hint(&self, node: Node, source: &[u8]) -> Option<String> {
+    fn expression_type_hint(
+        &self,
+        node: Node,
+        source: &[u8],
+        caller_file: &str,
+        self_type: Option<&str>,
+    ) -> Option<String> {
         match node.kind() {
             "composite_literal" => node
                 .child_by_field_name("type")
-                .and_then(|node| Self::first_type_identifier(node, source)),
+                .and_then(|node| types::type_name_of(node, source)),
             // `&T{}`, `*p`, `(expr)`.
             "unary_expression" | "parenthesized_expression" | "pointer_expression" => {
                 let inner = node
                     .child_by_field_name("operand")
                     .or_else(|| node.child_by_field_name("argument"))
                     .or_else(|| node.named_child(0))?;
-                self.expression_type_hint(inner, source)
+                self.expression_type_hint(inner, source, caller_file, self_type)
             }
             kind if Self::is_call_kind(kind) => {
                 let (callee, _) = Self::callee_slot(node)?;
-                let (name, ..) = self.describe_callee(callee, source, None)?;
-                Self::factory_type_hint(&name)
+                let described = self.describe_callee_in(callee, source, caller_file, self_type)?;
+                if let Some(declared) = self.call_result_type(&described, caller_file) {
+                    return Some(declared);
+                }
+                Self::factory_type_hint(&described.0)
             }
             _ => None,
         }
@@ -789,9 +885,22 @@ impl CallGraph {
                     scope.function =
                         Some(Self::definition_key(file.path, receiver.as_deref(), &name));
                     scope.receiver = receiver;
-                    scope.locals = self.collect_local_types(node, source);
+                    scope.locals.clear();
                 }
             }
+
+            // Declarations are noted as the walk passes them, in the same
+            // pass as the calls rather than in a sweep of each function's
+            // subtree — which doubled the work over every function body. The
+            // walk is in source order, so a declaration is seen before the
+            // calls below it, which is also the only place its type can apply.
+            self.note_local_types(
+                node,
+                source,
+                file.path,
+                scope.receiver.as_deref(),
+                &mut scope.locals,
+            );
 
             // Check for call expressions. BSL `method_call` is a simple call
             // (`Func()`); the one nested inside a `call_expression` (qualified
@@ -1346,14 +1455,25 @@ impl CallGraph {
         &self,
         operand: Node,
         source: &[u8],
+        caller_file: &str,
         self_type: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
         if !Self::is_call_kind(operand.kind()) {
             return None;
         }
+        // What the inner call declares it returns beats what its name
+        // suggests: `accountRepo(ctx)` is an ordinary helper whose name says
+        // nothing, while its result list says everything. The naming
+        // convention stays as the answer for calls the graph cannot identify
+        // — a factory held in a struct field, most of this corpus.
         let (callee, _) = Self::callee_slot(operand)?;
-        let (name, ..) = self.describe_callee(callee, source, self_type)?;
-        Self::factory_type_hint(&name)
+        let described = self.describe_callee_in(callee, source, caller_file, self_type)?;
+        // A declared result type was read; a factory name was only inferred.
+        // The flag is what keeps the two apart in the reported resolution.
+        if let Some(declared) = self.call_result_type(&described, caller_file) {
+            return Some((declared, false));
+        }
+        Self::factory_type_hint(&described.0).map(|inferred| (inferred, true))
     }
 
     /// Describe the callee slot of a call:
@@ -1368,10 +1488,11 @@ impl CallGraph {
     /// The last element is set when the scope hint was inferred from a factory
     /// name rather than read off the call site (see
     /// [`chained_call_scope_hint`](Self::chained_call_scope_hint)).
-    fn describe_callee(
+    fn describe_callee_in(
         &self,
         node: Node,
         source: &[u8],
+        caller_file: &str,
         self_type: Option<&str>,
     ) -> Option<(String, CallType, Option<String>, bool)> {
         let kind = node.kind();
@@ -1409,10 +1530,10 @@ impl CallGraph {
                 let scope =
                     receiver.and_then(|node| Self::scope_hint_from(node, source, self_type));
                 if scope.is_none() {
-                    if let Some(inferred) = receiver
-                        .and_then(|node| self.chained_call_scope_hint(node, source, self_type))
-                    {
-                        return Some((name, CallType::Method, Some(inferred), true));
+                    if let Some((chained, inferred)) = receiver.and_then(|node| {
+                        self.chained_call_scope_hint(node, source, caller_file, self_type)
+                    }) {
+                        return Some((name, CallType::Method, Some(chained), inferred));
                     }
                 }
                 Some((name, CallType::Method, scope, false))
@@ -1432,10 +1553,10 @@ impl CallGraph {
                     .or_else(|| node.named_child(0));
                 let scope = target.and_then(|node| Self::scope_hint_from(node, source, self_type));
                 if scope.is_none() {
-                    if let Some(inferred) = target
-                        .and_then(|node| self.chained_call_scope_hint(node, source, self_type))
-                    {
-                        return Some((name, CallType::Method, Some(inferred), true));
+                    if let Some((chained, inferred)) = target.and_then(|node| {
+                        self.chained_call_scope_hint(node, source, caller_file, self_type)
+                    }) {
+                        return Some((name, CallType::Method, Some(chained), inferred));
                     }
                 }
                 Some((name, CallType::Method, scope, false))
@@ -1507,7 +1628,7 @@ impl CallGraph {
         let (callee, receiver) = Self::callee_slot(node)?;
 
         let (target, mut call_type, mut scope_hint, mut scope_inferred) =
-            self.describe_callee(callee, source, self_type)?;
+            self.describe_callee_in(callee, source, path, self_type)?;
 
         if let Some(receiver) = receiver {
             call_type = if kind == "scoped_call_expression" {
@@ -1518,9 +1639,11 @@ impl CallGraph {
             scope_hint = Self::scope_hint_from(receiver, source, self_type);
             scope_inferred = false;
             if scope_hint.is_none() {
-                if let Some(inferred) = self.chained_call_scope_hint(receiver, source, self_type) {
-                    scope_hint = Some(inferred);
-                    scope_inferred = true;
+                if let Some((chained, inferred)) =
+                    self.chained_call_scope_hint(receiver, source, path, self_type)
+                {
+                    scope_hint = Some(chained);
+                    scope_inferred = inferred;
                 }
             }
         }
@@ -2587,6 +2710,7 @@ mod tests {
                 cognitive: 3,
             },
             receiver: None,
+            result_type: None,
         };
 
         graph
@@ -2613,6 +2737,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let callee = CallNode {
@@ -2622,6 +2747,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -2684,6 +2810,7 @@ mod tests {
                     }],
                     metrics: FunctionMetrics::default(),
                     receiver: None,
+                    result_type: None,
                 },
             );
         }
@@ -2696,6 +2823,7 @@ mod tests {
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
             },
         );
 
@@ -2717,6 +2845,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("isolated".to_string(), node);
@@ -2766,6 +2895,7 @@ mod tests {
             ],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -2789,6 +2919,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("leaf".to_string(), node);
@@ -2825,6 +2956,7 @@ mod tests {
             calls: Vec::new(),
             metrics: metrics.clone(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("complex_function".to_string(), node);
@@ -2869,6 +3001,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_b = CallNode {
@@ -2887,6 +3020,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_c = CallNode {
@@ -2905,6 +3039,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_d = CallNode {
@@ -2914,6 +3049,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -2957,6 +3093,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_c = CallNode {
@@ -2966,6 +3103,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("b".to_string(), node_b);
@@ -3001,6 +3139,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_b = CallNode {
@@ -3019,6 +3158,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_c = CallNode {
@@ -3037,6 +3177,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_d = CallNode {
@@ -3046,6 +3187,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -3089,6 +3231,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_b = CallNode {
@@ -3107,6 +3250,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_c = CallNode {
@@ -3116,6 +3260,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -3140,6 +3285,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         let node_b = CallNode {
@@ -3149,6 +3295,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -3191,6 +3338,7 @@ mod tests {
             ],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         // Create a less connected function
@@ -3210,6 +3358,7 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         // Three callers point at "hotspot" (forward edges).
@@ -3232,6 +3381,7 @@ mod tests {
                     }],
                     metrics: FunctionMetrics::default(),
                     receiver: None,
+                    result_type: None,
                 },
             );
         }
@@ -3302,6 +3452,7 @@ mod tests {
                 cognitive: 4,
             },
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("test_func".to_string(), node);
@@ -3324,6 +3475,7 @@ mod tests {
                 }],
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
             },
         );
 
@@ -3364,6 +3516,7 @@ mod tests {
                 cognitive: 2,
             },
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("func1".to_string(), node1);
@@ -3403,6 +3556,7 @@ mod tests {
                 cognitive: 2,
             },
             receiver: None,
+            result_type: None,
         };
 
         graph.nodes.insert("func".to_string(), node);
@@ -3479,6 +3633,7 @@ mod tests {
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
             };
             graph.nodes.insert(name.to_string(), node);
         }
@@ -3540,6 +3695,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -3548,6 +3704,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -3578,6 +3735,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -3586,6 +3744,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -3619,6 +3778,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
         let node_b = CallNode {
             name: "helper".to_string(),
@@ -3627,6 +3787,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
         };
 
         graph
@@ -3654,6 +3815,7 @@ mod tests {
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
             };
             graph
                 .nodes
@@ -3675,6 +3837,7 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: receiver.map(str::to_string),
+            result_type: None,
         }
     }
 
