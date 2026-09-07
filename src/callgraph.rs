@@ -97,14 +97,39 @@ pub enum CallResolution {
     /// Several namesakes and nothing to choose between them — the target is a
     /// deterministic pick, not a fact.
     NameOnly,
-    /// No function of that name is in the graph (third-party, stdlib, macro).
+    /// No function of that name is in the graph, and nothing at the call site
+    /// says where it went: a stdlib or builtin name, a macro, a method on a
+    /// value whose type was never written down. The residual case — the two
+    /// variants below are the ones the call site actually explains.
     Unresolved,
+    /// The call leaves the index, and the source says so: the qualifier named
+    /// an import that resolves to no indexed package (`assert.Len`), or a
+    /// local declared as a type from outside this repository (`wg.Add`).
+    /// Nothing is missing from the graph — the target is not project code.
+    ExternalPackage,
+    /// The qualifier named a package that *is* indexed, which carries no
+    /// function of that name: a method reached through a value, or a file the
+    /// index skipped. Unlike [`ExternalPackage`](Self::ExternalPackage) this
+    /// is a gap in what was read, so it is the count worth acting on.
+    PackageMissing,
 }
 
 impl CallResolution {
     /// Does this edge point at a function the graph actually identified?
     pub fn is_certain(self) -> bool {
         matches!(self, Self::Unique | Self::Receiver | Self::Scope)
+    }
+
+    /// Does this edge point outside the graph — no target function at all,
+    /// whatever the reason? Reports have to group these three together
+    /// wherever they ask "did this call resolve", and equality against a
+    /// single variant silently stopped covering that the moment the reasons
+    /// were split apart.
+    pub fn is_outside_graph(self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved | Self::ExternalPackage | Self::PackageMissing
+        )
     }
 
     /// Short label for reports; `None` for edges that need no caveat.
@@ -115,6 +140,8 @@ impl CallResolution {
             Self::SameFile => Some("same-file match"),
             Self::NameOnly => Some("name match only"),
             Self::Unresolved => Some("not in graph"),
+            Self::ExternalPackage => Some("not in graph, outside the index"),
+            Self::PackageMissing => Some("not in graph, indexed package has no such function"),
             Self::Unknown => Some("match unrecorded"),
             _ => None,
         }
@@ -918,9 +945,17 @@ impl CallGraph {
         import_path: &str,
     ) -> Option<(String, CallResolution)> {
         let Some(dir) = self.package_dir_for(import_path) else {
-            return Some((bare_name.to_string(), CallResolution::Unresolved));
+            // The import names a package this index does not contain: the
+            // call is third-party, not a gap in what was read.
+            return Some((bare_name.to_string(), CallResolution::ExternalPackage));
         };
-        let candidates = self.name_index.get(bare_name)?;
+        // The package is indexed and the graph has never heard the name: the
+        // same gap as the `0` arm below, reached one step earlier. Falling
+        // through to the general resolution would only relabel it as the
+        // residual `Unresolved`, losing the one thing the call site said.
+        let Some(candidates) = self.name_index.get(bare_name) else {
+            return Some((bare_name.to_string(), CallResolution::PackageMissing));
+        };
         let in_package: Vec<&String> = candidates
             .iter()
             .filter(|key| {
@@ -945,7 +980,7 @@ impl CallGraph {
         match in_package.len() {
             // The package is indexed but carries no such function: a method on
             // one of its types reached through a value, or an unindexed file.
-            0 => Some((bare_name.to_string(), CallResolution::Unresolved)),
+            0 => Some((bare_name.to_string(), CallResolution::PackageMissing)),
             1 => Some((in_package[0].clone(), CallResolution::Scope)),
             // Two package-level functions of one name cannot both exist in Go,
             // so this means the package directory was matched loosely (a
@@ -1098,7 +1133,7 @@ impl CallGraph {
                             // call leaves the graph.
                             .or_else(|| {
                                 hint.filter(|hint| ctx.is_foreign_local(hint))
-                                    .map(|_| (edge.target.clone(), CallResolution::Unresolved))
+                                    .map(|_| (edge.target.clone(), CallResolution::ExternalPackage))
                             });
 
                         // A qualifier that is not a shadowing local names an
@@ -2951,8 +2986,16 @@ impl CallGraph {
     /// resolving (a grammar change, a naming convention this reading does not
     /// cover) produces exactly the same number of edges, pointing at worse
     /// targets. This is what makes that visible in `get_index_status`.
+    ///
+    /// The three "not in graph" rows are reported apart because one lumped
+    /// figure could not be acted on. Half the edges of a Go corpus leaving
+    /// the graph is normal — those are calls into the standard library and
+    /// into dependencies nobody indexed — while an *indexed* package with no
+    /// such function is a gap in what was read, and a name declared nowhere
+    /// at all sits between the two. Read together they were indistinguishable,
+    /// so a healthy 47% looked like half a lost graph.
     pub fn resolution_stats(&self) -> Vec<(&'static str, usize)> {
-        let mut counts = [0usize; 8];
+        let mut counts = [0usize; 10];
         for node in self.nodes.iter() {
             for edge in &node.calls {
                 let slot = match edge.resolution {
@@ -2963,7 +3006,9 @@ impl CallGraph {
                     CallResolution::FactoryReceiver => 4,
                     CallResolution::SameFile => 5,
                     CallResolution::NameOnly => 6,
-                    CallResolution::Unresolved | CallResolution::Unknown => 7,
+                    CallResolution::ExternalPackage => 7,
+                    CallResolution::PackageMissing => 8,
+                    CallResolution::Unresolved | CallResolution::Unknown => 9,
                 };
                 counts[slot] += 1;
             }
@@ -2976,7 +3021,9 @@ impl CallGraph {
             ("receiver inferred from factory name", counts[4]),
             ("same file as caller", counts[5]),
             ("name match only", counts[6]),
-            ("not in graph", counts[7]),
+            ("not in graph: outside the index", counts[7]),
+            ("not in graph: indexed package, no such function", counts[8]),
+            ("not in graph: name not declared anywhere", counts[9]),
         ]
     }
 

@@ -49,7 +49,9 @@ Each entry says what its target was matched on:
 | `single implementation of the interface` | The receiver's type is an interface, and exactly one type in the index carries every method it declares | Strong candidate - dispatch is dynamic, another implementation could be injected |
 | `same-file match` | Namesakes exist; the one in the caller's file was taken | Likely, say so |
 | `name match only` | Namesakes exist and nothing distinguished them | A candidate - verify before acting |
-| `not in graph` | Third-party, stdlib, unindexed - or a qualifier that names an imported package outside this repo (`assert.Len`), or a Go type conversion (`account_model.AccountUuid(x)`), which is no call at all | Not project code; usually noise |
+| `not in graph, outside the index` | The import list says the target is not this repo's code: `assert.Len`, or a value declared as a foreign type (`wg.Add`) | Not project code; noise by construction, not a gap |
+| `not in graph, indexed package has no such function` | The qualifier named a package this index **does** carry, which has no such function: a method reached through a value, or a file the index skipped | The one "missing" kind worth chasing - something was not read |
+| `not in graph` | Nothing at the call site explains it: stdlib or builtin names, macros, a Go type conversion (`account_model.AccountUuid(x)`), which is no call at all | Not project code; usually noise |
 
 The footer counts them (`> 12 of 23 targets ... matched by name alone`). Carry
 that number into your answer. "117 callers, all matched by name" is a different
@@ -89,10 +91,15 @@ checker, so what is covered is what is written nearby:
 | `XFactory(c).M()`, `NewX().M()` | On type `X` from the factory/constructor name - `receiver inferred from factory name`; fires for `Factory`/`Provider`/`Builder` suffixes and `New`/`Make` prefixes, snake_case included |
 | `self.Provider.Deliver(to)` where the field is an interface | The one indexed type carrying every method the interface declares - `single implementation of the interface`; a mock in the test tree loses to production code |
 | `config.Get()` where `config` is an imported package of this repo | Narrowed to that package's own directory (not its subpackages), package-level functions only - `Scope` |
-| `assert.Len(t, x, 3)`, `err.Error()`, `wg.Add(1)` - a third-party package, or a name declared as a builtin, container or foreign type | **No target at all** - `not in graph`, instead of some namesake of this repo |
+| `assert.Len(t, x, 3)`, `err.Error()`, `wg.Add(1)` - a third-party package, or a name declared as a builtin, container or foreign type | **No target at all** - `not in graph, outside the index` (or plain `not in graph` for a builtin), instead of some namesake of this repo |
 
 `get_index_status` reports the mix (`## Call Edge Resolution`), which is how you
-tell a corpus that resolves well from one that mostly guesses.
+tell a corpus that resolves well from one that mostly guesses. The three
+`not in graph` rows are counted apart on purpose: a Go corpus routinely sends
+around half its edges out of the graph into the standard library and into
+dependencies nobody indexed, so that figure alone says nothing about quality.
+Read `indexed package, no such function` instead - that is the row that grows
+when something was genuinely not read.
 
 Still unresolved, and still needing a manual check:
 

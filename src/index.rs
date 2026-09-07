@@ -3662,13 +3662,15 @@ impl CodeIntelEngine {
 
         let guessed = edges
             .iter()
-            .filter(|edge| {
-                !edge.resolution.is_certain() && edge.resolution != CallResolution::Unresolved
-            })
+            .filter(|edge| !edge.resolution.is_certain() && !edge.resolution.is_outside_graph())
             .count();
         let external = edges
             .iter()
-            .filter(|edge| edge.resolution == CallResolution::Unresolved)
+            .filter(|edge| edge.resolution.is_outside_graph())
+            .count();
+        let missing_in_package = edges
+            .iter()
+            .filter(|edge| edge.resolution == CallResolution::PackageMissing)
             .count();
 
         if guessed > 0 {
@@ -3683,6 +3685,16 @@ impl CodeIntelEngine {
                 "\n> {} of {} targets are not in the graph (third-party, standard library, or an unindexed file).\n",
                 external,
                 edges.len()
+            ));
+        }
+        // Worth saying separately: a call into a package this index *does*
+        // carry, that carries no such function, is the one kind of missing
+        // target that means something was not read — the rest is stdlib and
+        // dependencies, which no amount of indexing this repo would add.
+        if missing_in_package > 0 {
+            output.push_str(&format!(
+                "> {} of those name a package that is indexed but has no such function — a method reached through a value, or a file the index skipped.\n",
+                missing_in_package
             ));
         }
         output

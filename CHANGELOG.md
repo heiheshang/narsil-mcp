@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`not in graph` split into the three things it was hiding.** One count
+  covered edges whose target the import list places outside the index
+  (`assert.Len`, `wg.Add` - third-party by construction), edges naming a
+  package that *is* indexed but carries no such function (a method reached
+  through a value, or a file the index skipped), and edges whose name is
+  declared nowhere at all (stdlib, builtins, macros). Read together, a Go
+  corpus sending half its edges into its dependencies looked identical to half
+  a lost graph, and impact analysis re-checked reachable code by hand for no
+  reason. `CallResolution` gains `ExternalPackage` and `PackageMissing`,
+  `resolution_stats` reports the three apart, `get_callees` names the middle
+  count in its footer, and `is_outside_graph()` replaces the equality tests
+  that silently stopped covering the group. Only the middle row grows when
+  something was genuinely not read.
+
 - **Argument names no longer have to be guessed.** Tool schemas had drifted
   into two families - call-graph and flow tools name their target `function`,
   symbol tools name it `symbol`; search tools cap with `max_results`, the rest

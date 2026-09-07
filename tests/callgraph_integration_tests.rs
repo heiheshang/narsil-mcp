@@ -1299,8 +1299,8 @@ func TestArgon(t *testing.T) {
         .expect("the call site should still be recorded");
     assert_eq!(
         edge.resolution,
-        CallResolution::Unresolved,
-        "testify is not this repository's code: got {}",
+        CallResolution::ExternalPackage,
+        "testify is not this repository's code, and the import list says so: got {}",
         edge.target
     );
     assert!(
@@ -1810,7 +1810,7 @@ func describe(err error, wg sync.WaitGroup) string {
     for edge in &callees {
         assert_eq!(
             edge.resolution,
-            CallResolution::Unresolved,
+            CallResolution::ExternalPackage,
             "{} is a call into someone else's code",
             edge.target
         );
@@ -1818,5 +1818,97 @@ func describe(err error, wg sync.WaitGroup) string {
     assert!(
         call_graph.get_callers("Report.Error").is_empty(),
         "a builtin `error` must not collect callers for this repository's types"
+    );
+}
+
+/// The three ways an edge can leave the graph mean three different things,
+/// and one lumped `not in graph` count could not be acted on: half a Go
+/// corpus leaving the graph is normal (stdlib and dependencies), while a call
+/// into an *indexed* package that has no such function is a gap in what was
+/// read.
+#[test]
+fn test_edges_outside_the_graph_say_which_kind_of_outside() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/pay/pay.go",
+            r#"
+package pay
+
+import (
+	"github.com/stretchr/testify/assert"
+
+	"go-rest-api/internal/config"
+)
+
+func Pay(t assert.TestingT) {
+	// An import that resolves to no indexed package.
+	assert.Len(t, []int{1}, 1)
+	// A package this index does carry, which has no such function.
+	config.NeverDefined()
+	// A name declared nowhere at all.
+	println("done")
+}
+"#,
+        ),
+        (
+            "internal/config/config.go",
+            "package config\n\nfunc Get() string {\n\treturn \"\"\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = call_graph.get_callees("internal/usecase/pay/pay.go::Pay");
+    let resolution_of = |name: &str| {
+        callees
+            .iter()
+            .find(|edge| edge.target.ends_with(name))
+            .map(|edge| edge.resolution)
+    };
+
+    assert_eq!(
+        resolution_of("Len"),
+        Some(CallResolution::ExternalPackage),
+        "testify is outside the index: {callees:?}"
+    );
+    assert_eq!(
+        resolution_of("NeverDefined"),
+        Some(CallResolution::PackageMissing),
+        "internal/config is indexed and has no such function: {callees:?}"
+    );
+
+    // All three group together wherever a report asks "did this resolve".
+    for edge in &callees {
+        assert!(
+            edge.resolution.is_outside_graph(),
+            "{} should count as outside the graph",
+            edge.target
+        );
+        assert!(!edge.resolution.is_certain(), "{}", edge.target);
+    }
+
+    // And the statistics report them apart rather than as one figure.
+    let stats = call_graph.resolution_stats();
+    let count_of = |label: &str| {
+        stats
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, count)| *count)
+            .unwrap_or_else(|| panic!("no such row: {label} in {stats:?}"))
+    };
+    assert_eq!(count_of("not in graph: outside the index"), 1, "{stats:?}");
+    assert_eq!(
+        count_of("not in graph: indexed package, no such function"),
+        1,
+        "{stats:?}"
     );
 }
