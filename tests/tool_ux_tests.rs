@@ -562,3 +562,80 @@ async fn oversized_files_skipped_from_index() -> Result<()> {
     assert!(!out.contains("huge.md"), "oversized file indexed:\n{out}");
     Ok(())
 }
+
+#[tokio::test]
+async fn symbol_and_function_are_interchangeable_across_families() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "svc.go",
+        "package svc\n\nfunc Helper() int { return 1 }\n\nfunc Caller() int { return Helper() }\n",
+    )?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let registry = ToolRegistry::new();
+
+    // Call-graph family declares 'function'; a caller reaching for 'symbol'
+    // used to spend the whole call on a schema mismatch.
+    let callers = registry
+        .dispatch(
+            "get_callers",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Helper"}),
+        )
+        .await?;
+    assert!(callers.contains("Caller"), "{callers}");
+
+    // Symbol family declares 'symbol'; 'function' now works there too.
+    let usages = registry
+        .dispatch(
+            "find_symbol_usages",
+            &engine,
+            json!({"repo": repo.name(), "function": "Helper"}),
+        )
+        .await?;
+    assert!(usages.contains("svc.go"), "{usages}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn limit_and_max_results_are_interchangeable() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "a.rs",
+        "fn alpha() {}\nfn alpha_two() {}\nfn alpha_three() {}\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // search_code declares 'max_results'; 'limit' must cap it just the same.
+    let capped = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "alpha", "limit": 1}),
+        )
+        .await?;
+    assert_eq!(capped.matches("a.rs").count(), 1, "{capped}");
+
+    // find_symbols declares 'limit'; 'max_results' is its long-standing alias.
+    let symbols = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "alpha", "max_results": 1}),
+        )
+        .await?;
+    assert!(symbols.contains("alpha"), "{symbols}");
+
+    Ok(())
+}

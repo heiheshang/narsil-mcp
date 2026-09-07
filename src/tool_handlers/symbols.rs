@@ -42,7 +42,7 @@ impl ToolHandler for GetSymbolDefinitionHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
+        let symbol = args.get_str_any(&["symbol", "function"]).unwrap_or("");
         let context_lines = args.get_u64_or("context_lines", 5) as usize;
         engine
             .get_symbol_definition(repo, symbol, context_lines)
@@ -61,7 +61,7 @@ impl ToolHandler for FindReferencesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
+        let symbol = args.get_str_any(&["symbol", "function"]).unwrap_or("");
         let include_def = args.get_bool_or("include_definition", true);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -98,7 +98,7 @@ impl ToolHandler for FindSymbolUsagesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
+        let symbol = args.get_str_any(&["symbol", "function"]).unwrap_or("");
         let include_imports = args.get_bool_or("include_imports", true);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -135,7 +135,7 @@ impl ToolHandler for WorkspaceSymbolSearchHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let query = args.get_str("query").unwrap_or("");
         let kind = args.get_str("kind");
-        let limit = args.get_limit_any(&["limit"], 20);
+        let limit = args.get_limit_any(&["limit", "max_results"], 20);
         engine.workspace_symbol_search(query, kind, limit).await
     }
 }

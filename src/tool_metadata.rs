@@ -373,6 +373,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Fully qualified symbol name (e.g., 'MyStruct', 'module::function')"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "context_lines": {"type": "integer", "description": "Number of context lines before/after (default: 5)"}
                 },
                 "required": ["repo", "symbol"]
@@ -394,6 +395,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Symbol name to find references for"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "include_definition": {"type": "boolean", "description": "Include the definition location (default: true)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -437,6 +439,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "include_imports": {"type": "boolean", "description": "Include import statements (default: true)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -479,7 +482,8 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Symbol name or partial name to search for"},
                     "kind": {"type": "string", "enum": ["function", "class", "struct", "interface", "enum", "variable", "all"], "description": "Filter by symbol kind (default: all)"},
-                    "limit": {"type": "integer", "description": "Maximum results to return (default: 20)"}
+                    "limit": {"type": "integer", "description": "Maximum results to return (default: 20)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
                 },
                 "required": ["query"]
             }),
@@ -529,6 +533,7 @@ lazy_static! {
                     "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
                     "doc_type": {"type": "string", "enum": ["file", "function", "class", "struct", "method"], "description": "Filter by document type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -551,6 +556,7 @@ lazy_static! {
                     "query": {"type": "string"},
                     "repo": {"type": "string", "description": "Optional: limit to specific repository"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "mode": {"type": "string", "enum": ["hybrid", "bm25", "tfidf"], "description": "Search mode: hybrid (default), bm25 only, or tfidf only"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -573,7 +579,8 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Natural language or code query"},
                     "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"}
                 },
                 "required": ["query"]
             }),
@@ -596,6 +603,7 @@ lazy_static! {
                     "repo": {"type": "string", "description": "Optional: limit to specific repository"},
                     "chunk_type": {"type": "string", "enum": ["function", "method", "class", "trait", "module", "all"], "description": "Filter by chunk type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -618,6 +626,7 @@ lazy_static! {
                     "query": {"type": "string", "description": "Code snippet to find similar code for"},
                     "repo": {"type": "string", "description": "Repository to search in (optional, searches all if omitted)"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -639,7 +648,9 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Symbol name to find similar code for"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -661,6 +672,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find clones of"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "threshold": {"type": "number", "description": "Similarity threshold 0-1 (default: 0.8)"}
                 },
                 "required": ["repo", "path", "function"]
@@ -750,6 +762,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Focus on specific function (optional)"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "depth": {"type": "integer", "description": "Maximum depth to traverse (default: 3)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
                 },
@@ -772,6 +785,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find callers of"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "transitive": {"type": "boolean", "description": "Include transitive callers (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
@@ -795,6 +809,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find callees of"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "transitive": {"type": "boolean", "description": "Include transitive callees (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
@@ -838,7 +853,8 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "function": {"type": "string", "description": "Function name to analyze"}
+                    "function": {"type": "string", "description": "Function name to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "function"]
             }),
@@ -1008,6 +1024,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path relative to repository"},
                     "symbol": {"type": "string", "description": "Symbol/function name to track"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "max_commits": {"type": "integer", "description": "Maximum commits to return (default: 10)"}
                 },
                 "required": ["repo", "path", "symbol"]
@@ -1480,7 +1497,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path containing the function"},
-                    "function": {"type": "string", "description": "Function name to analyze"}
+                    "function": {"type": "string", "description": "Function name to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1502,6 +1520,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path to analyze"},
                     "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
@@ -1523,7 +1542,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string"}
+                    "function": {"type": "string"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1544,7 +1564,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string"}
+                    "function": {"type": "string"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1566,6 +1587,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
@@ -1588,6 +1610,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
@@ -1609,7 +1632,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string"}
+                    "function": {"type": "string"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1772,6 +1796,7 @@ lazy_static! {
                     "query": {"type": "string", "description": "SPARQL query to execute"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000, max: 300000)"},
                     "limit": {"type": "integer", "description": "Maximum number of results (default: 1000, max: 10000)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"},
                     "offset": {"type": "integer", "description": "Offset for pagination (default: 0)"},
                     "format": {"type": "string", "enum": ["json", "markdown", "csv"], "description": "Output format (default: json)"}
                 },
@@ -1809,6 +1834,7 @@ lazy_static! {
                     "params": {"type": "object", "description": "Template parameters as key-value pairs"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
                     "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"},
                     "format": {"type": "string", "enum": ["json", "markdown", "csv"], "description": "Output format (default: json)"}
                 },
                 "required": ["template"]
@@ -1958,7 +1984,8 @@ lazy_static! {
                     "repo": {"type": "string", "description": "Repository name"},
                     "query": {"type": "string", "description": "SPARQL query to execute"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
-                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"}
+                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
                 },
                 "required": ["repo", "query"]
             }),
@@ -2077,6 +2104,72 @@ pub fn search_tools(query: &str) -> Vec<&'static ToolMetadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tool that names a symbol accepts both spellings, and every tool
+    /// that caps results accepts both spellings. The two families drifted
+    /// apart (`function` in call-graph/flow tools, `symbol` in symbol tools,
+    /// `max_results` in search tools, `limit` in the rest), and callers spent
+    /// whole tool calls guessing which one a given tool wanted. Adding a new
+    /// tool without its alias is a regression this test is here to catch.
+    #[test]
+    fn symbol_and_limit_arguments_accept_both_spellings() {
+        const PAIRS: &[(&str, &str)] = &[
+            ("function", "symbol"),
+            ("symbol", "function"),
+            ("max_results", "limit"),
+            ("limit", "max_results"),
+        ];
+
+        let mut missing: Vec<String> = Vec::new();
+        for (name, meta) in TOOL_METADATA.iter() {
+            let Some(props) = meta
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+            for (canonical, alias) in PAIRS {
+                if props.contains_key(*canonical) && !props.contains_key(*alias) {
+                    missing.push(format!("{name}: has '{canonical}' but not '{alias}'"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "tools missing an argument alias:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    /// An alias is only honoured by `validate_tool_args` when its description
+    /// is exactly `Alias for '<canonical>'`, so the spelling is load-bearing.
+    #[test]
+    fn alias_descriptions_name_a_real_property() {
+        for (name, meta) in TOOL_METADATA.iter() {
+            let Some(props) = meta
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+            for (key, prop) in props {
+                let Some(canonical) = prop
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .and_then(|d| d.strip_prefix("Alias for '"))
+                    .and_then(|rest| rest.split('\'').next())
+                else {
+                    continue;
+                };
+                assert!(
+                    props.contains_key(canonical),
+                    "{name}: '{key}' is an alias for '{canonical}', which the schema does not declare"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_tool_metadata_exists() {

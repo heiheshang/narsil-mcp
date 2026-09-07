@@ -188,7 +188,9 @@ impl ToolHandler for QueryCcgHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let query = args.get_str("query").unwrap_or("");
         let timeout_ms = args.get_u64("timeout_ms");
-        let limit = args.get_u64("limit").map(|v| v as usize);
+        let limit = args
+            .get_u64_any(&["limit", "max_results"])
+            .map(|v| v as usize);
 
         engine.query_ccg(repo, query, timeout_ms, limit).await
     }

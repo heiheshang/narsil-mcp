@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Argument names no longer have to be guessed.** Tool schemas had drifted
+  into two families - call-graph and flow tools name their target `function`,
+  symbol tools name it `symbol`; search tools cap with `max_results`, the rest
+  with `limit` - and a caller could spend a whole tool call on the wrong
+  spelling before seeing "missing required parameter". Each of the four
+  spellings is now a declared alias of its counterpart on every tool in either
+  family, honoured by both the handlers (`get_str_any` / `get_u64_any`) and
+  `validate_tool_args`. Two schema-invariant tests fail if a newly added tool
+  declares one spelling without the other, or points an alias at a property
+  that does not exist. `get_metrics` still takes only `format`: per-repository
+  figures come from `get_index_status`, and that is now written down in the
+  skill rather than discovered by a failed call.
+
 - **A type index, and call targets read off declarations.** The call graph
   stored functions and nothing else, so a qualifier naming anything but a
   receiver — a field, a variable, the value a call produced — fell through to

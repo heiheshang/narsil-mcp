@@ -252,9 +252,26 @@ CCG layers ship a portable, layered description of a codebase suitable for AI ha
 
 For large codebases, use pagination and filtering:
 
-- `max_results` parameter limits output size
+- `max_results` parameter limits output size (`limit` is accepted everywhere as
+  its alias, and vice versa - no need to remember which family a tool is in)
 - `file_pattern` filters by glob (e.g., `"*.py"`, `"src/**/*.ts"`)
 - `severity_threshold` filters security findings (critical, high, medium, low)
+
+## Argument Spellings
+
+Two families name their target differently, and both spellings are accepted by
+every tool in either family:
+
+- Call-graph and flow tools declare `function` (`get_callers`, `get_callees`,
+  `get_call_graph`, `get_complexity`, `get_control_flow`, `get_data_flow`,
+  `get_reaching_definitions`, `find_dead_code`, `find_dead_stores`,
+  `find_uninitialized`, `infer_types`, `find_semantic_clones`)
+- Symbol tools declare `symbol` (`get_symbol_definition`, `find_references`,
+  `find_symbol_usages`, `find_similar_to_symbol`, `get_symbol_history`)
+
+Passing `symbol` to `get_callers` or `function` to `find_symbol_usages` works.
+`get_metrics` takes only `format` - it has no `repo` or `path`; per-repository
+figures come from `get_index_status`.
 
 ## Troubleshooting
 
