@@ -36,6 +36,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   figures come from `get_index_status`, and that is now written down in the
   skill rather than discovered by a failed call.
 
+- **Methods carry their owning type.** Symbols were indexed under a bare name
+  with `qualified_name` always empty, so a Go method's receiver, a Rust `impl`
+  type and a class name were all lost: `Save` looked the same whichever type
+  declared it. The symbol parser now labels methods, fields and test cases
+  with their owner (`PaymentStore::Save`) using the same owner lookup the call
+  graph resolves calls with, listings print the qualified name, and it works as
+  a lookup key.
+
+- **`get_symbol_definition` disambiguates namesakes.** It used to return
+  whichever same-named symbol was parsed first, silently. It now reports the
+  other definitions of that name, and `receiver` ("AuditStore") or `file`
+  ("payment/store.go", matched as a path suffix) picks one; a filter matching
+  nothing lists the candidates instead of returning an arbitrary symbol.
+
+- **Symbol listings carry the end line.** `find_symbols` printed
+  `file:line` only, so the caller could not tell where a body stopped and had
+  to shell out to `sed` to read one. It now prints `file:start-end` in both the
+  grouped and the compact listing, which feeds `get_file`/`get_excerpt`
+  directly.
+
+- **`get_symbol_definition` can narrow a large body.** Reading a 450-line
+  function whole was the only option. Four new arguments cut it down:
+  `outline` prints the control-flow skeleton (signature plus
+  `if`/`switch`/`case`/`for`/`return` lines) with the gaps marked, `contains`
+  keeps only body lines matching a case-insensitive regex, and
+  `offset`/`max_lines` page through the body. A footer reports how many lines
+  were hidden.
+
+- **Named test cases are symbols.** Go's `t.Run("...")` and JavaScript /
+  TypeScript `describe`/`it`/`test` blocks are indexed as `TestCase` symbols
+  spanning the whole case block, so `find_symbols symbol_type: "test"` lists
+  the cases in a file and `get_symbol_definition` returns one whole case —
+  previously the only way to find a case boundary was grep.
+
+- **Go type declarations keep their kind.** `type X struct` and
+  `type X interface` were both reported as `TypeAlias` (one catch-all pattern
+  for every `type` declaration), so `find_symbols symbol_type: "struct"` never
+  matched a Go struct. Struct and interface declarations now report `Struct`
+  and `Interface`; `type X = Y` aliases, which the query missed entirely, are
+  indexed as `TypeAlias`.
+
+- **Go and Rust struct fields are symbols.** The symbol queries captured
+  functions, methods and type names only, so `find_symbols` with
+  `name_regex: "UUID$"` returned nothing for a field that `search_code` found
+  in one call. `field_declaration` names are now indexed as
+  `SymbolKind::Field` — in Go one symbol per name in `A, B int`, embedded
+  fields skipped, the struct tag kept in the signature; in Rust named struct
+  fields and struct-variant enum fields, tuple fields having no name to index —
+  and `symbol_type: "field"` filters to them. Other languages still do not
+  index fields.
+
+### Fixed
+
+- **`search_code` no longer hides how much it dropped.** Matches are ranked and
+  cut to `max_results` (default 10), but the header printed the post-truncation
+  count as `Found N results`, so a query that matched 300 lines and showed 10
+  read as a complete answer. When the list is cut the header now reads
+  `Showing 10 of 300 matching lines` and names the two ways out (`max_results`,
+  `file_pattern`). The tool description also stops calling it "semantic and
+  keyword search": it is a case-insensitive substring match with no regex, whose
+  scoring gives declaration lines a bonus over call sites — so call sites of a
+  known identifier belong to `find_symbol_usages`/`find_references`, which the
+  description and the `narsil-search` skill now say outright.
+
+- **`get_symbol_definition` suggests near misses.** A miss returned a bare
+  "Symbol not found", costing a second `find_symbols` call. The error now lists
+  the closest indexed symbols with their kind and line range — a name differing
+  only in case, one matching the last segment of a qualified name, or a
+  substring match — and otherwise points at `find_symbols`.
+
+- **Brace alternation in `file_pattern`.** The `glob` crate has no `{a,b}`
+  support and treated the braces literally, so `**/*.{json,md,yml}` matched
+  nothing and `search_code` reported zero hits where `grep` found ten. The
+  pattern is now expanded into one glob per alternative (nested groups
+  included) before compiling; an unbalanced brace is an error instead of a
+  silent empty filter.
+
 - **A type index, and call targets read off declarations.** The call graph
   stored functions and nothing else, so a qualifier naming anything but a
   receiver — a field, a variable, the value a call produced — fell through to

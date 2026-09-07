@@ -44,6 +44,129 @@ fn symbol_kind_to_doc_type(kind: &SymbolKind) -> DocType {
     }
 }
 
+/// A compiled user file glob: one `glob::Pattern` per brace alternative,
+/// matching when any alternative matches.
+#[derive(Debug, Clone)]
+struct FilePattern {
+    patterns: Vec<glob::Pattern>,
+}
+
+impl FilePattern {
+    fn matches(&self, path: &str) -> bool {
+        self.patterns.iter().any(|p| p.matches(path))
+    }
+}
+
+/// Expand shell-style brace alternation: `a.{rs,toml}` -> `[a.rs, a.toml]`.
+/// Nested groups are supported; a pattern without braces comes back as-is.
+/// Unbalanced braces are an error rather than a silently-literal `{`.
+fn expand_braces(pattern: &str) -> std::result::Result<Vec<String>, String> {
+    let Some(open) = pattern.find('{') else {
+        if pattern.contains('}') {
+            return Err("unbalanced '}' in brace alternation".to_string());
+        }
+        return Ok(vec![pattern.to_string()]);
+    };
+    let bytes = pattern.as_bytes();
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut splits = Vec::new();
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            b',' if depth == 1 => splits.push(i),
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Err("unbalanced '{' in brace alternation".to_string());
+    };
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let mut alternatives = Vec::new();
+    let mut start = open + 1;
+    for split in splits.into_iter().chain(std::iter::once(close)) {
+        alternatives.push(&pattern[start..split]);
+        start = split + 1;
+    }
+    let mut out = Vec::new();
+    for alt in alternatives {
+        for expanded in expand_braces(&format!("{}{}{}", prefix, alt, suffix))? {
+            out.push(expanded);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod file_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn expand_braces_plain_pattern_is_identity() {
+        assert_eq!(expand_braces("src/**/*.rs").unwrap(), vec!["src/**/*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_group() {
+        assert_eq!(
+            expand_braces("**/*.{json,md,yml}").unwrap(),
+            vec!["**/*.json", "**/*.md", "**/*.yml"]
+        );
+    }
+
+    #[test]
+    fn expand_braces_nested_and_multiple_groups() {
+        assert_eq!(
+            expand_braces("{src,tests}/**/*.{rs,{yml,yaml}}").unwrap(),
+            vec![
+                "src/**/*.rs",
+                "src/**/*.yml",
+                "src/**/*.yaml",
+                "tests/**/*.rs",
+                "tests/**/*.yml",
+                "tests/**/*.yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_braces_rejects_unbalanced() {
+        assert!(expand_braces("**/*.{json,md").is_err());
+        assert!(expand_braces("**/*.json}").is_err());
+    }
+
+    #[test]
+    fn compile_file_pattern_brace_glob_matches_each_alternative() {
+        let fp = CodeIntelEngine::compile_file_pattern("**/*.{json,md,yml}").unwrap();
+        assert!(fp.matches("docs/api/operation.json"));
+        assert!(fp.matches("README.md"));
+        assert!(fp.matches("deploy/values.yml"));
+        assert!(!fp.matches("src/main.go"));
+    }
+
+    #[test]
+    fn compile_file_pattern_bare_filename_matches_any_depth() {
+        let fp = CodeIntelEngine::compile_file_pattern("README.md").unwrap();
+        assert!(fp.matches("README.md"));
+        assert!(fp.matches("a/b/README.md"));
+        assert!(!fp.matches("a/b/README.txt"));
+    }
+
+    #[test]
+    fn compile_file_pattern_rejects_bad_glob() {
+        assert!(CodeIntelEngine::compile_file_pattern("src/[").is_err());
+        assert!(CodeIntelEngine::compile_file_pattern("**/*.{json").is_err());
+    }
+}
+
 /// Metadata about an indexed repository
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoMetadata {
@@ -231,6 +354,35 @@ struct WalkOutcome {
 /// trusted. `needs_reindex` compares size + mtime first and falls back to a
 /// content hash, so a file edited since the index was written is re-parsed
 /// rather than resurrected from the cache.
+/// `file:line` for a single-line symbol, `file:start-end` when the body spans
+/// several lines. Callers that want the body feed the end line straight into
+/// `get_file`/`get_excerpt`; without it they have to guess where it stops.
+/// Lines worth keeping in an `outline` view: the control-flow spine of a body.
+/// Deliberately lexical rather than tree-sitter based — it has to behave the
+/// same on all 32 indexed languages, including the ones whose grammar only
+/// yields top-level symbols.
+fn is_outline_line(line: &str) -> bool {
+    const KEYWORDS: [&str; 24] = [
+        "if ", "if(", "else", "elif", "switch", "select", "case ", "match ", "when ", "for ",
+        "for(", "while", "loop", "return", "try", "catch", "except", "finally", "defer", "go ",
+        "func ", "fn ", "def ", "throw",
+    ];
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lowered = trimmed.to_lowercase();
+    KEYWORDS.iter().any(|kw| lowered.starts_with(kw))
+}
+
+fn symbol_location(sym: &Symbol) -> String {
+    if sym.end_line > sym.start_line {
+        format!("{}:{}-{}", sym.file_path, sym.start_line, sym.end_line)
+    } else {
+        format!("{}:{}", sym.file_path, sym.start_line)
+    }
+}
+
 fn reusable_symbols(persisted: Option<&PersistedIndex>, file_path: &Path) -> Option<Vec<Symbol>> {
     let persisted = persisted?;
     let metadata = persisted.files.get(file_path)?;
@@ -262,6 +414,45 @@ pub struct FindSymbolsQuery<'a> {
     pub exclude_tests: Option<bool>,
     pub limit: usize,
     pub compact: bool,
+}
+
+/// Arguments for `get_symbol_definition`. A 400-line function is not worth
+/// reading whole: `outline`, `contains` and `max_lines`/`offset` narrow the
+/// body down before it is printed, which is what callers otherwise leave the
+/// tool to do with `sed`.
+pub struct SymbolDefinitionQuery<'a> {
+    pub repo: &'a str,
+    pub symbol: &'a str,
+    pub context_lines: usize,
+    /// Print only the control-flow skeleton of the body (signature, branches,
+    /// `case`/`return` lines) instead of every line.
+    pub outline: bool,
+    /// Case-insensitive regex; only body lines matching it are printed.
+    pub contains: Option<&'a str>,
+    /// Skip this many lines of the body before printing.
+    pub offset: usize,
+    /// Print at most this many body lines (0 = no cap).
+    pub max_lines: usize,
+    /// Disambiguate namesakes by file: an exact path or a suffix of one.
+    pub file: Option<&'a str>,
+    /// Disambiguate namesakes by owning type (Go receiver, Rust `impl`, class).
+    pub receiver: Option<&'a str>,
+}
+
+impl Default for SymbolDefinitionQuery<'_> {
+    fn default() -> Self {
+        Self {
+            repo: "",
+            symbol: "",
+            context_lines: 5,
+            outline: false,
+            contains: None,
+            offset: 0,
+            max_lines: 0,
+            file: None,
+            receiver: None,
+        }
+    }
 }
 
 impl Default for FindSymbolsQuery<'_> {
@@ -1409,6 +1600,79 @@ impl CodeIntelEngine {
     }
 
     /// Helper to create a helpful error message for missing/invalid repo parameter
+    /// A bare "Symbol 'X' not found" costs the caller another `find_symbols`
+    /// round trip. Attach the near misses instead: same name in a different
+    /// case, the same last segment of a qualified name, or a substring match.
+    fn symbol_not_found_error(
+        &self,
+        repo: &str,
+        symbol_name: &str,
+        symbols: &[Symbol],
+    ) -> anyhow::Error {
+        let needle = symbol_name.to_lowercase();
+        // `Type::method`, `Type.method`, `pkg/Type` — match on the last segment
+        // too, so a wrong qualifier still points at the right symbol.
+        let tail = needle
+            .rsplit([':', '.', '/'])
+            .next()
+            .unwrap_or(&needle)
+            .to_string();
+
+        let mut candidates: Vec<(u8, &Symbol)> = symbols
+            .iter()
+            .filter_map(|s| {
+                let name = s.name.to_lowercase();
+                let qualified = s.qualified_name.as_deref().map(str::to_lowercase);
+                let rank = if name == needle || qualified.as_deref() == Some(needle.as_str()) {
+                    0
+                } else if name == tail {
+                    1
+                } else if name.contains(&tail) || tail.contains(&name) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, s))
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return anyhow!(
+                "Symbol '{}' not found in repository '{}'. Use find_symbols with a \
+                 'pattern' or 'name_regex' to list what is indexed.",
+                symbol_name,
+                repo
+            );
+        }
+
+        candidates.sort_by_key(|(rank, s)| (*rank, s.name.len(), s.name.clone()));
+        let shown = candidates.len().min(5);
+        let listed = candidates[..shown]
+            .iter()
+            .map(|(_, s)| {
+                format!(
+                    "{} ({}, {:?})",
+                    s.qualified_name.as_deref().unwrap_or(&s.name),
+                    symbol_location(s),
+                    s.kind
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        anyhow!(
+            "Symbol '{}' not found in repository '{}'. Did you mean: {}{}",
+            symbol_name,
+            repo,
+            listed,
+            if candidates.len() > shown {
+                format!(" (+{} more)", candidates.len() - shown)
+            } else {
+                String::new()
+            }
+        )
+    }
+
     fn repo_not_found_error(&self, repo: &str) -> anyhow::Error {
         if repo.is_empty() {
             let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
@@ -1524,21 +1788,36 @@ impl CodeIntelEngine {
 
     /// Compile a user-supplied file glob. A bare filename (no separators, no
     /// wildcards) is normalized to `**/<name>` so it matches at any depth,
-    /// and an invalid glob is a hard error instead of a silently-dropped filter.
-    fn compile_file_pattern(pattern: &str) -> Result<glob::Pattern> {
-        let has_wildcard = pattern.contains(['*', '?', '[']);
+    /// brace alternation (`**/*.{json,md,yml}`) is expanded into one glob per
+    /// alternative — the `glob` crate has no brace support and would otherwise
+    /// treat `{` literally, matching nothing — and an invalid glob is a hard
+    /// error instead of a silently-dropped filter.
+    fn compile_file_pattern(pattern: &str) -> Result<FilePattern> {
+        let has_wildcard = pattern.contains(['*', '?', '[', '{']);
         let normalized = if !pattern.contains('/') && !has_wildcard {
             format!("**/{}", pattern)
         } else {
             pattern.to_string()
         };
-        glob::Pattern::new(&normalized).map_err(|e| {
+        let expanded = expand_braces(&normalized).map_err(|e| {
             anyhow::anyhow!(
-                "Invalid file pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.rs')",
+                "Invalid file pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.{{rs,toml}}')",
                 pattern,
                 e
             )
-        })
+        })?;
+        let patterns = expanded
+            .iter()
+            .map(|alt| glob::Pattern::new(alt))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Invalid file pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.rs')",
+                    pattern,
+                    e
+                )
+            })?;
+        Ok(FilePattern { patterns })
     }
 
     pub async fn find_symbols(&self, q: FindSymbolsQuery<'_>) -> Result<String> {
@@ -1603,8 +1882,10 @@ impl CodeIntelEngine {
             Some("method") => Some(SymbolKind::Method),
             Some("trait") => Some(SymbolKind::Trait),
             Some("type") => Some(SymbolKind::TypeAlias),
+            Some("field") => Some(SymbolKind::Field),
+            Some("test") => Some(SymbolKind::TestCase),
             Some(other) => anyhow::bail!(
-                "Unknown symbol_type '{}'. Expected one of: struct, class, enum, interface, function, method, trait, type, all",
+                "Unknown symbol_type '{}'. Expected one of: struct, class, enum, interface, function, method, trait, type, field, test, all",
                 other
             ),
         };
@@ -1640,9 +1921,16 @@ impl CodeIntelEngine {
                         return false;
                     }
                 }
-                // Name pattern filter (substring)
+                // Name pattern filter (substring). Matched against the
+                // qualified name too: that is what the listing prints, so
+                // pasting `PaymentStore::Save` back in has to work.
                 if let Some(ref pat_lower) = pat_lower {
-                    if !s.name.to_lowercase().contains(pat_lower) {
+                    let name_hit = s.name.to_lowercase().contains(pat_lower);
+                    let qualified_hit = s
+                        .qualified_name
+                        .as_deref()
+                        .is_some_and(|q| q.to_lowercase().contains(pat_lower));
+                    if !name_hit && !qualified_hit {
                         return false;
                     }
                 }
@@ -1698,8 +1986,9 @@ impl CodeIntelEngine {
             }
             for sym in &filtered {
                 output.push_str(&format!(
-                    "{} ({}:{})\n",
-                    sym.name, sym.file_path, sym.start_line
+                    "{} ({})\n",
+                    sym.qualified_name.as_deref().unwrap_or(&sym.name),
+                    symbol_location(sym)
                 ));
             }
             if self.options.cache_enabled {
@@ -1730,10 +2019,9 @@ impl CodeIntelEngine {
             output.push_str(&format!("## {:?}s\n\n", kind));
             for sym in syms {
                 output.push_str(&format!(
-                    "- **{}** (`{}:{}`) {}\n",
-                    sym.name,
-                    sym.file_path,
-                    sym.start_line,
+                    "- **{}** (`{}`) {}\n",
+                    sym.qualified_name.as_deref().unwrap_or(&sym.name),
+                    symbol_location(sym),
                     sym.signature.as_deref().unwrap_or("")
                 ));
             }
@@ -1749,29 +2037,88 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
-    pub async fn get_symbol_definition(
-        &self,
-        repo: &str,
-        symbol_name: &str,
-        context_lines: usize,
-    ) -> Result<String> {
+    pub async fn get_symbol_definition(&self, query: SymbolDefinitionQuery<'_>) -> Result<String> {
+        let SymbolDefinitionQuery {
+            repo,
+            symbol: symbol_name,
+            context_lines,
+            outline,
+            contains,
+            offset,
+            max_lines,
+            file,
+            receiver,
+        } = query;
+
+        use regex::RegexBuilder;
+
+        let contains_re = contains
+            .map(|re| {
+                RegexBuilder::new(re)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| anyhow!("Invalid 'contains' /{}/: {}", re, e))
+            })
+            .transpose()?;
+
         let repo_path = self.get_repo_path(repo)?;
         let symbols = self
             .symbols
             .get(repo)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
-        // Find matching symbol
-        let symbol = symbols
+        // Every symbol the name could mean. Picking the first one silently —
+        // which is what this used to do — hands back an arbitrary namesake:
+        // two `Save` methods on different types are one coin flip apart.
+        let namesakes: Vec<&Symbol> = symbols
             .iter()
-            .find(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
-            .ok_or_else(|| {
-                anyhow!(
-                    "Symbol '{}' not found in repository '{}'",
+            .filter(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
+            .collect();
+
+        if namesakes.is_empty() {
+            return Err(self.symbol_not_found_error(repo, symbol_name, &symbols));
+        }
+
+        let candidates: Vec<&Symbol> = namesakes
+            .iter()
+            .copied()
+            .filter(|s| match file {
+                // A suffix match so `models/bank.go` picks out
+                // `internal/models/bank.go` without spelling the whole path.
+                Some(f) => s.file_path == f || s.file_path.ends_with(&format!("/{f}")),
+                None => true,
+            })
+            .filter(|s| match receiver {
+                Some(r) => s
+                    .qualified_name
+                    .as_deref()
+                    .is_some_and(|q| q == format!("{r}::{}", s.name)),
+                None => true,
+            })
+            .collect();
+
+        let symbol = match candidates.first() {
+            Some(symbol) => *symbol,
+            None => {
+                anyhow::bail!(
+                    "No '{}' matches file={:?} receiver={:?} in repository '{}'. \
+                     Candidates: {}",
                     symbol_name,
-                    repo
-                )
-            })?;
+                    file.unwrap_or("<any>"),
+                    receiver.unwrap_or("<any>"),
+                    repo,
+                    namesakes
+                        .iter()
+                        .map(|s| format!(
+                            "{} ({})",
+                            s.qualified_name.as_deref().unwrap_or(&s.name),
+                            symbol_location(s)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+            }
+        };
 
         let file_path = validate_path(&repo_path, &symbol.file_path)?;
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
@@ -1793,9 +2140,30 @@ impl CodeIntelEngine {
             "**Lines**: {}-{}\n",
             symbol.start_line, symbol.end_line
         ));
-        output.push_str(&format!("**Kind**: {:?}\n\n", symbol.kind));
+        output.push_str(&format!("**Kind**: {:?}\n", symbol.kind));
+        if let Some(qualified) = &symbol.qualified_name {
+            output.push_str(&format!("**Qualified**: `{}`\n", qualified));
+        }
+        if candidates.len() > 1 {
+            let others = candidates[1..]
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} ({})",
+                        s.qualified_name.as_deref().unwrap_or(&s.name),
+                        symbol_location(s)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            output.push_str(&format!(
+                "**Also defined**: {} — pass 'receiver' or 'file' to pick one\n",
+                others
+            ));
+        }
 
-        output.push_str("```");
+        output.push_str("\n```");
+
         output.push_str(get_language_id(&symbol.file_path));
         output.push('\n');
 
@@ -1811,17 +2179,79 @@ impl CodeIntelEngine {
                 output.push('\n');
             }
         }
+        // Which of the printed lines survive the filters. Context lines around
+        // the symbol are dropped whenever a filter is active — they are there
+        // to orient a full read, not a filtered one.
+        let filtered = outline || contains_re.is_some() || offset > 0 || max_lines > 0;
+        let mut body_seen = 0usize; // body lines that passed outline/contains
+        let mut taken = 0usize; // body lines printed, signature excluded
+        let mut printed = 0usize;
+        let mut skipped = 0usize;
+        let mut last_printed: Option<usize> = None;
+
         for (i, line) in lines[start..end].iter().enumerate() {
             let line_num = start + i + 1;
-            let marker = if line_num >= symbol.start_line && line_num <= symbol.end_line {
-                "→"
-            } else {
-                " "
-            };
+            let in_body = line_num >= symbol.start_line && line_num <= symbol.end_line;
+
+            if filtered && !in_body {
+                continue;
+            }
+
+            if in_body {
+                // The signature line always survives: without it the excerpt
+                // cannot be read at all.
+                let is_signature = line_num == symbol.start_line;
+                let matches = is_signature
+                    || match (&contains_re, outline) {
+                        (Some(re), _) => re.is_match(line),
+                        (None, true) => is_outline_line(line),
+                        (None, false) => true,
+                    };
+                if !matches {
+                    skipped += 1;
+                    continue;
+                }
+                if !is_signature {
+                    body_seen += 1;
+                    if body_seen <= offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    if max_lines > 0 && taken >= max_lines {
+                        skipped += 1;
+                        continue;
+                    }
+                    taken += 1;
+                }
+            }
+
+            // Mark every gap in the printed range, so nobody reads two
+            // adjacent lines as adjacent in the file.
+            if let Some(prev) = last_printed {
+                if line_num > prev + 1 {
+                    output.push_str(&format!("       ⋯ {} line(s)\n", line_num - prev - 1));
+                }
+            }
+
+            let marker = if in_body { "→" } else { " " };
             output.push_str(&format!("{} {:4} │ {}\n", marker, line_num, line));
+            last_printed = Some(line_num);
+            if in_body {
+                printed += 1;
+            }
         }
 
         output.push_str("```\n");
+
+        if skipped > 0 {
+            output.push_str(&format!(
+                "\n*{} of {} body line(s) shown, {} hidden. \
+                 Read a range with get_file(start_line, end_line).*\n",
+                printed,
+                printed + skipped,
+                skipped
+            ));
+        }
 
         Ok(output)
     }
@@ -1980,6 +2410,7 @@ impl CodeIntelEngine {
                 .partial_cmp(&a.relevance_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        let total_matches = results.len();
         results.truncate(max_results);
 
         // Collect dependent files for smart invalidation
@@ -1987,7 +2418,15 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Search Results for: `{}`\n\n", query));
-        output.push_str(&format!("Found {} results\n\n", results.len()));
+        if total_matches > results.len() {
+            output.push_str(&format!(
+                "Showing {} of {} matching lines (ranked; raise `max_results` or narrow `file_pattern` to see the rest)\n\n",
+                results.len(),
+                total_matches
+            ));
+        } else {
+            output.push_str(&format!("Found {} results\n\n", total_matches));
+        }
 
         for (i, result) in results.iter().enumerate() {
             output.push_str(&format!("## {}. `{}`\n", i + 1, result.file_path));
@@ -3524,13 +3963,7 @@ impl CodeIntelEngine {
         let symbol = symbols
             .iter()
             .find(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
-            .ok_or_else(|| {
-                anyhow!(
-                    "Symbol '{}' not found in repository '{}'",
-                    symbol_name,
-                    repo
-                )
-            })?;
+            .ok_or_else(|| self.symbol_not_found_error(repo, symbol_name, &symbols))?;
 
         // Create symbol ID
         let symbol_id = format!("{}::{}", symbol.file_path, symbol.name);

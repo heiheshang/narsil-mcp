@@ -601,6 +601,7 @@ fn symbol_kind_to_rdf_class(kind: &SymbolKind) -> &'static str {
         SymbolKind::Field => "Variable",
         SymbolKind::Parameter => "Variable",
         SymbolKind::TypeAlias => "Symbol",
+        SymbolKind::TestCase => "Symbol",
         SymbolKind::Implementation => "Symbol",
         SymbolKind::Macro => "Symbol",
         SymbolKind::Unknown => "Symbol",

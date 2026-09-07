@@ -301,6 +301,98 @@ impl<'a> CallCtx<'a> {
     }
 }
 
+/// Shared with the symbol parser, which labels methods with the same owner
+/// the call graph resolves calls against.
+pub(crate) fn is_type_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "trait_item"
+            | "class_definition"
+            | "class_declaration"
+            | "class_specifier"
+            | "struct_declaration"
+            | "struct_specifier"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "trait_declaration"
+            | "object_declaration"
+            | "protocol_declaration"
+            | "extension_declaration"
+            // Ruby
+            | "class"
+            | "module"
+    )
+}
+
+/// First type name in a subtree: `*Server` -> `Server`, `Store[T]` ->
+/// `Store`. Falls back to a plain identifier for grammars without a
+/// dedicated type node (Ruby constants, Python class names).
+pub(crate) fn first_type_identifier(node: Node, source: &[u8]) -> Option<String> {
+    fn walk(node: Node, kinds: &[&str], out: &mut Option<String>, source: &[u8]) {
+        if out.is_some() {
+            return;
+        }
+        if kinds.contains(&node.kind()) {
+            *out = node.utf8_text(source).ok().map(|s| s.to_string());
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, kinds, out, source);
+        }
+    }
+
+    let mut found = None;
+    walk(node, &["type_identifier"], &mut found, source);
+    if found.is_none() {
+        walk(
+            node,
+            &["identifier", "constant", "simple_identifier", "name"],
+            &mut found,
+            source,
+        );
+    }
+    found
+}
+
+/// The type a function is defined on, or `None` for a free function.
+///
+/// Go keeps it in the method's `receiver` field; every other supported
+/// language nests the function inside the `impl`/class/trait that owns it.
+pub(crate) fn extract_receiver_type(node: Node, source: &[u8]) -> Option<String> {
+    if let Some(receiver) = node.child_by_field_name("receiver") {
+        if let Some(name) = first_type_identifier(receiver, source) {
+            return Some(name);
+        }
+    }
+
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "impl_item" {
+            // Rust: `impl Foo` and `impl Trait for Foo` both own `Foo`.
+            return current
+                .child_by_field_name("type")
+                .and_then(|owner| first_type_identifier(owner, source));
+        }
+        if is_type_declaration(current.kind()) {
+            if let Some(name) = current
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok().map(|s| s.to_string()))
+            {
+                return Some(name);
+            }
+            // Python's root node is also called `module`; unlike Ruby's it
+            // names no type, so the walk continues past it.
+            if current.kind() != "module" {
+                return first_type_identifier(current, source);
+            }
+        }
+        ancestor = current.parent();
+    }
+    None
+}
+
 impl CallGraph {
     pub fn new() -> Self {
         Self {
@@ -469,96 +561,6 @@ impl CallGraph {
     }
 
     /// Kinds that declare a type whose body holds methods.
-    fn is_type_declaration(kind: &str) -> bool {
-        matches!(
-            kind,
-            "trait_item"
-                | "class_definition"
-                | "class_declaration"
-                | "class_specifier"
-                | "struct_declaration"
-                | "struct_specifier"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "trait_declaration"
-                | "object_declaration"
-                | "protocol_declaration"
-                | "extension_declaration"
-                // Ruby
-                | "class"
-                | "module"
-        )
-    }
-
-    /// First type name in a subtree: `*Server` -> `Server`, `Store[T]` ->
-    /// `Store`. Falls back to a plain identifier for grammars without a
-    /// dedicated type node (Ruby constants, Python class names).
-    fn first_type_identifier(node: Node, source: &[u8]) -> Option<String> {
-        fn walk(node: Node, kinds: &[&str], out: &mut Option<String>, source: &[u8]) {
-            if out.is_some() {
-                return;
-            }
-            if kinds.contains(&node.kind()) {
-                *out = node.utf8_text(source).ok().map(|s| s.to_string());
-                return;
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk(child, kinds, out, source);
-            }
-        }
-
-        let mut found = None;
-        walk(node, &["type_identifier"], &mut found, source);
-        if found.is_none() {
-            walk(
-                node,
-                &["identifier", "constant", "simple_identifier", "name"],
-                &mut found,
-                source,
-            );
-        }
-        found
-    }
-
-    /// The type a function is defined on, or `None` for a free function.
-    ///
-    /// Go keeps it in the method's `receiver` field; every other supported
-    /// language nests the function inside the `impl`/class/trait that owns it.
-    fn extract_receiver_type(node: Node, source: &[u8]) -> Option<String> {
-        if let Some(receiver) = node.child_by_field_name("receiver") {
-            if let Some(name) = Self::first_type_identifier(receiver, source) {
-                return Some(name);
-            }
-        }
-
-        let mut ancestor = node.parent();
-        while let Some(current) = ancestor {
-            if current.kind() == "impl_item" {
-                // Rust: `impl Foo` and `impl Trait for Foo` both own `Foo`.
-                return current
-                    .child_by_field_name("type")
-                    .and_then(|owner| Self::first_type_identifier(owner, source));
-            }
-            if Self::is_type_declaration(current.kind()) {
-                if let Some(name) = current
-                    .child_by_field_name("name")
-                    .and_then(|name| name.utf8_text(source).ok().map(|s| s.to_string()))
-                {
-                    return Some(name);
-                }
-                // Python's root node is also called `module`; unlike Ruby's it
-                // names no type, so the walk continues past it.
-                if current.kind() != "module" {
-                    return Self::first_type_identifier(current, source);
-                }
-            }
-            ancestor = current.parent();
-        }
-        None
-    }
-
     fn try_extract_function(&self, node: Node, source: &[u8], path: &str) -> Option<CallNode> {
         let kind = node.kind();
 
@@ -593,7 +595,7 @@ impl CallGraph {
             line: node.start_position().row + 1,
             calls: Vec::new(),
             metrics,
-            receiver: Self::extract_receiver_type(node, source),
+            receiver: extract_receiver_type(node, source),
             result_type: Self::extract_result_type(node, source),
         })
     }
@@ -1047,7 +1049,7 @@ impl CallGraph {
                     | "singleton_method"
             ) {
                 if let Some(name) = extract_function_name(node, source) {
-                    let receiver = Self::extract_receiver_type(node, source);
+                    let receiver = extract_receiver_type(node, source);
                     scope.function =
                         Some(Self::definition_key(file.path, receiver.as_deref(), &name));
                     scope.receiver = receiver;

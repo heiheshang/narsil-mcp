@@ -343,12 +343,12 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
+                    "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "field", "test", "all"], "description": "Type of symbol to find (default: all). 'field' = struct fields (Go); 'test' = named test cases (Go t.Run, JS describe/it/test), whose line range covers the whole case block"},
                     "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex — use 'name_regex' for that."},
                     "query": {"type": "string", "description": "Alias for 'pattern'"},
                     "name": {"type": "string", "description": "Alias for 'pattern'"},
                     "name_regex": {"type": "string", "description": "Regex (case-insensitive) matched against symbol names, e.g. '^On[A-Z]' or 'Handler$'. Combine with 'pattern' to AND both; omit 'pattern' to match by shape alone."},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py'); a bare filename matches at any depth"},
+                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py', '**/*.{go,proto}'); a bare filename matches at any depth"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
                     "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated. Pass 0 for no limit — a genuine full enumeration."},
                     "max_results": {"type": "integer", "description": "Alias for 'limit'"},
@@ -362,7 +362,7 @@ lazy_static! {
 
         map.insert("get_symbol_definition", ToolMetadata {
             name: "get_symbol_definition",
-            description: "Get the full definition of a symbol with surrounding context. Returns the source code with line numbers.",
+            description: "Get the full definition of a symbol with surrounding context. Namesakes are reported and can be picked apart with 'file' or 'receiver'. Returns the source code with line numbers. For a large body, narrow it instead of reading it whole: 'outline' for the control-flow skeleton, 'contains' to keep only matching lines, 'offset'/'max_lines' to page through it.",
             category: ToolCategory::Symbols,
             tags: ["symbol", "definition", "source", "context"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -374,7 +374,13 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Fully qualified symbol name (e.g., 'MyStruct', 'module::function')"},
                     "function": {"type": "string", "description": "Alias for 'symbol'"},
-                    "context_lines": {"type": "integer", "description": "Number of context lines before/after (default: 5)"}
+                    "context_lines": {"type": "integer", "description": "Number of context lines before/after (default: 5; ignored when outline/contains/offset/max_lines narrow the body)"},
+                    "outline": {"type": "boolean", "description": "Print only the control-flow skeleton of the body — signature plus if/switch/case/for/return lines — with the gaps marked. Use on long functions to find the line range worth reading."},
+                    "contains": {"type": "string", "description": "Case-insensitive regex; only body lines matching it are printed (plus the signature). A grep scoped to one symbol."},
+                    "offset": {"type": "integer", "description": "Skip this many body lines before printing (default: 0)"},
+                    "max_lines": {"type": "integer", "description": "Print at most this many body lines (default: 0 = no cap)"},
+                    "file": {"type": "string", "description": "Disambiguate namesakes by file — a full repo-relative path or a suffix of one, e.g. 'models/bank.go'"},
+                    "receiver": {"type": "string", "description": "Disambiguate namesakes by owning type: the Go receiver, Rust impl type, or class that declares the method, e.g. receiver 'PaymentStore' for 'Save'"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -495,7 +501,7 @@ lazy_static! {
 
         map.insert("search_code", ToolMetadata {
             name: "search_code",
-            description: "Semantic and keyword search across code. Returns ranked excerpts with surrounding context.",
+            description: "Case-insensitive substring search across code (no regex). Matches are ranked - declaration lines outrank call sites - and truncated to max_results. For call sites of a known identifier use find_symbol_usages or find_references.",
             category: ToolCategory::Search,
             tags: ["search", "code", "keyword", "semantic"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -504,11 +510,11 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query - can be natural language or code pattern"},
+                    "query": {"type": "string", "description": "Literal text to look for; matched as a case-insensitive substring, not as a regex"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
-                    "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md'; a bare filename matches at any depth"},
+                    "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md', '**/*.{json,md,yml}'; a bare filename matches at any depth. Narrowing here beats raising max_results when the wanted hit is out-ranked"},
                     "path": {"type": "string", "description": "Alias for 'file_pattern'"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10); the header reports how many lines matched in total when the list was cut"},
                     "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },

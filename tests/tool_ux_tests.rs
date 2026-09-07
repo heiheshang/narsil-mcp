@@ -186,6 +186,32 @@ async fn search_code_path_alias_with_bare_filename() -> Result<()> {
 }
 
 #[tokio::test]
+async fn search_code_reports_matches_hidden_by_truncation() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let body: String = (0..20)
+        .map(|i| format!("call needle_marker at step {i}\n"))
+        .collect();
+    repo.add_file("docs/many.md", &body)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "needle_marker", "max_results": 3}),
+        )
+        .await?;
+
+    // The count must describe what matched, not what survived the cut.
+    assert!(
+        out.contains("Showing 3 of 20"),
+        "truncation was reported as a complete result:\n{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn search_code_invalid_glob_is_an_error() -> Result<()> {
     let repo = TestRepo::new()?;
     repo.add_file("a.md", "needle\n")?;
@@ -560,6 +586,328 @@ async fn oversized_files_skipped_from_index() -> Result<()> {
         .await?;
     assert!(out.contains("small.md"), "{out}");
     assert!(!out.contains("huge.md"), "oversized file indexed:\n{out}");
+    Ok(())
+}
+
+/// A symbol listing without the end line forces the caller to guess where a
+/// body stops (or shell out to `sed`); the range is what feeds `get_file`.
+#[tokio::test]
+async fn find_symbols_reports_line_range() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/lib.rs",
+        r#"pub fn spans_several_lines() {
+    let a = 1;
+    let b = 2;
+    println!("{a}{b}");
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "spans_several_lines"}),
+        )
+        .await?;
+    assert!(
+        out.contains("src/lib.rs:1-5"),
+        "no end line in the listing:\n{out}"
+    );
+
+    let compact = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "spans_several_lines", "compact": true}),
+        )
+        .await?;
+    assert!(
+        compact.contains("src/lib.rs:1-5"),
+        "no end line in compact mode:\n{compact}"
+    );
+    Ok(())
+}
+
+/// A bare "not found" costs another round trip. The error must name the
+/// symbols that nearly matched.
+#[tokio::test]
+async fn get_symbol_definition_suggests_near_misses() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/lib.rs",
+        "pub struct PaymentSnapshotBank { pub name: String }\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // Wrong case.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "paymentsnapshotbank"}),
+        )
+        .await
+        .expect_err("unknown symbol must fail");
+    assert!(
+        err.to_string().contains("PaymentSnapshotBank"),
+        "no candidate offered: {err}"
+    );
+
+    // Wrong qualifier, right last segment.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "models::PaymentSnapshotBank"}),
+        )
+        .await
+        .expect_err("unknown symbol must fail");
+    assert!(
+        err.to_string().contains("src/lib.rs:1"),
+        "candidate without a location: {err}"
+    );
+
+    // Nothing close: still actionable, no bogus suggestion.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Zzzzz"}),
+        )
+        .await
+        .expect_err("unknown symbol must fail");
+    assert!(
+        err.to_string().contains("find_symbols"),
+        "no way forward offered: {err}"
+    );
+    Ok(())
+}
+
+/// A 400-line function has to be readable in pieces, or callers fall back to
+/// `sed`. `outline`, `contains` and `offset`/`max_lines` are those pieces.
+#[tokio::test]
+async fn get_symbol_definition_narrows_large_bodies() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/exec.go",
+        r#"package exec
+
+func ExecuteLineItem(rail string) error {
+	total := 0
+	total = total + 1
+	switch rail {
+	case "eft":
+		return runEft()
+	case "payshape":
+		return runPayshape()
+	}
+	return nil
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let outline = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "outline": true}),
+        )
+        .await?;
+    assert!(
+        outline.contains("switch rail") && outline.contains("case \"payshape\""),
+        "outline dropped the control flow:\n{outline}"
+    );
+    assert!(
+        !outline.contains("total := 0"),
+        "outline kept straight-line code:\n{outline}"
+    );
+    assert!(
+        outline.contains("func ExecuteLineItem"),
+        "outline dropped the signature:\n{outline}"
+    );
+    assert!(outline.contains('⋯'), "gaps not marked:\n{outline}");
+
+    let grepped = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "contains": "payshape"}),
+        )
+        .await?;
+    assert!(
+        grepped.contains("runPayshape") && !grepped.contains("runEft()"),
+        "contains did not scope to matching lines:\n{grepped}"
+    );
+
+    let paged = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "offset": 1, "max_lines": 2}),
+        )
+        .await?;
+    assert!(
+        paged.contains("total = total + 1") && !paged.contains("total := 0"),
+        "offset not applied:\n{paged}"
+    );
+    assert!(
+        !paged.contains("return nil"),
+        "max_lines not applied:\n{paged}"
+    );
+    assert!(
+        paged.contains("hidden"),
+        "hidden lines not reported:\n{paged}"
+    );
+
+    // A bad regex must fail loudly rather than match nothing.
+    registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "contains": "("}),
+        )
+        .await
+        .expect_err("invalid 'contains' regex must be an error");
+    Ok(())
+}
+
+/// Two methods with one name used to be a coin flip: the lookup returned
+/// whichever was parsed first, with nothing in the output to say so.
+#[tokio::test]
+async fn get_symbol_definition_disambiguates_namesakes() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "internal/payment/store.go",
+        r#"package payment
+
+type PaymentStore struct{}
+
+func (s *PaymentStore) Save() error {
+	return savePayment()
+}
+"#,
+    )?;
+    repo.add_file(
+        "internal/audit/store.go",
+        r#"package audit
+
+type AuditStore struct{}
+
+func (s *AuditStore) Save() error {
+	return saveAudit()
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // Ambiguous lookup: still answers, but says what else it could have meant.
+    let ambiguous = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save"}),
+        )
+        .await?;
+    assert!(
+        ambiguous.contains("Also defined"),
+        "namesake not reported:\n{ambiguous}"
+    );
+
+    // By receiver.
+    let by_receiver = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "AuditStore"}),
+        )
+        .await?;
+    assert!(
+        by_receiver.contains("saveAudit") && !by_receiver.contains("savePayment"),
+        "receiver ignored:\n{by_receiver}"
+    );
+    assert!(
+        !by_receiver.contains("Also defined"),
+        "a single match must not report namesakes:\n{by_receiver}"
+    );
+
+    // By file suffix.
+    let by_file = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "payment/store.go"}),
+        )
+        .await?;
+    assert!(
+        by_file.contains("savePayment"),
+        "file suffix ignored:\n{by_file}"
+    );
+
+    // The qualified name is itself a lookup key.
+    let by_qualified = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "AuditStore::Save"}),
+        )
+        .await?;
+    assert!(
+        by_qualified.contains("saveAudit") && !by_qualified.contains("savePayment"),
+        "qualified name did not resolve:\n{by_qualified}"
+    );
+
+    // A filter that matches nothing lists what was available.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "LedgerStore"}),
+        )
+        .await
+        .expect_err("no match for the given receiver must be an error");
+    assert!(
+        err.to_string().contains("AuditStore::Save"),
+        "candidates not listed: {err}"
+    );
+    Ok(())
+}
+
+/// The listing prints qualified names, so a qualified name pasted back into
+/// `pattern` must find its symbol.
+#[tokio::test]
+async fn find_symbols_matches_qualified_names() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "store.go",
+        r#"package store
+
+type PaymentStore struct{}
+
+func (s *PaymentStore) Save() error { return nil }
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "PaymentStore::Save"}),
+        )
+        .await?;
+    assert!(
+        out.contains("PaymentStore::Save"),
+        "qualified pattern found nothing:\n{out}"
+    );
     Ok(())
 }
 

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::{CodeIntelEngine, FindSymbolsQuery};
+use crate::index::{CodeIntelEngine, FindSymbolsQuery, SymbolDefinitionQuery};
 
 /// Handler for find_symbols tool
 pub struct FindSymbolsHandler;
@@ -41,11 +41,18 @@ impl ToolHandler for GetSymbolDefinitionHandler {
     }
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
-        let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str_any(&["symbol", "function"]).unwrap_or("");
-        let context_lines = args.get_u64_or("context_lines", 5) as usize;
         engine
-            .get_symbol_definition(repo, symbol, context_lines)
+            .get_symbol_definition(SymbolDefinitionQuery {
+                repo: args.get_str("repo").unwrap_or(""),
+                symbol: args.get_str_any(&["symbol", "function"]).unwrap_or(""),
+                context_lines: args.get_u64_or("context_lines", 5) as usize,
+                outline: args.get_bool_or("outline", false),
+                contains: args.get_str("contains"),
+                offset: args.get_u64_or("offset", 0) as usize,
+                max_lines: args.get_u64_or("max_lines", 0) as usize,
+                file: args.get_str("file"),
+                receiver: args.get_str("receiver"),
+            })
             .await
     }
 }

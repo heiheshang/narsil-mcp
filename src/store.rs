@@ -417,6 +417,7 @@ fn kind_str(kind: &SymbolKind) -> &'static str {
         Variable => "Variable",
         Field => "Field",
         Parameter => "Parameter",
+        TestCase => "TestCase",
         Implementation => "Implementation",
         Macro => "Macro",
         Unknown => "Unknown",

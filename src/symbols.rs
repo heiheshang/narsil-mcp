@@ -33,6 +33,14 @@ pub enum SymbolKind {
     Implementation,
     Macro,
     Unknown,
+
+    // Variants are serialised by ordinal (postcard, in `store.rs`), so a new
+    // one goes at the end: inserting it anywhere else silently reinterprets
+    // every symbol a previous version persisted.
+    /// A named test case inside a test function: Go's `t.Run("...")`, a
+    /// JS/TS `describe`/`it`/`test` block. Indexed as its own symbol so the
+    /// case's line range can be looked up like any other definition.
+    TestCase,
 }
 
 impl SymbolKind {
@@ -77,6 +85,7 @@ impl SymbolKind {
             SymbolKind::Field => "🔷",
             SymbolKind::Parameter => "📥",
             SymbolKind::Implementation => "⚙️",
+            SymbolKind::TestCase => "🧪",
             SymbolKind::Macro => "🎯",
             SymbolKind::Unknown => "❓",
         }
