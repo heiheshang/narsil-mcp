@@ -18,6 +18,8 @@ Execute the following steps:
 
 4. **Find main components**:
    - Use `find_symbols` with `symbol_type="class"` to find main data structures
+     (Go and Rust declare them as `struct`, and interfaces as `interface` —
+     run the type that matches the language, not `class` alone)
    - Use `find_symbols` with `symbol_type="function"` and `pattern="*main*"` to find entry points
 
 5. **Understand dependencies**: Use `get_import_graph` to show how modules connect

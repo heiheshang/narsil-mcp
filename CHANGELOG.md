@@ -36,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   figures come from `get_index_status`, and that is now written down in the
   skill rather than discovered by a failed call.
 
+- **Skills name the two ways an empty result lies.** Two wrong conclusions came
+  up repeatedly in real sessions, both from tools behaving exactly as
+  documented. `find_symbols` matches one name or pattern, and `search_code`
+  matches one substring including its spaces, so a query built from two
+  identifiers or a sentence returns zero while every term is indexed — neither
+  is an AND over words. And a checkout outside `--repos` (a git worktree, a
+  second clone) is absent rather than stale, however fresh the index is, while
+  test files and test-helper packages *are* indexed like any source. The
+  `narsil-search` skill grows a "One name per lookup, not a phrase" section and
+  three anti-patterns; `narsil-repo-state` grows a fifth cause of an empty
+  answer — which checkout was indexed — plus the note that repeating the
+  primary's directory name in a worktree path leaves two repositories
+  contending for one `repo` value.
+
 - **Methods carry their owning type.** Symbols were indexed under a bare name
   with `qualified_name` always empty, so a Go method's receiver, a Rust `impl`
   type and a class name were all lost: `Save` looked the same whichever type

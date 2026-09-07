@@ -16,6 +16,7 @@ Goal: Understand structure and main components.
    → See top-level directory structure
 
 3. find_symbols(repo, symbol_type="class", file_pattern="src/**/*")
+   (Go/Rust: symbol_type="struct", plus "interface"; "type" now means alias only)
    → Find main data structures
 
 4. find_symbols(repo, symbol_type="function", pattern="*main*")
@@ -398,7 +399,9 @@ Requires `--remote` flag and `GITHUB_TOKEN` env var.
 
 | Scenario | Tool | Why |
 |----------|------|-----|
-| Know exact function name | `find_symbols` | Direct lookup |
+| Know exact function name | `find_symbols` | Direct lookup; results print `file:start-end` |
+| Know the method and its type | `find_symbols` | Qualified names are indexed: `pattern="Store::Save"` |
+| Know a test case's name | `find_symbols` | `symbol_type="test"` gives the case block's line range |
 | Know partial name | `workspace_symbol_search` | Fuzzy matching |
 | Searching for concept | `hybrid_search` | Semantic understanding |
 | Have code to match | `find_similar_code` | Pattern similarity |
@@ -428,3 +431,8 @@ Requires `--remote` flag and `GITHUB_TOKEN` env var.
 3. **Batch related queries** - Call multiple tools in parallel when independent
 4. **Check feature status first** - Use `get_index_status` to avoid wasted calls
 5. **Use excerpts over full files** - `get_excerpt` is faster than `get_file` for specific lines
+6. **Narrow a symbol, don't page it** - `get_symbol_definition(outline=true)` for the shape of a
+   long function, `contains="..."` for the lines mentioning something, `offset`/`max_lines` to page.
+   `find_symbols` already prints `file:start-end`, so a range read needs no extra lookup
+7. **Disambiguate before reading** - a `**Also defined**` line means the name is ambiguous;
+   re-ask with `receiver="TypeName"` or `file="pkg/file.go"` instead of trusting the first hit

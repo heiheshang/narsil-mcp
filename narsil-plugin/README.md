@@ -25,7 +25,7 @@ where to stop:
 
 | Skill | Covers |
 |-------|--------|
-| `narsil-search` | Locating code by name, string or description; choosing between `search_code`, `hybrid_search`, `neural_search` |
+| `narsil-search` | Locating code by name, string or description; choosing between `search_code`, `hybrid_search`, `neural_search`; reading a long symbol without reading all of it |
 | `narsil-callgraph` | Callers/callees/reachability, qualified method queries, reading the per-edge resolution markers |
 | `narsil-static-analysis` | Control/data flow, dead code, unused exports, type inference, import cycles |
 | `narsil-security` | Vulnerability scans, taint tracing, dependency CVEs, licences, SBOM |
