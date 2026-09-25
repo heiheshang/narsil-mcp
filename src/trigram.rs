@@ -257,6 +257,13 @@ impl TrigramIndex {
         let mut out = Vec::new();
         while stream.advance() {
             let t = &stream.token().text;
+            // A space in the needle stands for any whitespace run in the file
+            // (`search_code` collapses both sides), so a gram spanning one may
+            // be spelled differently in a file that matches. Only whitespace-
+            // free grams are safe to require.
+            if t.chars().any(char::is_whitespace) {
+                continue;
+            }
             if !out.iter().any(|g| g == t) {
                 out.push(t.clone());
             }
@@ -395,6 +402,20 @@ mod tests {
         // The whole reason a token index cannot answer this.
         let idx = populated();
         assert_eq!(idx.candidates("r", "path: &str").unwrap(), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn grams_spanning_whitespace_are_not_required() {
+        // `search_code` lets one space in the needle match any whitespace run,
+        // so a file aligned with two spaces or a tab is still a hit.
+        let idx = TrigramIndex::in_memory().unwrap();
+        idx.add_file("r", "q.sql", "WHERE  status\t= 'new'");
+        assert_eq!(
+            idx.candidates("r", "where status = 'new'").unwrap(),
+            vec!["q.sql"]
+        );
+        // Nothing but whitespace-spanning grams: no opinion, scan everything.
+        assert!(idx.candidates("r", "a b").is_none());
     }
 
     #[test]

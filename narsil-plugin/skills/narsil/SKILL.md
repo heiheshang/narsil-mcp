@@ -87,7 +87,7 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 |------|-----------|-------------|
 | Find files by name | `find_symbols` with `file_pattern` | Know filename pattern |
 | Find function/class definitions | `find_symbols` | Know symbol type (`function`, `method`, `struct`, `class`, `interface`, `enum`, `trait`, `type`, `field`, `test`) |
-| Find named test cases | `find_symbols` with `symbol_type="test"` | Go `t.Run("...")`, JS/TS `describe`/`it`/`test`; the symbol spans the whole case block |
+| Find named test cases | `find_symbols` with `symbol_type="test"` | Go `t.Run`, goblin/Ginkgo `Describe`/`It`, `It…` wrappers; JS/TS `describe`/`it`/`test`; the symbol spans the whole case block |
 | Search by content | `search_code` | Case-insensitive substring; ranked, and declarations outrank call sites - see the `narsil-search` skill |
 | Where an identifier is used | `find_symbol_usages` / `find_references` | Call sites; do not hunt them with `search_code` |
 | BM25-ranked search | `semantic_search` | Better ranking than search_code; `repo` scopes it to one repository |

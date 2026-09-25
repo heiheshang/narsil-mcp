@@ -183,6 +183,13 @@ impl LanguageParser {
                 name: "go".to_string(),
                 language: tree_sitter_go::LANGUAGE.into(),
                 extensions: vec!["go"],
+                // Test cases: `t.Run("...")`, goblin's `g.Describe`/`g.It`, and
+                // Ginkgo's dot-imported `Describe`/`Context`/`It`. `It`/`Describe`
+                // also admit an uppercase continuation, so project wrappers such
+                // as `ItRecover` count while `Items`/`Itoa` do not; a wrapper may
+                // take the suite (`g`, `t`) first and the name second. `Run` stays
+                // exact in selector form and is absent in bare form: `RunQuery("...")`
+                // and `Run("...")` are ordinary calls far more often than tests.
                 symbol_query: r#"
                     (function_declaration name: (identifier) @function.name) @function.def
                     (method_declaration name: (field_identifier) @method.name) @method.def
@@ -193,8 +200,16 @@ impl LanguageParser {
                     (field_declaration name: (field_identifier) @field.name) @field.def
                     (call_expression
                       function: (selector_expression field: (field_identifier) @_run)
-                      arguments: (argument_list . (interpreted_string_literal) @test.name)
-                      (#eq? @_run "Run")) @test.def
+                      arguments: (argument_list . [(interpreted_string_literal) (raw_string_literal)] @test.name)
+                      (#match? @_run "^(Run|Context|When|Specify|(It|Describe)([A-Z][A-Za-z0-9_]*)?)$")) @test.def
+                    (call_expression
+                      function: (identifier) @_case
+                      arguments: (argument_list . [(interpreted_string_literal) (raw_string_literal)] @test.name)
+                      (#match? @_case "^(Context|When|Specify|(It|Describe)([A-Z][A-Za-z0-9_]*)?)$")) @test.def
+                    (call_expression
+                      function: [(identifier) @_wrap (selector_expression field: (field_identifier) @_wrap)]
+                      arguments: (argument_list . (identifier) . [(interpreted_string_literal) (raw_string_literal)] @test.name)
+                      (#match? @_wrap "^(It|Describe)[A-Z][A-Za-z0-9_]*$")) @test.def
                 "#,
             },
             // C
@@ -1759,6 +1774,56 @@ func TestWithdraw(t *testing.T) {
             .symbols
             .iter()
             .any(|s| s.name == "TestWithdraw" && s.kind == SymbolKind::Function));
+
+        // goblin, Ginkgo and a project wrapper over goblin's `It`.
+        let bdd = r#"
+package api
+
+func TestRecover(t *testing.T) {
+    g := goblin.Goblin(t)
+    g.Describe("recovery", func() {
+        g.It("resends stuck operations", func() {})
+        ItRecover(g, "cancels after timeout", func() {})
+    })
+}
+
+var _ = Describe("ledger", func() {
+    Context(`with zero amount`, func() {
+        It("rejects", func() {})
+    })
+})
+
+func helpers() {
+    strconv.Itoa(1)
+    Items("not a test")
+    RunQuery("SELECT 1")
+    Run("not a test either")
+    key := ContextKey("user")
+}
+"#;
+        let parsed = parser.parse_file(Path::new("r_test.go"), bdd).unwrap();
+        let names: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TestCase)
+            .map(|s| s.name.as_str())
+            .collect();
+        for want in [
+            "recovery",
+            "resends stuck operations",
+            "cancels after timeout",
+            "ledger",
+            "with zero amount",
+            "rejects",
+        ] {
+            assert!(names.contains(&want), "{want:?} not indexed: {names:?}");
+        }
+        for unwanted in ["not a test", "SELECT 1", "not a test either", "user"] {
+            assert!(
+                !names.contains(&unwanted),
+                "ordinary call {unwanted:?} indexed as a test case: {names:?}"
+            );
+        }
 
         let js = r#"
 describe("withdrawals", () => {

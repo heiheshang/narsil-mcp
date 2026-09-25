@@ -157,6 +157,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`file` on `get_symbol_definition` / `find_symbol_usages` accepts a fragment
+  of the path.** It compared whole trailing path segments only, so
+  `file: "airtime"` rejected `internal/airtime/airtime_operation.go` — in one
+  review session that was four of the five failed calls. A path or a
+  whole-segment suffix still wins when it matches (`store.go` does not also
+  pick `ledger_store.go`); only when neither does is the argument taken as a
+  case-insensitive fragment.
+
+- **`search_code` ignores whitespace width.** A space in the query now matches
+  any run of spaces or tabs, so a pasted SQL fragment is found whatever the
+  file's alignment. The trigram filter no longer requires grams that span
+  whitespace, which would otherwise have ruled such files out before the scan.
+
+- **Go test cases beyond `t.Run`.** `symbol_type: "test"` now covers goblin
+  (`g.Describe`, `g.It`), Ginkgo (`Describe`, `Context`, `When`, `It`,
+  `Specify`) and project wrappers named `It…`/`Describe…`, including the
+  `ItRecover(g, "name", …)` shape where the suite comes first. Raw-string names
+  count too. Existing indexes need a `reindex` to pick these up.
+
 - **`find_symbol_usages` resolves qualified methods.** It used to grep for the
   full query string (`PaymentStore::Save`), so definitions and usages were both
   empty after pasting a qualified name from `find_symbols`. It now shares

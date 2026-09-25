@@ -43,7 +43,7 @@ your `repo` value points at.
 | A known function to find look-alikes of | `find_similar_to_symbol` | Refactoring candidates |
 | Need function/class boundaries, not lines | `search_chunks` | AST-aware chunks |
 | A file whose name you know | `find_symbols` with `file_pattern` | Cheaper than any search |
-| A named test case | `find_symbols` with `symbol_type: "test"` | Go `t.Run("...")`, JS/TS `describe`/`it`/`test`; the line range covers the whole case block |
+| A named test case | `find_symbols` with `symbol_type: "test"` | Go `t.Run`, goblin `g.Describe`/`g.It`, Ginkgo `Describe`/`Context`/`It`, wrappers named `It…`/`Describe…` (`ItRecover(g, "...")`); JS/TS `describe`/`it`/`test`; the line range covers the whole case block. Any other helper is invisible here — fall back to `search_code` on the case name |
 
 ## One name per lookup, not a phrase
 
@@ -51,8 +51,11 @@ your `repo` value points at.
 pattern. Two identifiers in one string match nothing: `"BeneficiaryService
 CreateDestination"` returns zero while `NewBeneficiaryService` and
 `CreateDestination` are both indexed. `search_code` has the same shape for a
-different reason — its substring includes the spaces, so a multi-word query only
-hits a line carrying that exact phrase. `"BackfillLegacy stage execution"`
+different reason — its substring includes the words and the spaces between
+them, so a multi-word query only hits a line carrying that phrase. Whitespace
+*width* does not matter (one space in the query matches any run of spaces or
+tabs), but the phrase must sit on one line: SQL broken across lines is found by
+one distinctive line of it, not by the whole statement. `"BackfillLegacy stage execution"`
 returns nothing in a corpus where `backfill_legacy` returns twenty results.
 
 Neither is an AND over terms. When you have several words, either search the one
@@ -130,7 +133,10 @@ with (`**Also defined**: ...`). Do not ignore that line: it means the body you
 are reading may not be the one you meant.
 
 Pick one with `receiver: "AuditStore"` (the owning type) or
-`file: "payment/store.go"` (a path suffix is enough). A filter that matches
+`file: "payment/store.go"`. `file` takes a path, a suffix of one, or — when
+neither matches — any fragment of the path (`file: "airtime"` picks
+`internal/airtime/airtime_operation.go`). A fragment shared by several files
+keeps all of them, and the `**Also defined**` line says so. A filter that matches
 nothing is an error listing the candidates, not a silent fallback to another
 symbol.
 

@@ -379,7 +379,7 @@ lazy_static! {
                     "contains": {"type": "string", "description": "Case-insensitive regex; only body lines matching it are printed (plus the signature). A grep scoped to one symbol."},
                     "offset": {"type": "integer", "description": "Skip this many body lines before printing (default: 0)"},
                     "max_lines": {"type": "integer", "description": "Print at most this many body lines (default: 0 = no cap)"},
-                    "file": {"type": "string", "description": "Disambiguate namesakes by file — a full repo-relative path or a suffix of one, e.g. 'models/bank.go'"},
+                    "file": {"type": "string", "description": "Disambiguate namesakes by file — a repo-relative path, a suffix of one ('models/bank.go'), or failing those any fragment of the path ('bank')"},
                     "receiver": {"type": "string", "description": "Disambiguate namesakes by owning type: the Go receiver, Rust impl type, or class that declares the method, e.g. receiver 'PaymentStore' for 'Save'"}
                 },
                 "required": ["repo", "symbol"]
@@ -448,7 +448,7 @@ lazy_static! {
                     "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "include_imports": {"type": "boolean", "description": "Include import statements (default: true)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
-                    "file": {"type": "string", "description": "Disambiguate namesakes by file path or suffix"},
+                    "file": {"type": "string", "description": "Disambiguate namesakes by file — a path, a suffix of one, or failing those any fragment of the path"},
                     "receiver": {"type": "string", "description": "Disambiguate methods by owning type (Go receiver, Rust impl, class name)"}
                 },
                 "required": ["repo", "symbol"]
@@ -503,7 +503,7 @@ lazy_static! {
 
         map.insert("search_code", ToolMetadata {
             name: "search_code",
-            description: "Case-insensitive substring search across code (no regex). Matches are ranked - declaration lines outrank call sites - and truncated to max_results. For call sites of a known identifier use find_symbol_usages or find_references.",
+            description: "Case-insensitive substring search across code (no regex); a space in the query matches any run of whitespace, so alignment and tabs do not matter. Matches are ranked - declaration lines outrank call sites - and truncated to max_results. For call sites of a known identifier use find_symbol_usages or find_references.",
             category: ToolCategory::Search,
             tags: ["search", "code", "keyword", "semantic"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -512,7 +512,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Literal text to look for; matched as a case-insensitive substring, not as a regex"},
+                    "query": {"type": "string", "description": "Literal text to look for; matched as a case-insensitive substring within one line, not as a regex; each whitespace run matches any whitespace run"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
                     "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md', '**/*.{json,md,yml}'; a bare filename matches at any depth. Narrowing here beats raising max_results when the wanted hit is out-ranked"},
                     "path": {"type": "string", "description": "Alias for 'file_pattern'"},

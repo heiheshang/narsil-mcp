@@ -211,6 +211,44 @@ async fn search_code_reports_matches_hidden_by_truncation() -> Result<()> {
     Ok(())
 }
 
+/// A pasted SQL fragment rarely carries the file's exact alignment; two spaces
+/// against one used to read as "no such code".
+#[tokio::test]
+async fn search_code_ignores_whitespace_width() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "repo/stuck.go",
+        "package repo\n\nconst q = `SELECT id FROM ops\n\tWHERE  status\t=  'new'`\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "where status = 'new'"}),
+        )
+        .await?;
+    assert!(
+        out.contains("stuck.go"),
+        "whitespace width decided the match:\n{out}"
+    );
+
+    let none = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "wherestatus"}),
+        )
+        .await?;
+    assert!(
+        none.contains("Found 0 results"),
+        "whitespace that is absent must not be invented:\n{none}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn search_code_invalid_glob_is_an_error() -> Result<()> {
     let repo = TestRepo::new()?;
@@ -805,6 +843,17 @@ func (s *AuditStore) Save() error {
 }
 "#,
     )?;
+    repo.add_file(
+        "internal/ledger/ledger_store.go",
+        r#"package ledger
+
+type LedgerStore struct{}
+
+func (s *LedgerStore) Save() error {
+	return saveLedger()
+}
+"#,
+    )?;
     let (engine, _idx) = engine_for(&repo).await?;
     let registry = ToolRegistry::new();
 
@@ -851,6 +900,32 @@ func (s *AuditStore) Save() error {
         "file suffix ignored:\n{by_file}"
     );
 
+    // A fragment of the path that is no whole-segment suffix.
+    let by_fragment = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "AUDIT"}),
+        )
+        .await?;
+    assert!(
+        by_fragment.contains("saveAudit") && !by_fragment.contains("Also defined"),
+        "path fragment ignored:\n{by_fragment}"
+    );
+
+    // A fragment shared by both paths leaves both in play.
+    let shared = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "store"}),
+        )
+        .await?;
+    assert!(
+        shared.contains("Also defined"),
+        "a fragment matching both files must keep both:\n{shared}"
+    );
+
     // The qualified name is itself a lookup key.
     let by_qualified = registry
         .dispatch(
@@ -864,12 +939,26 @@ func (s *AuditStore) Save() error {
         "qualified name did not resolve:\n{by_qualified}"
     );
 
+    // A whole-segment suffix outranks the fragment reading of the same text:
+    // `store.go` names the two `store.go` files, not `ledger_store.go`.
+    let by_segment = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "store.go"}),
+        )
+        .await?;
+    assert!(
+        !by_segment.contains("saveLedger") && !by_segment.contains("ledger_store.go"),
+        "segment suffix fell through to a fragment match:\n{by_segment}"
+    );
+
     // A filter that matches nothing lists what was available.
     let err = registry
         .dispatch(
             "get_symbol_definition",
             &engine,
-            json!({"repo": repo.name(), "symbol": "Save", "receiver": "LedgerStore"}),
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "CacheStore"}),
         )
         .await
         .expect_err("no match for the given receiver must be an error");
@@ -987,10 +1076,7 @@ func Caller() { var s PaymentStore; s.Save() }
         out.contains("store.go | 7 | usage"),
         "call site line not listed:\n{out}"
     );
-    assert!(
-        !out.contains("No usages found"),
-        "{out}"
-    );
+    assert!(!out.contains("No usages found"), "{out}");
 
     let with_receiver = registry
         .dispatch(

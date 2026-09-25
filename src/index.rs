@@ -107,7 +107,24 @@ fn expand_braces(pattern: &str) -> std::result::Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod contains_ignore_case_tests {
-    use super::contains_ignore_case;
+    use super::{contains_ignore_case, line_matches, normalize_needle};
+
+    #[test]
+    fn whitespace_runs_in_the_needle_match_any_run_in_the_line() {
+        let needle = normalize_needle("WHERE  status =\t'new'");
+        assert_eq!(needle, "where status = 'new'");
+        assert!(line_matches("    where status = 'new'", &needle));
+        assert!(line_matches("WHERE   status  =  'new' AND", &needle));
+        assert!(line_matches("where\tstatus = 'new'", &needle));
+        // Whitespace must still be present where the needle has it.
+        assert!(!line_matches("wherestatus = 'new'", &needle));
+    }
+
+    #[test]
+    fn needles_without_whitespace_are_unchanged() {
+        assert_eq!(normalize_needle("ZeroAmount"), "zeroamount");
+        assert!(line_matches("if op.ZeroAmount {", "zeroamount"));
+    }
 
     #[test]
     fn matches_regardless_of_case() {
@@ -480,6 +497,70 @@ fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     let n = needle_lower.as_bytes();
     h.windows(n.len())
         .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+}
+
+/// Narrow namesakes by the `file` argument.
+///
+/// A full path or a whole-segment suffix (`payment/store.go`) wins when it
+/// matches anything. Otherwise the argument is taken as a case-insensitive
+/// fragment of the path: agents write `file: "airtime"` for
+/// `internal/airtime/airtime_operation.go`, and demanding the exact tail made
+/// that the most common failed lookup. The precise form goes first so that
+/// `store.go` does not also pick up `audit_store.go`.
+fn filter_by_file<'a>(symbols: Vec<&'a Symbol>, file: Option<&str>) -> Vec<&'a Symbol> {
+    let Some(f) = file else {
+        return symbols;
+    };
+    let f = f.trim_start_matches("./");
+    let suffix = format!("/{f}");
+    let exact: Vec<&Symbol> = symbols
+        .iter()
+        .copied()
+        .filter(|s| s.file_path == f || s.file_path.ends_with(&suffix))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let needle = f.to_lowercase();
+    symbols
+        .into_iter()
+        .filter(|s| s.file_path.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// `search_code`'s needle: lower-cased, every whitespace run collapsed to one
+/// space. A pasted SQL fragment rarely carries the file's exact indentation or
+/// alignment, and a byte-exact match turned "the query has two spaces where the
+/// file has one" into "no such code".
+fn normalize_needle(query: &str) -> String {
+    collapse_whitespace(&query.to_lowercase())
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
+}
+
+/// Line test for a needle from [`normalize_needle`]: a space in the needle
+/// stands for any run of whitespace in the line. Needles without one — the
+/// common case, a single identifier — keep the allocation-free path.
+fn line_matches(line: &str, needle: &str) -> bool {
+    if !needle.contains(' ') {
+        return contains_ignore_case(line, needle);
+    }
+    collapse_whitespace(&line.to_lowercase()).contains(needle)
 }
 
 fn reusable_symbols(persisted: Option<&PersistedIndex>, file_path: &Path) -> Option<Vec<Symbol>> {
@@ -1911,13 +1992,8 @@ impl CodeIntelEngine {
             return Err(self.symbol_not_found_error(repo, symbol_name, symbols));
         }
 
-        let candidates: Vec<&Symbol> = namesakes
-            .iter()
-            .copied()
-            .filter(|s| match file {
-                Some(f) => s.file_path == f || s.file_path.ends_with(&format!("/{f}")),
-                None => true,
-            })
+        let candidates: Vec<&Symbol> = filter_by_file(namesakes.clone(), file)
+            .into_iter()
             .filter(|s| match receiver {
                 Some(r) => s
                     .qualified_name
@@ -2515,7 +2591,7 @@ impl CodeIntelEngine {
             }
         }
 
-        let query_lower = query.to_lowercase();
+        let query_lower = normalize_needle(query);
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
         let mut results: Vec<CodeExcerpt> = Vec::new();
 
@@ -2539,7 +2615,7 @@ impl CodeIntelEngine {
             let candidates: Option<std::collections::HashSet<String>> = self
                 .substring_index
                 .as_ref()
-                .and_then(|tri| tri.candidates(&repo_name, query))
+                .and_then(|tri| tri.candidates(&repo_name, &query_lower))
                 .map(|paths| paths.into_iter().collect());
 
             if candidates.as_ref().is_some_and(|c| c.is_empty()) {
@@ -2586,7 +2662,7 @@ impl CodeIntelEngine {
 
                 // Simple text search with scoring
                 for (line_num, line) in lines.iter().enumerate() {
-                    if contains_ignore_case(line, &query_lower) {
+                    if line_matches(line, &query_lower) {
                         let start = line_num.saturating_sub(3);
                         let end = (line_num + 4).min(lines.len());
 
@@ -2630,7 +2706,7 @@ impl CodeIntelEngine {
                     let lines: Vec<&str> = searchable_content.lines().collect();
 
                     for (line_num, line) in lines.iter().enumerate() {
-                        if line.to_lowercase().contains(&query_lower) {
+                        if line_matches(line, &query_lower) {
                             let start = line_num.saturating_sub(3);
                             let end = (line_num + 4).min(lines.len());
 
@@ -8067,10 +8143,7 @@ impl CodeIntelEngine {
             if exclude_tests && is_test_file(&symbol.file_path) {
                 continue;
             }
-            let label = symbol
-                .qualified_name
-                .as_deref()
-                .unwrap_or(&symbol.name);
+            let label = symbol.qualified_name.as_deref().unwrap_or(&symbol.name);
             definitions.push((
                 symbol.file_path.clone(),
                 symbol.start_line,
