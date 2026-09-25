@@ -37,8 +37,10 @@ pub mod store;
 pub mod supply_chain;
 pub mod symbols;
 pub mod taint;
+pub mod tantivy_index;
 pub mod text;
 pub mod tool_metadata;
+pub mod trigram;
 pub mod type_inference;
 pub mod validation;
 

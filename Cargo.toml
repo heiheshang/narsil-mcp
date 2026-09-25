@@ -13,7 +13,7 @@ exclude = ["frontend/", "docs/", ".github/", "*.md", "!README.md"]
 
 [features]
 default = ["native"]
-native = ["dep:notify", "dep:tokio", "dep:async-trait", "dep:reqwest", "dep:octocrab", "dep:lsp-types", "dep:lsp-server", "dep:tempfile", "dep:axum", "dep:tower", "dep:tower-http"]
+native = ["tantivy/mmap", "dep:notify", "dep:tokio", "dep:async-trait", "dep:reqwest", "dep:octocrab", "dep:lsp-types", "dep:lsp-server", "dep:tempfile", "dep:axum", "dep:tower", "dep:tower-http"]
 graph = ["dep:oxigraph", "dep:flate2"]  # RDF knowledge graph with SPARQL support
 frontend = ["native", "dep:rust-embed", "dep:mime_guess"]  # Embeds visualization frontend in binary
 neural = ["usearch", "ndarray"]

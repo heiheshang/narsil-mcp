@@ -301,7 +301,7 @@ impl HybridSearchEngine {
             term_freq,
         };
 
-        self.bm25_index.inner.write().add_document(search_doc);
+        self.bm25_index.add_document_retaining_text(search_doc);
 
         // Index in TF-IDF
         self.tfidf_engine.index_snippet(

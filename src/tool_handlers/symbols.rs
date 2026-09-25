@@ -109,7 +109,14 @@ impl ToolHandler for FindSymbolUsagesHandler {
         let include_imports = args.get_bool_or("include_imports", true);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
-            .find_symbol_usages(repo, symbol, include_imports, exclude_tests)
+            .find_symbol_usages(
+                repo,
+                symbol,
+                include_imports,
+                exclude_tests,
+                args.get_str("file"),
+                args.get_str("receiver"),
+            )
             .await
     }
 }

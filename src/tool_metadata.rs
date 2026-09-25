@@ -434,7 +434,7 @@ lazy_static! {
 
         map.insert("find_symbol_usages", ToolMetadata {
             name: "find_symbol_usages",
-            description: "Find all usages of a symbol across files, including imports and re-exports. Cross-language aware for JS/TS projects.",
+            description: "Find all usages of a symbol across files, including imports and re-exports. Accepts qualified names (Type::method) and disambiguates namesakes with receiver or file like get_symbol_definition. Searches source for the bare identifier at call sites.",
             category: ToolCategory::Symbols,
             tags: ["symbol", "usages", "imports", "exports"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -447,7 +447,9 @@ lazy_static! {
                     "symbol": {"type": "string"},
                     "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "include_imports": {"type": "boolean", "description": "Include import statements (default: true)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
+                    "file": {"type": "string", "description": "Disambiguate namesakes by file path or suffix"},
+                    "receiver": {"type": "string", "description": "Disambiguate methods by owning type (Go receiver, Rust impl, class name)"}
                 },
                 "required": ["repo", "symbol"]
             }),

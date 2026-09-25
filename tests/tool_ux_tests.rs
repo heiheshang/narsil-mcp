@@ -956,6 +956,57 @@ async fn symbol_and_function_are_interchangeable_across_families() -> Result<()>
 }
 
 #[tokio::test]
+async fn find_symbol_usages_resolves_qualified_methods() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "store.go",
+        r#"package store
+
+type PaymentStore struct{}
+
+func (s *PaymentStore) Save() error { return nil }
+
+func Caller() { var s PaymentStore; s.Save() }
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbol_usages",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "PaymentStore::Save"}),
+        )
+        .await?;
+    assert!(
+        out.contains("PaymentStore::Save"),
+        "definition not listed:\n{out}"
+    );
+    assert!(
+        out.contains("store.go | 7 | usage"),
+        "call site line not listed:\n{out}"
+    );
+    assert!(
+        !out.contains("No usages found"),
+        "{out}"
+    );
+
+    let with_receiver = registry
+        .dispatch(
+            "find_symbol_usages",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "PaymentStore"}),
+        )
+        .await?;
+    assert!(
+        with_receiver.contains("store.go | 7 | usage"),
+        "{with_receiver}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn limit_and_max_results_are_interchangeable() -> Result<()> {
     let repo = TestRepo::new()?;
     repo.add_file(

@@ -2,10 +2,11 @@
 //!
 //! Provides intelligent code search that understands programming patterns.
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::tantivy_index::TantivyIndex;
 
 /// Repository tag for documents indexed outside a repository walk
 /// (WASM, transient per-query indexes) and for older persisted documents.
@@ -105,22 +106,13 @@ impl Default for BM25Params {
     }
 }
 
-/// Code-aware search index using BM25
+/// Code-aware search index.
+///
+/// A thin owner of a [`TantivyIndex`]. The BM25 that used to live here kept its
+/// whole inverted index in a `HashMap` and was never persisted; see
+/// [`crate::tantivy_index`] for what replaced it and why.
 pub struct SearchIndex {
-    /// All documents
-    documents: Vec<SearchDocument>,
-    /// Inverted index: term -> document indices
-    inverted_index: HashMap<String, Vec<usize>>,
-    /// Document frequency per term
-    doc_freq: HashMap<String, usize>,
-    /// Average document length
-    avg_doc_len: f64,
-    /// Running total of all document lengths (term counts), for O(1) avg update
-    total_doc_terms: usize,
-    /// BM25 parameters
-    params: BM25Params,
-    /// Code-specific synonyms
-    synonyms: HashMap<String, Vec<String>>,
+    inner: TantivyIndex,
 }
 
 impl Default for SearchIndex {
@@ -130,152 +122,69 @@ impl Default for SearchIndex {
 }
 
 impl SearchIndex {
+    /// In-RAM index.
     pub fn new() -> Self {
         Self {
-            documents: Vec::new(),
-            inverted_index: HashMap::new(),
-            doc_freq: HashMap::new(),
-            avg_doc_len: 0.0,
-            total_doc_terms: 0,
-            params: BM25Params::default(),
-            synonyms: Self::build_code_synonyms(),
+            // An in-RAM tantivy index has no filesystem and no existing schema
+            // to reconcile, so there is no failure a caller could act on.
+            inner: TantivyIndex::in_memory()
+                .expect("in-memory tantivy index must be constructible"),
         }
     }
 
-    /// Approximate memory footprint (diagnostics).
-    /// Returns (docs, content_bytes, term_freq_bytes, inverted_bytes, doc_freq_bytes).
-    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize) {
-        let content_bytes: usize = self
-            .documents
-            .iter()
-            .map(|d| d.id.len() + d.file_path.len() + d.content.len())
-            .sum();
-        let term_freq_bytes: usize = self
-            .documents
-            .iter()
-            .map(|d| {
-                d.term_freq
-                    .keys()
-                    .map(|k| k.len() + std::mem::size_of::<usize>())
-                    .sum::<usize>()
-            })
-            .sum();
-        let inverted_bytes: usize = self
-            .inverted_index
-            .iter()
-            .map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>())
-            .sum();
-        let doc_freq_bytes: usize = self
-            .doc_freq
-            .keys()
-            .map(|k| k.len() + std::mem::size_of::<usize>())
-            .sum();
-        (
-            self.documents.len(),
-            content_bytes,
-            term_freq_bytes,
-            inverted_bytes,
-            doc_freq_bytes,
-        )
+    /// Open (or create) a persisted index rooted at `path`.
+    #[cfg(feature = "native")]
+    pub fn open_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: TantivyIndex::open_or_create(path)?,
+        })
     }
 
-    /// Build code-specific synonym mappings
-    fn build_code_synonyms() -> HashMap<String, Vec<String>> {
-        let mut synonyms = HashMap::new();
+    /// The underlying index, for operations with no wrapper equivalent:
+    /// `commit`, `delete_repo`, `disk_bytes`.
+    pub fn tantivy(&self) -> &TantivyIndex {
+        &self.inner
+    }
 
-        // Common programming synonyms
-        let synonym_groups = vec![
-            vec![
-                "func",
-                "function",
-                "fn",
-                "def",
-                "method",
-                "proc",
-                "procedure",
-            ],
-            vec!["struct", "structure", "class", "type", "record"],
-            vec!["err", "error", "exception", "failure", "fault"],
-            vec!["ok", "success", "result"],
-            vec!["str", "string", "text"],
-            vec!["int", "integer", "number", "num"],
-            vec!["bool", "boolean", "flag"],
-            vec!["arr", "array", "list", "vec", "vector", "slice"],
-            vec!["dict", "dictionary", "map", "hashmap", "hash"],
-            vec!["cfg", "config", "configuration", "settings", "options"],
-            vec!["msg", "message", "payload"],
-            vec!["req", "request"],
-            vec!["res", "resp", "response"],
-            vec!["db", "database", "store", "storage"],
-            vec!["auth", "authentication", "authorize"],
-            vec!["impl", "implement", "implementation"],
-            vec!["init", "initialize", "setup", "create", "new"],
-            vec!["del", "delete", "remove", "drop"],
-            vec!["get", "fetch", "retrieve", "read", "load"],
-            vec!["set", "update", "write", "save", "store"],
-            vec!["async", "asynchronous", "concurrent"],
-            vec!["sync", "synchronous", "blocking"],
-        ];
-
-        for group in synonym_groups {
-            for term in &group {
-                let others: Vec<String> = group
-                    .iter()
-                    .filter(|&t| t != term)
-                    .map(|s| s.to_string())
-                    .collect();
-                synonyms.insert(term.to_string(), others);
-            }
+    /// Add a document to the index.
+    ///
+    /// Indexing failures are logged rather than propagated: the callers are
+    /// indexing loops over thousands of files, and one unparseable document
+    /// must not abort the walk.
+    pub fn add_document(&self, doc: SearchDocument) {
+        if let Err(e) = self.inner.add_document(doc) {
+            tracing::warn!("Failed to index document: {}", e);
         }
-
-        synonyms
     }
 
-    /// Add a document to the index
-    pub fn add_document(&mut self, doc: SearchDocument) {
-        let doc_idx = self.documents.len();
-
-        // Update inverted index + doc frequency from unique terms only. The
-        // old code iterated the per-occurrence token list, pushing `doc_idx`
-        // once per occurrence — bloating postings lists with duplicates.
-        for token in doc.term_freq.keys() {
-            self.inverted_index
-                .entry(token.clone())
-                .or_default()
-                .push(doc_idx);
-            *self.doc_freq.entry(token.clone()).or_default() += 1;
+    /// Add a document and keep its raw text, so `SearchResult::document.content`
+    /// round-trips. Only for callers that read that field back.
+    pub fn add_document_retaining_text(&self, doc: SearchDocument) {
+        if let Err(e) = self.inner.add_document_retaining_text(doc) {
+            tracing::warn!("Failed to index document: {}", e);
         }
-
-        let doc_len: usize = doc.term_freq.values().sum();
-        self.total_doc_terms += doc_len;
-
-        self.documents.push(doc);
-
-        self.avg_doc_len = self.total_doc_terms as f64 / self.documents.len() as f64;
     }
 
-    /// Index content from a file
-    pub fn index_file(&mut self, repo: Arc<str>, file_path: &str, content: &str) {
-        let tokens = tokenize_code(content);
-        let term_freq = count_terms(&tokens);
-
+    /// Index content from a file.
+    pub fn index_file(&self, repo: Arc<str>, file_path: &str, content: &str) {
         self.add_document(SearchDocument {
             id: file_path.to_string(),
             repo,
             file_path: file_path.to_string(),
-            // Persistent index: keep raw text empty (regenerated on demand).
-            content: String::new(),
+            // Handed to tantivy for tokenization and dropped; the corpus index
+            // indexes this text without storing it.
+            content: content.to_string(),
             doc_type: DocType::File,
             start_line: 1,
             end_line: content.lines().count(),
-            term_freq,
+            term_freq: HashMap::new(),
         });
     }
 
     /// Index a symbol (function, class, etc.)
     #[allow(clippy::too_many_arguments)]
     pub fn index_symbol(
-        &mut self,
+        &self,
         repo: Arc<str>,
         file_path: &str,
         name: &str,
@@ -284,19 +193,15 @@ impl SearchIndex {
         start_line: usize,
         end_line: usize,
     ) {
-        let tokens = tokenize_code(content);
-        let term_freq = count_terms(&tokens);
-
         self.add_document(SearchDocument {
             id: format!("{}::{}", file_path, name),
             repo,
             file_path: file_path.to_string(),
-            // Persistent index: keep raw text empty (regenerated on demand).
-            content: String::new(),
+            content: content.to_string(),
             doc_type,
             start_line,
             end_line,
-            term_freq,
+            term_freq: HashMap::new(),
         });
     }
 
@@ -305,9 +210,11 @@ impl SearchIndex {
         self.search_in(query, max_results, None)
     }
 
-    /// Search the index with BM25 ranking, optionally restricted to one
-    /// repository. Filtering happens before ranking, so `max_results` is
-    /// honoured within the repository instead of being spent on other repos.
+    /// Search with BM25 ranking, optionally restricted to one repository.
+    ///
+    /// Filtering is a clause of the query rather than a pass over results, so
+    /// `max_results` is honoured within the repository instead of being spent
+    /// on other repositories.
     pub fn search_in(
         &self,
         query: &str,
@@ -320,105 +227,20 @@ impl SearchIndex {
             return Vec::new();
         }
 
-        let query_tokens = tokenize_code(query);
-
-        // Expand query with synonyms
-        let expanded_tokens = self.expand_query(&query_tokens);
-
-        let mut scores: HashMap<usize, (f64, Vec<String>)> = HashMap::new();
-
-        for token in &expanded_tokens {
-            if let Some(doc_indices) = self.inverted_index.get(token) {
-                let idf = self.compute_idf(token);
-
-                for &doc_idx in doc_indices {
-                    let doc = &self.documents[doc_idx];
-                    if let Some(repo) = repo {
-                        if &*doc.repo != repo {
-                            continue;
-                        }
-                    }
-                    let tf = doc.term_freq.get(token).copied().unwrap_or(0) as f64;
-                    let doc_len = doc.term_freq.values().sum::<usize>() as f64;
-
-                    let bm25_score = self.bm25_score(tf, doc_len, idf);
-
-                    let entry = scores.entry(doc_idx).or_insert((0.0, Vec::new()));
-                    entry.0 += bm25_score;
-                    if !entry.1.contains(token) {
-                        entry.1.push(token.clone());
-                    }
-                }
-            }
-        }
-
-        // Boost exact name matches
-        for (doc_idx, (score, _)) in &mut scores {
-            let doc = &self.documents[*doc_idx];
-            if doc.id.to_lowercase().contains(&query.to_lowercase()) {
-                *score *= 2.0;
-            }
-        }
-
-        // Sort by score and take top results
-        let mut results: Vec<_> = scores.into_iter().collect();
-        results.sort_by(|a, b| {
-            b.1 .0
-                .partial_cmp(&a.1 .0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(max_results);
-
-        results
+        self.inner
+            .search_in(query, max_results, repo)
             .into_iter()
-            .map(|(doc_idx, (score, matched_terms))| {
-                let doc = &self.documents[doc_idx];
-                let snippet = Self::generate_snippet(&doc.content, &matched_terms, doc.start_line);
+            .map(|(document, score, matched_terms)| {
+                let snippet =
+                    Self::generate_snippet(&document.content, &matched_terms, document.start_line);
                 SearchResult {
-                    document: doc.clone(),
+                    document,
                     score,
                     matched_terms,
                     snippet,
                 }
             })
             .collect()
-    }
-
-    /// Compute IDF (Inverse Document Frequency)
-    fn compute_idf(&self, term: &str) -> f64 {
-        let n = self.documents.len() as f64;
-        let df = self.doc_freq.get(term).copied().unwrap_or(0) as f64;
-
-        if df == 0.0 {
-            0.0
-        } else {
-            ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
-        }
-    }
-
-    /// Compute BM25 score for a term in a document
-    fn bm25_score(&self, tf: f64, doc_len: f64, idf: f64) -> f64 {
-        let k1 = self.params.k1;
-        let b = self.params.b;
-        let avg_dl = self.avg_doc_len;
-
-        let numerator = tf * (k1 + 1.0);
-        let denominator = tf + k1 * (1.0 - b + b * doc_len / avg_dl);
-
-        idf * numerator / denominator
-    }
-
-    /// Expand query terms with synonyms
-    fn expand_query(&self, tokens: &[String]) -> Vec<String> {
-        let mut expanded = tokens.to_vec();
-
-        for token in tokens {
-            if let Some(synonyms) = self.synonyms.get(token) {
-                expanded.extend(synonyms.clone());
-            }
-        }
-
-        expanded
     }
 
     /// Generate a snippet highlighting matched terms from already-loaded text.
@@ -456,33 +278,78 @@ impl SearchIndex {
             .collect::<Vec<_>>()
             .join("\n")
     }
-
     /// Get statistics about the index
     pub fn stats(&self) -> IndexStats {
-        let doc_types: HashMap<DocType, usize> =
-            self.documents.iter().fold(HashMap::new(), |mut acc, doc| {
-                *acc.entry(doc.doc_type.clone()).or_default() += 1;
-                acc
-            });
-
         IndexStats {
-            total_documents: self.documents.len(),
-            total_terms: self.inverted_index.len(),
-            avg_doc_length: self.avg_doc_len,
-            doc_types,
+            total_documents: self.inner.num_docs(),
+            total_terms: self.inner.num_terms(),
+            avg_doc_length: self.inner.avg_doc_len(),
+            doc_types: self.inner.doc_type_counts(),
         }
     }
 
     /// Clear the index
-    pub fn clear(&mut self) {
-        self.documents.clear();
-        self.inverted_index.clear();
-        self.doc_freq.clear();
-        self.avg_doc_len = 0.0;
-        self.total_doc_terms = 0;
+    pub fn clear(&self) {
+        if let Err(e) = self.inner.clear() {
+            tracing::warn!("Failed to clear search index: {}", e);
+        }
     }
 }
 
+/// Code-specific synonym groups, applied to query terms at search time.
+///
+/// Lifted out of the old `SearchIndex` unchanged: the table is the accumulated
+/// domain knowledge here, and it outlived the scorer it was written for.
+pub fn build_code_synonyms() -> HashMap<String, Vec<String>> {
+    let mut synonyms = HashMap::new();
+
+    // Common programming synonyms
+    let synonym_groups = vec![
+        vec![
+            "func",
+            "function",
+            "fn",
+            "def",
+            "method",
+            "proc",
+            "procedure",
+        ],
+        vec!["struct", "structure", "class", "type", "record"],
+        vec!["err", "error", "exception", "failure", "fault"],
+        vec!["ok", "success", "result"],
+        vec!["str", "string", "text"],
+        vec!["int", "integer", "number", "num"],
+        vec!["bool", "boolean", "flag"],
+        vec!["arr", "array", "list", "vec", "vector", "slice"],
+        vec!["dict", "dictionary", "map", "hashmap", "hash"],
+        vec!["cfg", "config", "configuration", "settings", "options"],
+        vec!["msg", "message", "payload"],
+        vec!["req", "request"],
+        vec!["res", "resp", "response"],
+        vec!["db", "database", "store", "storage"],
+        vec!["auth", "authentication", "authorize"],
+        vec!["impl", "implement", "implementation"],
+        vec!["init", "initialize", "setup", "create", "new"],
+        vec!["del", "delete", "remove", "drop"],
+        vec!["get", "fetch", "retrieve", "read", "load"],
+        vec!["set", "update", "write", "save", "store"],
+        vec!["async", "asynchronous", "concurrent"],
+        vec!["sync", "synchronous", "blocking"],
+    ];
+
+    for group in synonym_groups {
+        for term in &group {
+            let others: Vec<String> = group
+                .iter()
+                .filter(|&t| t != term)
+                .map(|s| s.to_string())
+                .collect();
+            synonyms.insert(term.to_string(), others);
+        }
+    }
+
+    synonyms
+}
 /// Index statistics
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -632,10 +499,14 @@ fn is_stop_word(token: &str) -> bool {
     STOP_WORDS.contains(&token)
 }
 
-/// Thread-safe search index wrapper
+/// Thread-safe search index wrapper.
+///
+/// Tantivy serialises its own writes and serves concurrent readers from an
+/// immutable snapshot, so this no longer needs a lock of its own — the
+/// `RwLock` it used to hold made every indexing thread queue behind one
+/// writer.
 pub struct ConcurrentSearchIndex {
-    /// The inner search index (public for direct access when needed)
-    pub inner: RwLock<SearchIndex>,
+    inner: SearchIndex,
 }
 
 impl Default for ConcurrentSearchIndex {
@@ -647,18 +518,37 @@ impl Default for ConcurrentSearchIndex {
 impl ConcurrentSearchIndex {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(SearchIndex::new()),
+            inner: SearchIndex::new(),
         }
+    }
+
+    /// Persisted index rooted at `path`.
+    #[cfg(feature = "native")]
+    pub fn open_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: SearchIndex::open_or_create(path)?,
+        })
+    }
+
+    /// The underlying index, for `commit`, `delete_repo` and `disk_bytes`.
+    pub fn tantivy(&self) -> &TantivyIndex {
+        self.inner.tantivy()
     }
 
     /// Add a single document to the search index.
     /// Used by WASM interface for incremental indexing.
     pub fn add_document(&self, doc: SearchDocument) {
-        self.inner.write().add_document(doc);
+        self.inner.add_document(doc);
+    }
+
+    /// Add a document whose raw text must round-trip; see
+    /// [`SearchIndex::add_document_retaining_text`].
+    pub fn add_document_retaining_text(&self, doc: SearchDocument) {
+        self.inner.add_document_retaining_text(doc);
     }
 
     pub fn index_file(&self, repo: Arc<str>, file_path: &str, content: &str) {
-        self.inner.write().index_file(repo, file_path, content);
+        self.inner.index_file(repo, file_path, content);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -672,13 +562,13 @@ impl ConcurrentSearchIndex {
         start_line: usize,
         end_line: usize,
     ) {
-        self.inner.write().index_symbol(
+        self.inner.index_symbol(
             repo, file_path, name, content, doc_type, start_line, end_line,
         );
     }
 
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
-        self.inner.read().search(query, max_results)
+        self.inner.search(query, max_results)
     }
 
     /// BM25 search restricted to a single repository when `repo` is set.
@@ -688,15 +578,15 @@ impl ConcurrentSearchIndex {
         max_results: usize,
         repo: Option<&str>,
     ) -> Vec<SearchResult> {
-        self.inner.read().search_in(query, max_results, repo)
+        self.inner.search_in(query, max_results, repo)
     }
 
     pub fn stats(&self) -> IndexStats {
-        self.inner.read().stats()
+        self.inner.stats()
     }
 
     pub fn clear(&self) {
-        self.inner.write().clear();
+        self.inner.clear();
     }
 }
 
@@ -723,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_search_index() {
-        let mut index = SearchIndex::new();
+        let index = SearchIndex::new();
 
         index.index_file(
             Arc::from("demo"),
@@ -762,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_search_in_restricts_to_repo() {
-        let mut index = SearchIndex::new();
+        let index = SearchIndex::new();
 
         index.index_file(Arc::from("alpha"), "user.rs", "pub fn get_user() {}");
         index.index_file(Arc::from("beta"), "user.rs", "pub fn get_user() {}");
@@ -785,7 +675,7 @@ mod tests {
     /// hits from other repositories that are then filtered away.
     #[test]
     fn test_search_in_budget_is_not_eaten_by_other_repos() {
-        let mut index = SearchIndex::new();
+        let index = SearchIndex::new();
 
         for i in 0..20 {
             index.index_file(
@@ -803,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_persistent_index_stores_empty_content() {
-        let mut index = SearchIndex::new();
+        let index = SearchIndex::new();
         index.index_symbol(
             Arc::from("demo"),
             "f.rs",
@@ -815,17 +705,17 @@ mod tests {
         );
         index.index_file(Arc::from("demo"), "g.rs", "fn bar() {}");
 
-        // The persistent index must NOT retain raw text (cost ~2.4 GB on the
-        // 1C corpus) — it is regenerated from disk/file_cache at query time.
-        for doc in &index.documents {
+        // The corpus index must NOT retain raw text (cost ~2.4 GB on the 1C
+        // corpus) — it is regenerated from disk/file_cache at query time.
+        let hits = index.search("foo", 10);
+        assert!(!hits.is_empty(), "indexed symbol must be findable");
+        for hit in &hits {
             assert!(
-                doc.content.is_empty(),
-                "persistent index must store empty content, got {:?}",
-                doc.content
+                hit.document.content.is_empty(),
+                "corpus index must not carry raw text back, got {:?}",
+                hit.document.content
             );
         }
-        // Scoring still works (term_freq drives BM25, not content).
-        assert!(!index.search("foo", 10).is_empty());
     }
 
     #[test]
@@ -877,11 +767,19 @@ mod tests {
 
     #[test]
     fn test_synonym_expansion() {
+        // Synonyms are applied to query terms: searching `func` must reach a
+        // document that only ever says `function`.
         let index = SearchIndex::new();
-        let tokens = vec!["func".to_string()];
-        let expanded = index.expand_query(&tokens);
+        index.index_file(
+            Arc::from("demo"),
+            "a.rs",
+            "the function keyword introduces a definition",
+        );
 
-        assert!(expanded.contains(&"function".to_string()) || expanded.contains(&"fn".to_string()));
+        assert!(
+            !index.search("func", 10).is_empty(),
+            "a query term's synonyms must reach documents using the other spelling"
+        );
     }
 
     // Security tests for regex DoS prevention
@@ -921,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_sort_handles_nan_scores() {
-        let mut index = SearchIndex::new();
+        let index = SearchIndex::new();
 
         index.index_file(Arc::from("demo"), "a.rs", "fn hello() { }");
         index.index_file(Arc::from("demo"), "b.rs", "fn world() { }");

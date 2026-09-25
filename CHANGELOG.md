@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The BM25 index is tantivy's now, and it survives a restart.** `tantivy` had
+  been a non-optional dependency since the beginning and was imported nowhere:
+  the only occurrence of the name in the source was a licence string in a
+  supply-chain fixture. Search actually ran on a hand-rolled
+  `HashMap<String, Vec<usize>>` inverted index that was never persisted, so
+  every process start re-read and re-tokenized the entire corpus before the
+  first query could be answered, and every posting list sat on the heap for the
+  life of the server. `src/tantivy_index.rs` replaces the scorer; the postings
+  are mmap'd segments under `<index>/search`, and an unchanged file is skipped
+  on the next walk instead of being tokenized again (the symbol store and the
+  search index must *both* hold a repository before anything is skipped, so a
+  half-deleted cache rebuilds rather than answering from nothing). Note that
+  this removes BM25 from the cold-start cost, not the cold start itself: the
+  walk still runs, because `file_cache`, the TF-IDF embeddings and the
+  normalized 1C documents are still built from source every time. Term
+  semantics are unchanged: tantivy is driven through a `CodeTokenizer` that
+  defers to the existing `tokenize_code`, and the synonym table moved to the
+  query side intact. Raw text retention became a per-document choice, so the
+  chunks `hybrid_search` reads back keep their text — compressed on disk now,
+  not resident — while files and symbols still keep none. Re-indexing an edited
+  file also deletes its previous documents, which the map-backed index never
+  did: each save left a stale duplicate behind.
+
+- **`search_code` stops reading the whole corpus.** It is a substring matcher,
+  so no token index could serve it, and it scanned every cached file of every
+  repository calling `line.to_lowercase()` per line — one `String` allocation
+  per line per query, ~125 000 of them for a single call on this repository.
+  A trigram index (`src/trigram.rs`, the Zoekt/Google Code Search approach)
+  now intersects the needle's own 3-grams to decide which files could possibly
+  match, and only those are read. Trigrams over-approximate and never reject a
+  real hit, so the scan still decides and results are identical. Needles under
+  three characters have no trigrams and fall back to the full scan, as does a
+  candidate set large enough that filtering stops paying. The postings live in
+  their own tantivy index under `<index>/substring` rather than on the heap.
+  The per-line comparison is allocation-free for ASCII and still folds Unicode
+  correctly for the Cyrillic corpora.
+
+- **Neural search uses the ANN index it was already shipping.** `usearch` was
+  a declared dependency, `neural::vector_index` implemented an HNSW index over
+  it with `save`/`load`, and nothing ever constructed one: both `NeuralEngine`
+  constructors took the brute-force store, so every query scanned every vector
+  while the dependency was compiled into the binary. Three defects had to be
+  fixed before it could be wired up — capacity was reserved once at
+  construction so the index filled and silently refused every later insert,
+  there was no repository-scoped search for `search_in` to use, and `clear`
+  emptied the id map while leaving the vectors in place. The brute-force store
+  remains the fallback when the `neural` feature is off, and is no longer
+  gratuitously slow: vectors are L2-normalised on insert (the query's own norm
+  used to be recomputed once per stored document), the top-k is a heap instead
+  of a full sort of the corpus, and the vectors are one contiguous buffer
+  rather than an allocation and a cloned `String` per document.
+
 ### Added
 
 - **`not in graph` split into the three things it was hiding.** One count
@@ -102,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index fields.
 
 ### Fixed
+
+- **`find_symbol_usages` resolves qualified methods.** It used to grep for the
+  full query string (`PaymentStore::Save`), so definitions and usages were both
+  empty after pasting a qualified name from `find_symbols`. It now shares
+  `get_symbol_definition`'s lookup (`qualified_name`, `receiver`, `file`) and
+  searches source for the bare identifier at call sites.
 
 - **`search_code` no longer hides how much it dropped.** Matches are ranked and
   cut to `max_results` (default 10), but the header printed the post-truncation

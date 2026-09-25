@@ -106,6 +106,64 @@ fn expand_braces(pattern: &str) -> std::result::Result<Vec<String>, String> {
 }
 
 #[cfg(test)]
+mod contains_ignore_case_tests {
+    use super::contains_ignore_case;
+
+    #[test]
+    fn matches_regardless_of_case() {
+        assert!(contains_ignore_case("let Foo = Bar();", "foo"));
+        assert!(contains_ignore_case("LET FOO", "let foo"));
+    }
+
+    #[test]
+    fn matches_at_the_boundaries() {
+        assert!(contains_ignore_case("abc", "abc"));
+        assert!(contains_ignore_case("xabc", "abc"));
+        assert!(contains_ignore_case("abcx", "abc"));
+    }
+
+    #[test]
+    fn rejects_what_is_not_there() {
+        assert!(!contains_ignore_case("alpha", "beta"));
+        // A needle longer than the haystack must not index out of bounds:
+        // `windows()` panics on a zero-length window, and a naive range would
+        // underflow here.
+        assert!(!contains_ignore_case("ab", "abc"));
+        assert!(!contains_ignore_case("", "abc"));
+    }
+
+    #[test]
+    fn an_empty_needle_matches_anything() {
+        assert!(contains_ignore_case("anything", ""));
+        assert!(contains_ignore_case("", ""));
+    }
+
+    #[test]
+    fn non_ascii_folds_correctly() {
+        // The 1C corpora are Cyrillic; ASCII-only folding would miss these.
+        assert!(contains_ignore_case("Счётчик = 0", "счётчик"));
+        assert!(contains_ignore_case("ПОЛНОЕИМЯ", "полноеимя"));
+        assert!(!contains_ignore_case("Счётчик", "счетчик"));
+    }
+
+    #[test]
+    fn agrees_with_the_allocating_form_it_replaced() {
+        for (hay, needle) in [
+            ("fn parse_config()", "parse_config"),
+            ("Mixed CASE text", "case"),
+            ("Кириллица тут", "кириллица"),
+            ("no match here", "absent"),
+        ] {
+            assert_eq!(
+                contains_ignore_case(hay, needle),
+                hay.to_lowercase().contains(needle),
+                "divergence on {hay:?} / {needle:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod file_pattern_tests {
     use super::*;
 
@@ -308,6 +366,12 @@ pub struct CodeIntelEngine {
     call_graphs: DashMap<String, CallGraph>,
     /// Semantic search index
     search_index: Arc<ConcurrentSearchIndex>,
+    /// Trigram index backing `search_code`'s substring matching.
+    ///
+    /// Present only when persistence is on: the postings belong on disk, and
+    /// without an index directory there is nowhere to put them. When absent,
+    /// `search_code` scans every cached file exactly as it always did.
+    substring_index: Option<Arc<crate::trigram::TrigramIndex>>,
     /// Embedding engine for semantic similarity (TF-IDF)
     embedding_engine: Arc<EmbeddingEngine>,
     /// Neural embedding engine for semantic search (when neural is enabled)
@@ -381,6 +445,41 @@ fn symbol_location(sym: &Symbol) -> String {
     } else {
         format!("{}:{}", sym.file_path, sym.start_line)
     }
+}
+
+/// Result of resolving a symbol query against the index (shared by definition
+/// and usage tools). `search_name` is always the bare identifier to grep for
+/// in source — qualified queries like `Type::method` must not be searched
+/// literally, or call sites are missed.
+struct ResolvedSymbolLookup<'a> {
+    symbols: Vec<&'a Symbol>,
+    search_name: String,
+}
+
+/// Case-insensitive substring test that does not allocate for ASCII text.
+///
+/// `search_code` runs this once per line of every candidate file. The previous
+/// `line.to_lowercase().contains(..)` allocated a `String` per line — ~125 000
+/// allocations per query on this repository alone, and that was before the
+/// trigram filter cut the file set down.
+///
+/// Non-ASCII text still falls back to allocating, which keeps the Unicode case
+/// folding correct for the 1C corpora rather than guessing at it.
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    if !haystack.is_ascii() || !needle_lower.is_ascii() {
+        return haystack.to_lowercase().contains(needle_lower);
+    }
+
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    h.windows(n.len())
+        .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
 fn reusable_symbols(persisted: Option<&PersistedIndex>, file_path: &Path) -> Option<Vec<Symbol>> {
@@ -608,6 +707,49 @@ impl CodeIntelEngine {
 
         let total_repos = expanded_repos.len();
 
+        // The BM25 index is persisted alongside the symbol store. It used to be
+        // an in-RAM map rebuilt from source on every boot, which is most of what
+        // made a cold start expensive; tantivy reads its segments back instead.
+        // Without persistence the index still works, it just lives in RAM.
+        let search_index = if index_store.is_some() {
+            let search_dir = expanded_index.join("search");
+            match ConcurrentSearchIndex::open_or_create(&search_dir) {
+                Ok(idx) => {
+                    info!("Search index persisted in {:?}", search_dir);
+                    idx
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to open persisted search index at {:?}: {}; using in-memory index",
+                        search_dir, e
+                    );
+                    ConcurrentSearchIndex::new()
+                }
+            }
+        } else {
+            ConcurrentSearchIndex::new()
+        };
+
+        let substring_index = if index_store.is_some() {
+            let dir = expanded_index.join("substring");
+            match crate::trigram::TrigramIndex::open_or_create(&dir) {
+                Ok(idx) => {
+                    info!("Substring (trigram) index persisted in {:?}", dir);
+                    Some(Arc::new(idx))
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to open trigram index at {:?}: {}; \
+                         search_code will scan files directly",
+                        dir, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let engine = Self {
             _index_path: expanded_index,
             repo_paths: expanded_repos.clone(),
@@ -618,7 +760,8 @@ impl CodeIntelEngine {
             parser: Arc::new(LanguageParser::new()?),
             git_repos: DashMap::new(),
             call_graphs: DashMap::new(),
-            search_index: Arc::new(ConcurrentSearchIndex::new()),
+            search_index: Arc::new(search_index),
+            substring_index,
             embedding_engine: Arc::new(EmbeddingEngine::new(1000)), // 1000-dim TF-IDF vectors
             neural_engine,
             options: options.clone(),
@@ -823,6 +966,18 @@ impl CodeIntelEngine {
             }
         }
 
+        // Flush the search index once, after every repository has been walked.
+        // Committing per document would fsync thousands of times; committing
+        // here means a crash mid-walk costs the walk, not the corpus.
+        if let Err(e) = self.search_index.tantivy().commit() {
+            warn!("Failed to commit search index: {}", e);
+        }
+        if let Some(tri) = self.substring_index.as_ref() {
+            if let Err(e) = tri.commit() {
+                warn!("Failed to commit trigram index: {}", e);
+            }
+        }
+
         // Initialize git repos if enabled
         if self.options.git_enabled {
             for repo_path in &self.repo_paths {
@@ -1010,6 +1165,32 @@ impl CodeIntelEngine {
         // trees: the call graph is built from them, and they are not persisted.
         let reuse = reuse.filter(|_| !self.options.call_graph_enabled);
 
+        // The search index persists separately from the symbol store, so a warm
+        // symbol cache does not by itself prove the documents are there: a user
+        // who deleted one file but not the other would otherwise get a
+        // repository that reports as cached and answers no searches. Requiring
+        // documents on disk makes the two agree before anything is skipped.
+        // Both indexes must hold the repository, not just one: they are
+        // separate directories and a partial cache must not be mistaken for a
+        // complete one.
+        let search_warm = reuse.is_some()
+            && self.search_index.tantivy().repo_doc_count(&repo_name) > 0
+            && self
+                .substring_index
+                .as_ref()
+                .is_none_or(|tri| tri.repo_file_count(&repo_name) > 0);
+        if !search_warm {
+            // Cold, or out of step with the symbol cache: clear this
+            // repository rather than layering a second copy of every document
+            // on top of the last run's.
+            if let Err(e) = self.search_index.tantivy().delete_repo(&repo_name) {
+                warn!("Failed to clear search index for {}: {}", repo_name, e);
+            }
+            if let Some(tri) = self.substring_index.as_ref() {
+                tri.delete_repo(&repo_name);
+            }
+        }
+
         // Use ignore crate to respect .gitignore
         let walker = ignore::WalkBuilder::new(path)
             .hidden(true)
@@ -1140,6 +1321,28 @@ impl CodeIntelEngine {
                         .to_string_lossy()
                         .to_string();
 
+                    // Documents for an unchanged file are already in the
+                    // persisted index; re-adding them would duplicate every
+                    // hit. A changed file has its old documents dropped first,
+                    // because symbols it used to define may be gone.
+                    let index_into_search = !(search_warm && reused);
+                    if index_into_search {
+                        if search_warm {
+                            self.search_index
+                                .tantivy()
+                                .delete_file(&repo_tag, &relative_path);
+                            if let Some(tri) = self.substring_index.as_ref() {
+                                tri.delete_file(&repo_tag, &relative_path);
+                            }
+                        }
+                        // Substring search indexes whole file text, including
+                        // the punctuation a token index throws away — that is
+                        // the point of it.
+                        if let Some(tri) = self.substring_index.as_ref() {
+                            tri.add_file(&repo_tag, &relative_path, &content);
+                        }
+                    }
+
                     let has_parser_support = parsed.is_some();
                     if let Some(parsed) = parsed {
                         let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
@@ -1159,15 +1362,17 @@ impl CodeIntelEngine {
                                 card.push('\n');
                                 card.push_str(doc);
                             }
-                            self.search_index.index_symbol(
-                                Arc::clone(&repo_tag),
-                                &relative_path,
-                                &symbol.name,
-                                &card,
-                                symbol_kind_to_doc_type(&symbol.kind),
-                                symbol.start_line,
-                                symbol.end_line,
-                            );
+                            if index_into_search {
+                                self.search_index.index_symbol(
+                                    Arc::clone(&repo_tag),
+                                    &relative_path,
+                                    &symbol.name,
+                                    &card,
+                                    symbol_kind_to_doc_type(&symbol.kind),
+                                    symbol.start_line,
+                                    symbol.end_line,
+                                );
+                            }
 
                             // Index symbol into embedding engine for similarity search
                             if let Some(ref sig) = symbol.signature {
@@ -1213,7 +1418,7 @@ impl CodeIntelEngine {
                     // Index the whole file into search only when the parser
                     // extracted no symbols (text-only / unsupported languages).
                     // Parsed files index per-symbol cards above instead.
-                    if !has_parser_support {
+                    if !has_parser_support && index_into_search {
                         self.search_index.index_file(
                             Arc::clone(&repo_tag),
                             &relative_path,
@@ -1222,7 +1427,11 @@ impl CodeIntelEngine {
                     }
 
                     for document in collect_onec_normalized_documents(path, file_path.as_path()) {
-                        self.index_normalized_document(Arc::clone(&repo_tag), &document);
+                        self.index_normalized_document(
+                            Arc::clone(&repo_tag),
+                            &document,
+                            index_into_search,
+                        );
                         normalized_docs_vec.push(document);
                     }
                 }
@@ -1370,7 +1579,15 @@ impl CodeIntelEngine {
         })
     }
 
-    fn index_normalized_document(&self, repo: Arc<str>, document: &NormalizedDocument) {
+    /// `index_into_search` is false when the search index already holds this
+    /// document from a previous run. The TF-IDF embeddings below are not
+    /// persisted, so they are rebuilt either way.
+    fn index_normalized_document(
+        &self,
+        repo: Arc<str>,
+        document: &NormalizedDocument,
+        index_into_search: bool,
+    ) {
         let file_path = normalized_document_primary_source(document);
         let content = render_normalized_search_content(document);
         let start_line = 1;
@@ -1380,16 +1597,18 @@ impl CodeIntelEngine {
         // Raw text is NOT retained: display re-renders it from `normalized_docs`
         // on demand (see `normalized_doc_content_by_id`). Storing it here and in
         // the embedding engine doubled ~1 GB of redundant content on the 1C dump.
-        self.search_index.add_document(SearchDocument {
-            id: document.id.clone(),
-            repo: Arc::clone(&repo),
-            file_path: file_path.clone(),
-            content: String::new(),
-            doc_type: DocType::Other,
-            start_line,
-            end_line,
-            term_freq,
-        });
+        if index_into_search {
+            self.search_index.add_document(SearchDocument {
+                id: document.id.clone(),
+                repo: Arc::clone(&repo),
+                file_path: file_path.clone(),
+                content: String::new(),
+                doc_type: DocType::Other,
+                start_line,
+                end_line,
+                term_freq,
+            });
+        }
 
         self.embedding_engine.index_snippet_embed_only(
             document.id.clone(),
@@ -1671,6 +1890,68 @@ impl CodeIntelEngine {
                 String::new()
             }
         )
+    }
+
+    /// Resolve a symbol query to one or more index entries and the bare name
+    /// to search for in file text (call sites rarely spell `Type::method`).
+    fn resolve_symbol_lookup<'a>(
+        &self,
+        repo: &str,
+        symbol_name: &str,
+        file: Option<&str>,
+        receiver: Option<&str>,
+        symbols: &'a [Symbol],
+    ) -> Result<ResolvedSymbolLookup<'a>> {
+        let namesakes: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
+            .collect();
+
+        if namesakes.is_empty() {
+            return Err(self.symbol_not_found_error(repo, symbol_name, symbols));
+        }
+
+        let candidates: Vec<&Symbol> = namesakes
+            .iter()
+            .copied()
+            .filter(|s| match file {
+                Some(f) => s.file_path == f || s.file_path.ends_with(&format!("/{f}")),
+                None => true,
+            })
+            .filter(|s| match receiver {
+                Some(r) => s
+                    .qualified_name
+                    .as_deref()
+                    .is_some_and(|q| q == format!("{r}::{}", s.name)),
+                None => true,
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            anyhow::bail!(
+                "No '{}' matches file={:?} receiver={:?} in repository '{}'. \
+                 Candidates: {}",
+                symbol_name,
+                file.unwrap_or("<any>"),
+                receiver.unwrap_or("<any>"),
+                repo,
+                namesakes
+                    .iter()
+                    .map(|s| format!(
+                        "{} ({})",
+                        s.qualified_name.as_deref().unwrap_or(&s.name),
+                        symbol_location(s)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+
+        let search_name = candidates[0].name.clone();
+        Ok(ResolvedSymbolLookup {
+            symbols: candidates,
+            search_name,
+        })
     }
 
     fn repo_not_found_error(&self, repo: &str) -> anyhow::Error {
@@ -2067,58 +2348,9 @@ impl CodeIntelEngine {
             .get(repo)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
-        // Every symbol the name could mean. Picking the first one silently —
-        // which is what this used to do — hands back an arbitrary namesake:
-        // two `Save` methods on different types are one coin flip apart.
-        let namesakes: Vec<&Symbol> = symbols
-            .iter()
-            .filter(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
-            .collect();
-
-        if namesakes.is_empty() {
-            return Err(self.symbol_not_found_error(repo, symbol_name, &symbols));
-        }
-
-        let candidates: Vec<&Symbol> = namesakes
-            .iter()
-            .copied()
-            .filter(|s| match file {
-                // A suffix match so `models/bank.go` picks out
-                // `internal/models/bank.go` without spelling the whole path.
-                Some(f) => s.file_path == f || s.file_path.ends_with(&format!("/{f}")),
-                None => true,
-            })
-            .filter(|s| match receiver {
-                Some(r) => s
-                    .qualified_name
-                    .as_deref()
-                    .is_some_and(|q| q == format!("{r}::{}", s.name)),
-                None => true,
-            })
-            .collect();
-
-        let symbol = match candidates.first() {
-            Some(symbol) => *symbol,
-            None => {
-                anyhow::bail!(
-                    "No '{}' matches file={:?} receiver={:?} in repository '{}'. \
-                     Candidates: {}",
-                    symbol_name,
-                    file.unwrap_or("<any>"),
-                    receiver.unwrap_or("<any>"),
-                    repo,
-                    namesakes
-                        .iter()
-                        .map(|s| format!(
-                            "{} ({})",
-                            s.qualified_name.as_deref().unwrap_or(&s.name),
-                            symbol_location(s)
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-            }
-        };
+        let lookup = self.resolve_symbol_lookup(repo, symbol_name, file, receiver, &symbols)?;
+        let candidates = &lookup.symbols;
+        let symbol = candidates[0];
 
         let file_path = validate_path(&repo_path, &symbol.file_path)?;
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
@@ -2300,6 +2532,20 @@ impl CodeIntelEngine {
                 Err(_) => continue,
             };
 
+            // Narrow to the files whose trigrams admit the needle before
+            // touching any content. `None` means the index has no opinion —
+            // too short a needle, or too many candidates to be worth it — and
+            // the scan proceeds over everything, as it always did.
+            let candidates: Option<std::collections::HashSet<String>> = self
+                .substring_index
+                .as_ref()
+                .and_then(|tri| tri.candidates(&repo_name, query))
+                .map(|paths| paths.into_iter().collect());
+
+            if candidates.as_ref().is_some_and(|c| c.is_empty()) {
+                continue;
+            }
+
             // Search through cached files
             for entry in self.file_cache.iter() {
                 let file_path = entry.key();
@@ -2319,6 +2565,13 @@ impl CodeIntelEngine {
                     continue;
                 }
 
+                if candidates
+                    .as_ref()
+                    .is_some_and(|c| !c.contains(rel_path.as_ref()))
+                {
+                    continue;
+                }
+
                 // Apply file pattern filter
                 if let Some(ref g) = glob {
                     if !g.matches(&rel_path) {
@@ -2333,7 +2586,7 @@ impl CodeIntelEngine {
 
                 // Simple text search with scoring
                 for (line_num, line) in lines.iter().enumerate() {
-                    if line.to_lowercase().contains(&query_lower) {
+                    if contains_ignore_case(line, &query_lower) {
                         let start = line_num.saturating_sub(3);
                         let end = (line_num + 4).min(lines.len());
 
@@ -2818,11 +3071,15 @@ impl CodeIntelEngine {
         }
 
         {
-            let (docs, content_b, tf_b, inv_b, df_b) =
-                self.search_index.inner.read().memory_breakdown();
+            // Tantivy holds its postings in mmap'd segments rather than on the
+            // heap, so the interesting number is now on-disk size, not a
+            // breakdown of in-RAM maps.
+            let stats = self.search_index.stats();
             info!(
-                "[mem] search_index: {} docs, content {:.1} MB, term_freq {:.1} MB, inverted {:.1} MB, doc_freq {:.1} MB",
-                docs, content_b as f64 / 1e6, tf_b as f64 / 1e6, inv_b as f64 / 1e6, df_b as f64 / 1e6
+                "[mem] search_index: {} docs, {} terms, {:.1} MB on disk",
+                stats.total_documents,
+                stats.total_terms,
+                self.search_index.tantivy().disk_bytes() as f64 / 1e6,
             );
         }
 
@@ -3110,12 +3367,22 @@ impl CodeIntelEngine {
                         // Record the file as indexed (content read from disk).
                         self.file_cache.insert(change.path.clone(), ());
 
-                        // Update search index
+                        // Update search index. The previous documents for this
+                        // file go first: re-indexing on top of them used to
+                        // leave the old copy in place, so an edited file
+                        // accumulated a stale duplicate per save.
+                        self.search_index
+                            .tantivy()
+                            .delete_file(&repo_name, &rel_path);
                         self.search_index.index_file(
                             Arc::from(repo_name.as_str()),
                             &rel_path,
                             &content,
                         );
+                        if let Some(tri) = self.substring_index.as_ref() {
+                            tri.delete_file(&repo_name, &rel_path);
+                            tri.add_file(&repo_name, &rel_path, &content);
+                        }
 
                         let normalized_documents =
                             collect_onec_normalized_documents(repo_path, &change.path);
@@ -3136,6 +3403,7 @@ impl CodeIntelEngine {
                             self.index_normalized_document(
                                 Arc::from(repo_name.as_str()),
                                 &document,
+                                true,
                             );
                         }
 
@@ -7775,6 +8043,8 @@ impl CodeIntelEngine {
         symbol_name: &str,
         include_imports: bool,
         exclude_tests: Option<bool>,
+        file: Option<&str>,
+        receiver: Option<&str>,
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
@@ -7786,21 +8056,26 @@ impl CodeIntelEngine {
             .map(|s| s.clone())
             .unwrap_or_default();
 
+        let lookup =
+            self.resolve_symbol_lookup(repo_name, symbol_name, file, receiver, &symbols)?;
+        let search_name = lookup.search_name.as_str();
+
         let mut usages: Vec<(String, usize, String)> = Vec::new();
         let mut definitions: Vec<(String, usize, String)> = Vec::new();
 
-        // Find definitions
-        for symbol in &symbols {
-            if symbol.name == symbol_name {
-                if exclude_tests && is_test_file(&symbol.file_path) {
-                    continue;
-                }
-                definitions.push((
-                    symbol.file_path.clone(),
-                    symbol.start_line,
-                    format!("{:?} definition", symbol.kind),
-                ));
+        for symbol in &lookup.symbols {
+            if exclude_tests && is_test_file(&symbol.file_path) {
+                continue;
             }
+            let label = symbol
+                .qualified_name
+                .as_deref()
+                .unwrap_or(&symbol.name);
+            definitions.push((
+                symbol.file_path.clone(),
+                symbol.start_line,
+                format!("{:?} definition ({label})", symbol.kind),
+            ));
         }
 
         // Search for usages in files
@@ -7834,7 +8109,7 @@ impl CodeIntelEngine {
                     continue;
                 }
 
-                if line.contains(symbol_name) {
+                if line.contains(search_name) {
                     let context = if is_import { "import" } else { "usage" };
                     usages.push((rel_path.clone(), line_num + 1, context.to_string()));
                 }
@@ -7843,6 +8118,12 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Symbol Usages: '{}'\n\n", symbol_name));
+        if search_name != symbol_name {
+            output.push_str(&format!(
+                "*Text search uses bare identifier `{}` (qualified names rarely appear at call sites).*\n\n",
+                search_name
+            ));
+        }
 
         if !definitions.is_empty() {
             output.push_str("## Definitions\n\n");
