@@ -1,3 +1,5 @@
+[← Neural Search](neural-search.md) · [Back to README](../README.md) · [WebAssembly →](wasm.md)
+
 # Visualization Frontend
 
 narsil-mcp includes an optional web-based visualization frontend for exploring call graphs, import dependencies, and code structure interactively.
@@ -163,3 +165,43 @@ The HTTP server includes CORS headers for local development. If you're accessing
 1. Ensure `--call-graph` flag is enabled for call graph views
 2. Check that the repository is indexed (`list_repos` tool)
 3. Verify the function exists (`find_symbols` tool)
+
+## Quick Start
+
+Explore call graphs, imports, symbol references, and control flow interactively in your browser.
+
+```bash
+# Build with embedded frontend
+cargo build --release --features frontend
+
+# Run with HTTP server
+narsil-mcp --repos ~/project --http --call-graph
+# Open http://localhost:3000
+```
+
+**Five graph views:**
+
+| View | Description |
+|------|-------------|
+| **Call Graph** | Function call relationships with depth control and direction filtering |
+| **Import Graph** | File-level import dependencies across the codebase |
+| **Symbol Graph** | All references to a symbol, with file clustering |
+| **Hybrid** | Combined call + import graph with split budget |
+| **Control Flow** | Real CFG with basic blocks, branches, and loop back-edges |
+
+**Features:**
+- Interactive Cytoscape.js graphs with drag, zoom, and double-click drill-down
+- Complexity metrics overlay with color coding (green/yellow/orange/red)
+- Security vulnerability overlay highlighting taint sources and sinks
+- Six layout algorithms (dagre, force-directed, breadthfirst, concentric, circle, grid)
+- File tree sidebar with syntax-highlighted code viewer
+- URL-driven state (shareable links, browser back/forward)
+- Dark mode support
+- Node detail panel with code excerpts and navigation to source
+
+> **Full documentation:** See [docs/frontend.md](frontend.md) for setup, API endpoints, and development mode.
+
+## See Also
+
+- [Protocol and HTTP API](api.md) — HTTP endpoints the UI uses
+- [Getting Started](getting-started.md) — feature builds

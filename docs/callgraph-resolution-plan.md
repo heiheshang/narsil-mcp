@@ -1,3 +1,5 @@
+[← 1C Embedding Plan](1c-embedding-implementation-plan.md) · [Back to README](../README.md)
+
 # План: доведение разрешения вызовов в графе
 
 > **Выполнено 2026-09-02.** Все шесть этапов реализованы; итог на том же
@@ -186,3 +188,8 @@
 - Каждый этап проверяется на том же корпусе с выборочной ручной сверкой
   15–20 рёбер: цифры показывают сдвиг, но не показывают, куда именно
   уехали новые рёбра.
+
+## See Also
+
+- [Available Tools](tools.md) — call graph tools
+- [Architecture](architecture.md) — call graph design

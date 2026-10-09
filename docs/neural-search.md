@@ -1,3 +1,5 @@
+[← Supported Languages](languages.md) · [Back to README](../README.md) · [Visualization Frontend →](frontend.md)
+
 # Neural Semantic Search
 
 Neural embeddings enable true semantic code search - finding functionally similar code even when variable names, comments, and structure differ. This is powered by code-specialized embedding models.
@@ -156,3 +158,26 @@ cargo build --release --features neural-onnx
 |---------|-------------|------|
 | `neural` | TF-IDF vector search, API embeddings | ~32MB |
 | `neural-onnx` | Local ONNX model inference | ~50MB |
+
+## Quick Start
+
+Find similar code using neural embeddings - even when variable names and structure differ.
+
+```bash
+# Quick setup with wizard
+narsil-mcp config init --neural
+
+# Or manually with Voyage AI
+export VOYAGE_API_KEY="your-key"
+narsil-mcp --repos ~/project --neural --neural-model voyage-code-2
+```
+
+Supports Voyage AI, OpenAI, custom endpoints, and local ONNX models.
+
+> **Full documentation:** See [docs/neural-search.md](neural-search.md) for setup, backends, and use cases.
+
+## See Also
+
+- [Configuration](configuration.md) — neural flags and env vars
+- [Available Tools](tools.md) — search tools compared
+- [Troubleshooting](troubleshooting.md) — API errors

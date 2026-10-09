@@ -1,3 +1,5 @@
+[← Repository Structure](REPO_STRUCTURE.md) · [Back to README](../README.md) · [Call Graph Resolution Plan →](callgraph-resolution-plan.md)
+
 # 1C Code Embedding Implementation Plan
 
 ## Overview
@@ -744,3 +746,8 @@ This slice produces immediate user value with limited architectural risk and cre
 2026-04-29 - Phase 3 completed: BSL files now produce AST-aware chunks with preserved procedure/function boundaries.
 2026-04-29 - Phase 1 completed: unsupported textual files now remain searchable and chunkable.
 2026-04-29 - Initial implementation plan for adding 1C code embedding and XML-aware indexing support.
+
+## See Also
+
+- [Neural Search](neural-search.md) — neural search setup
+- [Supported Languages](languages.md) — 1C (BSL) support

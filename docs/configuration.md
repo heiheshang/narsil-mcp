@@ -1,3 +1,5 @@
+[← Installation Guide](INSTALL.md) · [Back to README](../README.md) · [Integrations →](integrations.md)
+
 # Configuration Guide
 
 narsil-mcp supports flexible configuration through multiple layers, allowing you to customize tool availability, presets, and behavior at different levels.
@@ -1045,9 +1047,157 @@ narsil-mcp --repos . --git
    yamllint ~/.config/narsil-mcp/config.yaml
    ```
 
+
+## Quick Reference: CLI, presets and config commands
+
+**v1.1.0+ introduces optional configuration** for fine-grained control over tools and performance. **All existing usage continues to work** - configuration is completely optional!
+
+#### Quick Start
+
+```bash
+# Generate default config interactively
+narsil-mcp config init
+
+# List available tools
+narsil-mcp tools list
+
+# Apply a preset via CLI
+narsil-mcp --repos ~/project --preset minimal
+```
+
+#### Automatic Editor Detection
+
+narsil-mcp detects your editor and applies an optimal preset automatically:
+
+| Editor | Preset | Tools | Context Tokens | Why |
+|--------|--------|-------|----------------|-----|
+| **Zed** | Minimal | 26 | ~4,686 | Fast startup, minimal context |
+| **VS Code** | Balanced | 51 | ~8,948 | Good feature balance |
+| **Claude Desktop** | Full | 90 | ~12,001 | Maximum capabilities |
+
+**Token Savings:**
+- **Minimal preset:** 61% fewer tokens vs Full
+- **Balanced preset:** 25% fewer tokens vs Full
+
+#### Presets
+
+Choose a preset based on your use case:
+
+```bash
+# Minimal - Fast, lightweight (Zed, Cursor)
+narsil-mcp --repos ~/project --preset minimal
+
+# Balanced - Good defaults (VS Code, IntelliJ)
+narsil-mcp --repos ~/project --preset balanced --git --call-graph
+
+# Full - All features (Claude Desktop, comprehensive analysis)
+narsil-mcp --repos ~/project --preset full --git --call-graph
+
+# Security-focused - Security and supply chain tools
+narsil-mcp --repos ~/project --preset security-focused
+```
+
+#### Configuration Files
+
+**User config** (`~/.config/narsil-mcp/config.yaml`):
+
+```yaml
+version: "1.0"
+preset: "balanced"
+
+tools:
+  # Disable slow tools
+  overrides:
+    neural_search:
+      enabled: false
+      reason: "Too slow for interactive use"
+
+performance:
+  max_tool_count: 50  # Limit total tools
+```
+
+**Project config** (`.narsil.yaml` in repo root):
+
+```yaml
+version: "1.0"
+preset: "security-focused"  # Override user preset
+
+tools:
+  categories:
+    Security:
+      enabled: true
+    SupplyChain:
+      enabled: true
+```
+
+**Named repository profiles** are useful for multi-repo workspaces:
+
+```yaml
+version: "1.0"
+profiles:
+  platform:
+    repos:
+      - ~/src/api
+      - ~/src/web
+    git: true
+    call_graph: true
+    persist: true
+    preset: balanced
+```
+
+```bash
+narsil-mcp --profile platform
+narsil-mcp config profiles
+```
+
+**Priority:** CLI flags > Environment vars > Project config > User config > Defaults
+
+#### Environment Variables
+
+```bash
+# Select repos/profile
+export NARSIL_REPOS=~/src/api,~/src/web
+export NARSIL_PROFILE=platform
+
+# Apply preset
+export NARSIL_PRESET=minimal
+
+# Enable specific categories
+export NARSIL_ENABLED_CATEGORIES=Repository,Symbols,Search
+
+# Disable specific tools
+export NARSIL_DISABLED_TOOLS=neural_search,generate_sbom
+```
+
+#### CLI Commands
+
+```bash
+# View effective config
+narsil-mcp config show
+
+# Validate config file
+narsil-mcp config validate ~/.config/narsil-mcp/config.yaml
+
+# List tools by category
+narsil-mcp tools list --category Search
+
+# Search for tools
+narsil-mcp tools search "git"
+
+# Export config
+narsil-mcp config export > my-config.yaml
+
+# List named repository profiles
+narsil-mcp config profiles
+```
+
+**Learn More:**
+- [Configuration Guide](configuration.md) - Full configuration reference
+- [Installation Guide](INSTALL.md) - Platform-specific installation
+
 ## See Also
 
-- [Migration Guide](./migration.md) - Upgrading from previous versions
+- [Changelog](../CHANGELOG.md) - Upgrading from previous versions
 - [Example Configurations](../examples/configs/README.md) - Ready-to-use config templates
 - [README](../README.md) - Main project documentation
 - [Tool Reference](../README.md#mcp-tools-90-total) - Complete tool documentation

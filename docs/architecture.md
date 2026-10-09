@@ -1,3 +1,5 @@
+[← Security Rules](security.md) · [Back to README](../README.md) · [Performance →](performance.md)
+
 # Architecture & Design Patterns
 
 **Version:** 1.8.0 | **Language:** Rust (Edition 2021) | **Last updated:** 2025-08-20
@@ -591,3 +593,45 @@ Backward compatible (no breaking changes)
 **This architecture demonstrates professional systems design with emphasis on performance, reliability, and extensibility across a complex code analysis platform.**
 
 Last updated: 2025-08-20
+
+## Overview Diagram
+
+```
++-----------------------------------------------------------------+
+|                         MCP Server                               |
+|  +-----------------------------------------------------------+  |
+|  |                   JSON-RPC over stdio                      |  |
+|  +-----------------------------------------------------------+  |
+|                              |                                   |
+|  +---------------------------v-------------------------------+  |
+|  |                   Code Intel Engine                        |  |
+|  |  +------------+ +------------+ +------------------------+  |  |
+|  |  |  Symbol    | |   File     | |    Search Engine       |  |  |
+|  |  |  Index     | |   Cache    | |  (Tantivy + TF-IDF)    |  |  |
+|  |  | (DashMap)  | | (DashMap)  | +------------------------+  |  |
+|  |  +------------+ +------------+                              |  |
+|  |  +------------+ +------------+ +------------------------+  |  |
+|  |  | Call Graph | |  Taint     | |   Security Rules       |  |  |
+|  |  |  Analysis  | |  Tracker   | |   Engine               |  |  |
+|  |  +------------+ +------------+ +------------------------+  |  |
+|  +-----------------------------------------------------------+  |
+|                              |                                   |
+|  +---------------------------v-------------------------------+  |
+|  |                Tree-sitter Parser                          |  |
+|  |  +------+ +------+ +------+ +------+ +------+             |  |
+|  |  | Rust | |Python| |  JS  | |  TS  | | Go   | ...         |  |
+|  |  +------+ +------+ +------+ +------+ +------+             |  |
+|  +-----------------------------------------------------------+  |
+|                              |                                   |
+|  +---------------------------v-------------------------------+  |
+|  |                Repository Walker                           |  |
+|  |           (ignore crate - respects .gitignore)             |  |
+|  +-----------------------------------------------------------+  |
++-----------------------------------------------------------------+
+```
+
+## See Also
+
+- [Performance](performance.md) — benchmarks
+- [Development](development.md) — working on the code
+- [Repository Structure](REPO_STRUCTURE.md) — repository layout
