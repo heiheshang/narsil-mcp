@@ -2192,6 +2192,7 @@ dependencies = [
  "ignore",
  "js-sys",
  "lazy_static",
+ "libc",
  "lsp-server",
  "lsp-types",
  "memmap2",

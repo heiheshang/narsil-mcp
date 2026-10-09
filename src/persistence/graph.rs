@@ -57,6 +57,72 @@ pub struct KnowledgeGraph {
     store: Store,
 }
 
+/// How long `open` waits for another process to release the store.
+///
+/// A `systemctl restart` starts the new process while the old one is still
+/// exiting: unmapping ~10 GB takes a while, and RocksDB's lock is only dropped
+/// when its file descriptors close at the very end.
+const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits until no other process holds the RocksDB lock of the store at `path`.
+///
+/// This is not just politeness: oxigraph 0.5.9 wraps RocksDB's "lock held"
+/// message — allocated by C `malloc` — in a Rust `CString` and frees it with
+/// the Rust global allocator. Under mimalloc that is a segfault, so RocksDB
+/// must never get the chance to report the lock. A store that stays locked
+/// fails here with an ordinary error instead.
+#[cfg(unix)]
+fn wait_for_store_lock(path: &Path, timeout: std::time::Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut announced = false;
+    loop {
+        let Some(pid) = store_lock_holder(&path.join("LOCK")) else {
+            return Ok(());
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "knowledge graph store {} is still locked by pid {pid} after {}s",
+                path.display(),
+                timeout.as_secs()
+            ));
+        }
+        if !announced {
+            tracing::info!(
+                "Knowledge graph store {} is locked by pid {pid}; waiting for it to be released",
+                path.display()
+            );
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_store_lock(_path: &Path, _timeout: std::time::Duration) -> Result<()> {
+    Ok(())
+}
+
+/// Pid of another process holding RocksDB's `fcntl` write lock on
+/// `lock_path`, or `None` when the file is absent or unlocked. `F_GETLK` only
+/// inspects: it never takes the lock, so there is nothing to release.
+#[cfg(unix)]
+fn store_lock_holder(lock_path: &Path) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .ok()?;
+    // SAFETY: `flock` is plain old data; all-zero is a valid value.
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as _;
+    probe.l_whence = libc::SEEK_SET as _;
+    // SAFETY: `file` is open for the whole call and `probe` is a valid `flock`.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+    (rc == 0 && i32::from(probe.l_type) != libc::F_UNLCK).then_some(probe.l_pid)
+}
+
 impl std::fmt::Debug for KnowledgeGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KnowledgeGraph")
@@ -83,6 +149,7 @@ impl KnowledgeGraph {
     /// let graph = KnowledgeGraph::open(Path::new("/tmp/narsil-graph")).unwrap();
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
+        wait_for_store_lock(path, STORE_LOCK_WAIT)?;
         let store = Store::open(path).map_err(|e| anyhow!("Failed to open store: {e}"))?;
         Ok(Self { store })
     }
@@ -515,6 +582,56 @@ impl KnowledgeGraph {
 
 #[cfg(test)]
 mod tests {
+
+    /// A store locked by another process makes `open` wait and then fail with
+    /// an error; before the probe existed this path segfaulted under mimalloc.
+    #[cfg(unix)]
+    #[test]
+    fn open_waits_for_a_store_locked_by_another_process() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("graph");
+        drop(KnowledgeGraph::open(&store).unwrap());
+        let lock_path = store.join("LOCK");
+
+        // fcntl locks are per process: the holder has to be a child.
+        // SAFETY: the child only calls async-signal-safe functions and _exits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path);
+                if let Ok(file) = file {
+                    let mut lock: libc::flock = std::mem::zeroed();
+                    lock.l_type = libc::F_WRLCK as _;
+                    lock.l_whence = libc::SEEK_SET as _;
+                    libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock);
+                    libc::sleep(3);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let started = std::time::Instant::now();
+        while store_lock_holder(&lock_path).is_none() {
+            assert!(started.elapsed().as_secs() < 2, "child never took the lock");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(store_lock_holder(&lock_path), Some(child));
+
+        let err = wait_for_store_lock(&store, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("still locked"), "{err}");
+
+        // Once the holder exits, opening succeeds without a restart.
+        let graph = KnowledgeGraph::open(&store);
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        assert!(graph.is_ok(), "{:?}", graph.err());
+    }
+
     use super::*;
 
     #[test]

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Restarting a `--graph` server no longer segfaults once.** A restarted
+  process could start while the old one was still exiting and still held the
+  knowledge graph's RocksDB `LOCK`. RocksDB reports that with a C-`malloc`ed
+  message, which oxigraph 0.5.9 frees through the Rust global allocator —
+  mimalloc here — so the new process died with SIGSEGV and came up only on the
+  supervisor's next retry. `KnowledgeGraph::open` now probes the lock with
+  `fcntl(F_GETLK)` first and waits up to 30 s for the holder to exit, then
+  fails with an ordinary error if the store stays locked.
+
 ### Changed
 
 - **`hybrid_search` and `search_chunks` no longer rebuild an index per call.**
