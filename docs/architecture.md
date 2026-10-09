@@ -84,7 +84,7 @@ narsil-mcp is a high-performance MCP (Model Context Protocol) server written in 
 | `parser.rs` | Tree-sitter language abstraction |
 | `extract.rs` | AST-aware symbol extraction |
 | `search.rs` | Tantivy BM25 full-text search |
-| `index.rs` | CodeIntelEngine (main orchestrator) |
+| `engine/mod.rs` | CodeIntelEngine (main orchestrator) |
 | `store.rs` | SQLite persistence layer |
 | `embeddings.rs` | TF-IDF vector space embeddings |
 | `incremental.rs` | Merkle tree change detection |
@@ -171,7 +171,7 @@ pub struct ToolRegistry {
 - **sparql:** RDF knowledge graph queries
 - **ccg:** Code Context Graph export/import
 
-### 3. CodeIntelEngine (`src/index.rs`)
+### 3. CodeIntelEngine (`src/engine/mod.rs`)
 
 **Pattern:** Facade + Singleton (Arc-wrapped)
 

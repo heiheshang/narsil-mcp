@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
+use crate::engine::CodeIntelEngine;
 use crate::extract::ExcerptConfig;
-use crate::index::CodeIntelEngine;
 
 /// Handler for list_repos tool
 pub struct ListReposHandler;

@@ -5,7 +5,7 @@
 use crate::config::editor::get_editor_preset_or_full;
 use crate::config::preset::Preset;
 use crate::config::schema::ToolConfig;
-use crate::index::EngineOptions;
+use crate::engine::EngineOptions;
 use crate::tool_metadata::{FeatureFlag, PerformanceImpact, ToolMetadata, TOOL_METADATA};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

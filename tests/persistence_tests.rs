@@ -1,5 +1,5 @@
 use anyhow::Result;
-use narsil_mcp::index::FindSymbolsQuery;
+use narsil_mcp::engine::FindSymbolsQuery;
 use narsil_mcp::lsp::LspConfig;
 use narsil_mcp::neural::NeuralConfig;
 use narsil_mcp::streaming::StreamingConfig;
@@ -33,7 +33,7 @@ impl TestRepo {
 
 #[tokio::test]
 async fn test_persistence_index_creation() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file(
@@ -79,7 +79,7 @@ async fn test_persistence_index_creation() -> Result<()> {
 
 #[tokio::test]
 async fn test_persistence_index_loading() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -163,7 +163,7 @@ async fn test_persistence_index_loading() -> Result<()> {
 
 #[tokio::test]
 async fn test_persistence_stale_file_detection() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -246,7 +246,7 @@ async fn test_persistence_stale_file_detection() -> Result<()> {
 
 #[tokio::test]
 async fn test_persistence_disabled() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file(
@@ -294,7 +294,7 @@ async fn test_persistence_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_empty_persisted_index() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     // Don't add any files initially
@@ -359,7 +359,7 @@ async fn test_empty_persisted_index() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_creation() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn test() {}")?;
@@ -394,7 +394,7 @@ async fn test_async_watcher_creation() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn test() {}")?;
@@ -429,7 +429,7 @@ async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_file_change_detection() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -480,7 +480,7 @@ async fn test_async_watcher_file_change_detection() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_debouncing() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -545,7 +545,7 @@ async fn test_async_watcher_debouncing() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_filters_non_source_files() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -609,7 +609,7 @@ async fn test_async_watcher_filters_non_source_files() -> Result<()> {
 /// file event could arrive — silently disabling `--watch`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use narsil_mcp::persist;
     use std::sync::Arc;
     use std::time::Duration;
@@ -676,7 +676,7 @@ async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
 /// dropped the Sender accidentally — not a bug in this function.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use narsil_mcp::persist;
     use std::sync::Arc;
     use std::time::Duration;
@@ -723,7 +723,7 @@ async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
 /// answering "no results" while `find_symbols` still worked.
 #[tokio::test]
 async fn test_warm_start_keeps_search_working() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file(
@@ -824,7 +824,7 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
 /// one repository's files across two buckets in `list_repos`.
 #[tokio::test]
 async fn test_warm_start_reports_the_same_languages() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn alpha() -> i32 { 1 }\n")?;

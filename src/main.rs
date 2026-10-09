@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand};
-use narsil_mcp::{config, http_server, index, lsp, mcp, neural, persist, repo, streaming};
+use narsil_mcp::{config, engine, http_server, lsp, mcp, neural, persist, repo, streaming};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn, Level};
@@ -271,7 +271,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize the code intelligence engine with options
-    let options = index::EngineOptions {
+    let options = engine::EngineOptions {
         git_enabled: server_args.git,
         call_graph_enabled: server_args.call_graph,
         persist_enabled: server_args.persist,
@@ -286,7 +286,7 @@ async fn main() -> Result<()> {
         index_max_file_size: match server_args.max_file_size {
             Some(0) => None,
             Some(n) => Some(n),
-            None => index::EngineOptions::default().index_max_file_size,
+            None => engine::EngineOptions::default().index_max_file_size,
         },
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
@@ -297,7 +297,7 @@ async fn main() -> Result<()> {
     // NOTE: Engine creation is now fast and returns immediately.
     // Indexing happens in background to allow quick MCP server startup.
     let mut engine =
-        index::CodeIntelEngine::with_options(server_args.index_path, repos, options).await?;
+        engine::CodeIntelEngine::with_options(server_args.index_path, repos, options).await?;
 
     // Initialize remote repository support if enabled
     if server_args.remote {

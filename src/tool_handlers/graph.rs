@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{ArgExtractor, ToolHandler};
 use crate::callgraph::CallType;
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 // ============================================================================
 // JSON Schema Types (matching frontend TypeScript interfaces)

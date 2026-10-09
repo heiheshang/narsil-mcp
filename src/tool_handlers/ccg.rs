@@ -8,7 +8,7 @@ use serde_json::Value;
 #[cfg(feature = "graph")]
 use super::ArgExtractor;
 use super::ToolHandler;
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 #[cfg(feature = "graph")]
 use crate::ccg::{AccessControl, AccessMode, AccessTier, AgentId, Authorization};

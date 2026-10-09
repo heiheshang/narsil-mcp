@@ -10,7 +10,7 @@
 /// come from adversarial (vendored, untrusted) source.
 ///
 /// One alias instead of five hand-written `DashMap<K, V, ahash::RandomState>`
-/// declarations spread across `callgraph.rs`/`index.rs`: changing the hasher
+/// declarations spread across `callgraph.rs`/`engine/mod.rs`: changing the hasher
 /// choice is then one edit, not five kept in lockstep by hand.
 pub(crate) type FastMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 
@@ -56,11 +56,11 @@ pub mod ccg;
 #[cfg(feature = "native")]
 pub mod chunk_cache;
 #[cfg(feature = "native")]
+pub mod engine;
+#[cfg(feature = "native")]
 pub mod git;
 #[cfg(feature = "native")]
 pub mod http_server;
-#[cfg(feature = "native")]
-pub mod index;
 #[cfg(feature = "native")]
 pub mod lsp;
 #[cfg(feature = "native")]

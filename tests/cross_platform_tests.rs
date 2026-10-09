@@ -4,7 +4,7 @@
 /// macOS, Linux, and Windows platforms.
 use anyhow::Result;
 use narsil_mcp::config::ConfigLoader;
-use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 use std::env;
 use std::fs;
 use std::path::PathBuf;

@@ -43,7 +43,7 @@ narsil-mcp/
 │   ├── mcp.rs                      # MCP server implementation
 │   │
 │   ├── parser.rs                   # Language parsers (16+)
-│   ├── index.rs                    # Indexing infrastructure
+│   ├── engine/mod.rs               # Indexing infrastructure
 │   │
 │   ├── cache/                      # Query caching (Sprint 1)
 │   │   ├── mod.rs

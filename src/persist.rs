@@ -716,7 +716,7 @@ impl IncrementalIndexer {
 /// from new call sites; it returns the sender so the caller cannot forget to
 /// keep it alive.
 pub async fn run_watch_mode(
-    engine: Arc<crate::index::CodeIntelEngine>,
+    engine: Arc<crate::engine::CodeIntelEngine>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     info!("Starting async watch mode background task");
@@ -768,7 +768,7 @@ pub async fn run_watch_mode(
 #[must_use = "the returned Sender must be held until the watcher should stop; \
               dropping it immediately exits the watcher (issue #26)"]
 pub fn spawn_watch_mode(
-    engine: Arc<crate::index::CodeIntelEngine>,
+    engine: Arc<crate::engine::CodeIntelEngine>,
 ) -> tokio::sync::broadcast::Sender<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     tokio::spawn(async move {

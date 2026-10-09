@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::{CodeIntelEngine, FindSymbolsQuery, SymbolDefinitionQuery};
+use crate::engine::{CodeIntelEngine, FindSymbolsQuery, SymbolDefinitionQuery};
 
 /// Handler for find_symbols tool
 pub struct FindSymbolsHandler;

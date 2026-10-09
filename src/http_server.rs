@@ -27,7 +27,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::ClientInfo;
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 use crate::mcp::McpServer;
 use crate::tool_handlers::ToolRegistry;
 use crate::tool_metadata::TOOL_METADATA;

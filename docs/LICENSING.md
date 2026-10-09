@@ -30,7 +30,7 @@ narsil-mcp/                         # MIT License - PUBLIC on GitHub
 ├── src/
 │   ├── mcp/                        # All 90 MCP tools
 │   ├── parser.rs                   # 32 language parsers
-│   ├── index.rs                    # Local indexing
+│   ├── engine/mod.rs               # Local indexing
 │   ├── cache/                      # Query caching
 │   ├── cfg.rs                      # Control flow analysis
 │   ├── dfg.rs                      # Data flow analysis

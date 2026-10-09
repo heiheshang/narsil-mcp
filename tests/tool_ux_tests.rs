@@ -2,7 +2,7 @@
 //! result caps and loud failures instead of silently-empty successes.
 
 use anyhow::Result;
-use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 use narsil_mcp::tool_handlers::ToolRegistry;
 use serde_json::json;
 use std::path::Path;

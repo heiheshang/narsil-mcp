@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
 // Re-use the library's test utilities
-use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
 #[tokio::test]
 async fn test_engine_creation_is_fast() {

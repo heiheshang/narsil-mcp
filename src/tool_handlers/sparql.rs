@@ -8,7 +8,7 @@ use serde_json::Value;
 #[cfg(feature = "graph")]
 use super::ArgExtractor;
 use super::ToolHandler;
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for sparql_query tool
 pub struct SparqlQueryHandler;

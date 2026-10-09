@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 mod analysis;
 mod callgraph;

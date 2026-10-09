@@ -1,4 +1,4 @@
-use narsil_mcp::index::CodeIntelEngine;
+use narsil_mcp::engine::CodeIntelEngine;
 use std::fs;
 use tempfile::TempDir;
 

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for get_control_flow tool
 pub struct GetControlFlowHandler;
