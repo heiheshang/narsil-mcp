@@ -99,6 +99,7 @@ glob = "0.3"
 
 # Indexing and search
 tantivy = { version = "0.22", default-features = false, features = ["lz4-compression"] }  # Full-text search engine (no mmap for wasm compat)
+rust-stemmers = "1.2"  # Snowball Russian stemmer for Cyrillic tokens (already pulled in by tantivy)
 memmap2 = "0.9"   # Memory-mapped files for speed
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }   # Binary serialization for index persistence
 regex = "1.10"    # Regular expression support

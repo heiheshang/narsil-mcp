@@ -2213,6 +2213,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rust-embed",
+ "rust-stemmers",
  "serde",
  "serde-saphyr",
  "serde_json",

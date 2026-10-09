@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Russian words match across inflections.** `tokenize_code` now reduces
+  all-Cyrillic tokens to their Snowball Russian stem (with `ё` folded to `е`),
+  so `остановкой` finds `Остановка` and `обработчиков` finds `Обработчики`.
+  Every token-based index shares the tokenizer: BM25 (`semantic_search`,
+  `hybrid_search`), TF-IDF and the chunk token cache. On the 67-query 1C set,
+  `hybrid_search` rose from hit@5 0.507 to 0.687 (McNemar p=0.0075), recall@20
+  0.687 → 0.866 (p=0.0042), MRR@10 +0.112 (p=0.0036); `search_chunks` did not
+  change significantly. Indexing the 210 MB CommonModules dump took 28.1 s
+  instead of 26.3 s. The persisted BM25 index records the tokenizer version
+  and is rebuilt on first start after the upgrade.
+
 - **`semantic_search` says when it is guessing.** Without `--neural` it is
   keyword search (BM25), so a query whose words the code does not use — e.g.
   Russian against English identifiers — used to return a confident-looking page

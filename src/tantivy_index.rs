@@ -41,7 +41,12 @@ use tantivy::{
     Term,
 };
 
-use crate::search::{tokenize_code, DocType, SearchDocument};
+use crate::search::{tokenize_code, DocType, SearchDocument, TOKENIZER_VERSION};
+
+/// File in a persisted index directory recording the [`TOKENIZER_VERSION`]
+/// its terms were produced with.
+#[cfg(feature = "native")]
+const TOKENIZER_MARKER: &str = "narsil-tokenizer-version";
 
 /// Name under which [`CodeTokenizer`] is registered with tantivy.
 pub const CODE_TOKENIZER: &str = "code";
@@ -247,8 +252,27 @@ impl TantivyIndex {
     pub fn open_or_create(path: &std::path::Path) -> Result<Self> {
         use tantivy::directory::MmapDirectory;
 
+        // Terms indexed under another tokenizer version never match today's
+        // queries; the index is a cache, so drop it and let indexing refill it.
+        let marker = path.join(TOKENIZER_MARKER);
+        let indexed_with = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if path.join("meta.json").exists() && indexed_with != Some(TOKENIZER_VERSION) {
+            tracing::info!(
+                "Tantivy index at {:?} built with tokenizer {:?}, current is {}; rebuilding",
+                path,
+                indexed_with,
+                TOKENIZER_VERSION
+            );
+            std::fs::remove_dir_all(path)
+                .with_context(|| format!("remove stale tantivy index {:?}", path))?;
+        }
+
         std::fs::create_dir_all(path)
             .with_context(|| format!("create tantivy index dir {:?}", path))?;
+        std::fs::write(&marker, TOKENIZER_VERSION.to_string())
+            .with_context(|| format!("write tokenizer marker {:?}", marker))?;
         let dir = MmapDirectory::open(path)
             .with_context(|| format!("open tantivy index dir {:?}", path))?;
 
@@ -267,6 +291,8 @@ impl TantivyIndex {
                 std::fs::remove_dir_all(path).ok();
                 std::fs::create_dir_all(path)
                     .with_context(|| format!("recreate tantivy index dir {:?}", path))?;
+                std::fs::write(&marker, TOKENIZER_VERSION.to_string())
+                    .with_context(|| format!("write tokenizer marker {:?}", marker))?;
                 let dir = MmapDirectory::open(path)
                     .with_context(|| format!("reopen tantivy index dir {:?}", path))?;
                 Index::open_or_create(dir, schema).context("create tantivy index")?
@@ -936,6 +962,24 @@ mod delete_ordering_tests {
             end_line: 10,
             term_freq: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn an_index_from_another_tokenizer_version_is_rebuilt_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+            idx.add_document(doc("a.rs::f", "r", "durable")).unwrap();
+            idx.commit().unwrap();
+        }
+        std::fs::write(dir.path().join(TOKENIZER_MARKER), "1").unwrap();
+
+        let reopened = TantivyIndex::open_or_create(dir.path()).unwrap();
+        assert_eq!(reopened.num_docs(), 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(TOKENIZER_MARKER)).unwrap(),
+            TOKENIZER_VERSION.to_string()
+        );
     }
 
     #[test]

@@ -398,7 +398,46 @@ pub fn tokenize_code(text: &str) -> Vec<String> {
         })
         .filter(|t| t.len() >= 2)
         .filter(|t| !is_stop_word(t))
+        .map(stem_cyrillic)
         .collect()
+}
+
+/// Version of the term semantics produced by [`tokenize_code`]. Persisted
+/// indexes record it and are rebuilt when it changes, since terms indexed
+/// under one version never match queries tokenized under another.
+///
+/// 2: Cyrillic tokens are stemmed.
+pub const TOKENIZER_VERSION: u32 = 2;
+
+/// Reduces an all-Cyrillic token to its Snowball Russian stem, so that
+/// `остановкой`, `остановка` and `Остановить` meet in the index. 1C (BSL)
+/// identifiers and comments are Russian and inflected; without this a query
+/// only matches the exact word form the code happens to use. `ё` is folded to
+/// `е` first: the code writes either, and the stemmer treats them apart.
+/// Tokens with any non-Cyrillic character are left alone.
+fn stem_cyrillic(token: String) -> String {
+    use rust_stemmers::{Algorithm, Stemmer};
+    use std::sync::OnceLock;
+
+    static RUSSIAN: OnceLock<Stemmer> = OnceLock::new();
+
+    if token.is_ascii() || !token.chars().all(is_cyrillic_letter) {
+        return token;
+    }
+    let folded = token.replace('ё', "е");
+    let stem = RUSSIAN
+        .get_or_init(|| Stemmer::create(Algorithm::Russian))
+        .stem(&folded);
+    // A stem shorter than two characters loses too much to be useful.
+    if stem.chars().count() >= 2 {
+        stem.into_owned()
+    } else {
+        folded
+    }
+}
+
+fn is_cyrillic_letter(ch: char) -> bool {
+    matches!(ch, '\u{0400}'..='\u{04FF}') && ch.is_alphabetic()
 }
 
 /// Split identifiers by camelCase, PascalCase, and snake_case
@@ -605,6 +644,24 @@ mod tests {
     }
 
     #[test]
+    fn cyrillic_word_forms_share_a_stem() {
+        let stem = |text: &str| tokenize_code(text);
+        assert_eq!(stem("остановкой"), stem("остановка"));
+        assert_eq!(stem("Обработчиков"), stem("обработчики"));
+        assert_eq!(stem("документа"), stem("Документ"));
+        // `ё` and `е` spellings meet.
+        assert_eq!(stem("Счётчик"), stem("Счетчик"));
+    }
+
+    #[test]
+    fn stemming_leaves_latin_and_mixed_tokens_alone() {
+        let tokens = tokenize_code("handlers ОбработчикиОбновления");
+        assert!(tokens.contains(&"handlers".to_string()));
+        assert!(tokens.iter().all(|t| t != "обработчики"));
+        assert!(tokens.contains(&"обработчик".to_string()));
+    }
+
+    #[test]
     fn test_tokenize_snake_case() {
         let tokens = tokenize_code("get_user_by_id");
         assert!(tokens.contains(&"get".to_string()));
@@ -741,9 +798,9 @@ mod tests {
     #[test]
     fn test_tokenize_cyrillic_camel_case() {
         let tokens = tokenize_code("ОбработатьXMLДанные");
-        assert!(tokens.contains(&"обработать".to_string()));
+        assert!(tokens.contains(&stem_cyrillic("обработать".to_string())));
         assert!(tokens.contains(&"xml".to_string()));
-        assert!(tokens.contains(&"данные".to_string()));
+        assert!(tokens.contains(&stem_cyrillic("данные".to_string())));
         assert!(tokens.contains(&"обработатьxmlданные".to_string()));
     }
 
@@ -751,16 +808,16 @@ mod tests {
     fn test_tokenize_mixed_script_identifier() {
         let tokens = tokenize_code("xmlклиент");
         assert!(tokens.contains(&"xml".to_string()));
-        assert!(tokens.contains(&"клиент".to_string()));
+        assert!(tokens.contains(&stem_cyrillic("клиент".to_string())));
         assert!(tokens.contains(&"xmlклиент".to_string()));
     }
 
     #[test]
     fn test_tokenize_mixed_digits_and_cyrillic() {
         let tokens = tokenize_code("УТ11ОбменXML");
-        assert!(tokens.contains(&"ут".to_string()));
+        assert!(tokens.contains(&stem_cyrillic("ут".to_string())));
         assert!(tokens.contains(&"11".to_string()));
-        assert!(tokens.contains(&"обмен".to_string()));
+        assert!(tokens.contains(&stem_cyrillic("обмен".to_string())));
         assert!(tokens.contains(&"xml".to_string()));
         assert!(tokens.contains(&"ут11обменxml".to_string()));
     }
