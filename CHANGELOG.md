@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`hybrid_search` and `search_chunks` no longer rebuild an index per call.**
+  `hybrid_search` built a fresh BM25 + TF-IDF index over every chunk of the
+  repository on each request, and `search_chunks` re-chunked and re-tokenized
+  every file; on a 2,279-module 1C dump that was 83 s and 37 s per query.
+  `hybrid_search` now fuses three rankings with RRF: the persistent BM25 index
+  (symbol cards), the TF-IDF embeddings (signatures) and query-token overlap
+  with function bodies. The bodies come from a new chunk token cache
+  (`src/chunk_cache.rs`): chunk boundaries and interned token ids, no text,
+  filled lazily on first use and revalidated per file by size and mtime.
+  `search_chunks` scores from the same cache and re-chunks only the files whose
+  chunks it returns. On that corpus: `hybrid_search` 0.07–0.12 s, `search_chunks`
+  0.6–2 s, the first call after startup ~12 s while the cache warms. Retrieval
+  quality on a 67-query 1C benchmark is unchanged (paired permutation test on
+  MRR, p = 0.29); fusing only the two persistent indexes lost recall@20
+  (0.76 → 0.58), which is why the body ranking is part of the fusion. Unscoped
+  `hybrid_search` results now carry a `Repo` line and repo-relative paths.
+
 - **The BM25 index is tantivy's now, and it survives a restart.** `tantivy` had
   been a non-optional dependency since the beginning and was imported nowhere:
   the only occurrence of the name in the source was a licence string in a

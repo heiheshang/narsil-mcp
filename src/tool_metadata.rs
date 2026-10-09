@@ -552,7 +552,7 @@ lazy_static! {
 
         map.insert("hybrid_search", ToolMetadata {
             name: "hybrid_search",
-            description: "Perform hybrid search combining BM25 keyword search with TF-IDF semantic similarity using Reciprocal Rank Fusion (RRF).",
+            description: "Perform hybrid search fusing three rankings with Reciprocal Rank Fusion (RRF): BM25 over symbol cards (name, signature, doc comment), TF-IDF over signatures, and query-token overlap with function bodies. mode=bm25|tfidf uses a single index. The first hybrid call after startup builds the body token cache and is slower.",
             category: ToolCategory::Search,
             tags: ["search", "hybrid", "bm25", "tfidf", "rrf"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
