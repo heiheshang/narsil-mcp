@@ -150,6 +150,11 @@ impl KnowledgeGraph {
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
         wait_for_store_lock(path, STORE_LOCK_WAIT)?;
+        // Only the lock case is guarded. Any other error RocksDB reports here
+        // (corrupt files, permissions, disk full) goes through the same
+        // oxigraph `ErrorStatus` drop and still segfaults under mimalloc; see
+        // `wait_for_store_lock`. Fixing that needs oxigraph to free the message
+        // with `libc::free`, or mimalloc's `override` feature.
         let store = Store::open(path).map_err(|e| anyhow!("Failed to open store: {e}"))?;
         Ok(Self { store })
     }

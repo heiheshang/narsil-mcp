@@ -772,7 +772,17 @@ impl CodeIntelEngine {
                 .graph_path
                 .clone()
                 .unwrap_or_else(|| expanded_index.join("graph"));
-            match crate::persistence::KnowledgeGraph::open(&graph_path) {
+            // `open` may sleep up to 30 s waiting for a previous process to
+            // release the store, so keep it off the async worker threads.
+            let opened = {
+                let graph_path = graph_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::persistence::KnowledgeGraph::open(&graph_path)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("graph open task failed: {e}")))
+            };
+            match opened {
                 Ok(graph) => {
                     info!("Knowledge graph opened at {:?}", graph_path);
                     // Load ontology if the graph is new/empty
