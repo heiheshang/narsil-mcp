@@ -357,11 +357,6 @@ impl Default for EngineOptions {
     }
 }
 
-/// Cached chunk signatures of one file (see `index::text::chunk_cache`).
-type FileChunkSigs = Arc<[crate::index::text::chunk_cache::ChunkSig]>;
-/// `(file index, chunk index, score)` from `score_cached_chunks`.
-type ChunkHit = (usize, usize, f64);
-
 /// The main code intelligence engine
 pub struct CodeIntelEngine {
     /// Base path for index storage (stored for potential future use)

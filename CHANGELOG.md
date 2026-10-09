@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Library module paths changed (`narsil_mcp::…`).** `index` is now
+  `engine` (`narsil_mcp::engine::CodeIntelEngine`, `EngineOptions`), and
+  `chunk_cache` moved to `index::text::chunk_cache`. The name `index` now
+  belongs to the new index layer, so old imports fail with a missing-item
+  error inside `index`, not a missing module. `hybrid_search` and
+  `search_chunks` live in `src/engine/search.rs`. The binary and MCP tools are
+  unchanged.
+
 - **`hybrid_search` and `search_chunks` no longer rebuild an index per call.**
   `hybrid_search` built a fresh BM25 + TF-IDF index over every chunk of the
   repository on each request, and `search_chunks` re-chunked and re-tokenized
@@ -27,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hybrid_search` now fuses three rankings with RRF: the persistent BM25 index
   (symbol cards), the TF-IDF embeddings (signatures) and query-token overlap
   with function bodies. The bodies come from a new chunk token cache
-  (`src/chunk_cache.rs`): chunk boundaries and interned token ids, no text,
+  (`src/index/text/chunk_cache.rs`): chunk boundaries and interned token ids, no text,
   filled lazily on first use and revalidated per file by size and mtime.
   `search_chunks` scores from the same cache and re-chunks only the files whose
   chunks it returns. On that corpus: `hybrid_search` 0.07–0.12 s, `search_chunks`

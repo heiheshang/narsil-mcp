@@ -6,14 +6,22 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::{
-    normalized_document_primary_source, render_normalized_search_content, ChunkHit,
-    CodeIntelEngine, FileChunkSigs,
+    normalized_document_primary_source, render_normalized_search_content, CodeIntelEngine,
 };
+use crate::index::text::chunk_cache::ChunkSig;
+
+/// Cached chunk signatures of one file (see `index::text::chunk_cache`).
+type FileChunkSigs = Arc<[ChunkSig]>;
+/// `(file index, chunk index, score)` from `score_cached_chunks`.
+type ChunkHit = (usize, usize, f64);
 
 impl CodeIntelEngine {
-    /// Perform hybrid search combining BM25 and TF-IDF
+    /// Hybrid search: fuses three rankings with RRF — BM25 over symbol cards,
+    /// TF-IDF over signatures, and query-token overlap with function bodies
+    /// from `chunk_cache`. `mode` = `bm25` | `tfidf` uses a single index.
     pub async fn hybrid_search(
         &self,
         query: &str,
