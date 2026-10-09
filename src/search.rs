@@ -402,19 +402,11 @@ pub fn tokenize_code(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Version of the term semantics produced by [`tokenize_code`]. Persisted
-/// indexes record it and are rebuilt when it changes, since terms indexed
-/// under one version never match queries tokenized under another.
-///
-/// 2: Cyrillic tokens are stemmed.
+/// Bump whenever [`tokenize_code`] output changes: persisted indexes built
+/// with another version are discarded.
 pub const TOKENIZER_VERSION: u32 = 2;
 
-/// Reduces an all-Cyrillic token to its Snowball Russian stem, so that
-/// `остановкой`, `остановка` and `Остановить` meet in the index. 1C (BSL)
-/// identifiers and comments are Russian and inflected; without this a query
-/// only matches the exact word form the code happens to use. `ё` is folded to
-/// `е` first: the code writes either, and the stemmer treats them apart.
-/// Tokens with any non-Cyrillic character are left alone.
+/// `ё` is folded first: code writes either, and the stemmer treats them apart.
 fn stem_cyrillic(token: String) -> String {
     use rust_stemmers::{Algorithm, Stemmer};
     use std::sync::OnceLock;
@@ -649,7 +641,6 @@ mod tests {
         assert_eq!(stem("остановкой"), stem("остановка"));
         assert_eq!(stem("Обработчиков"), stem("обработчики"));
         assert_eq!(stem("документа"), stem("Документ"));
-        // `ё` and `е` spellings meet.
         assert_eq!(stem("Счётчик"), stem("Счетчик"));
     }
 

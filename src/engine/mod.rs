@@ -129,7 +129,7 @@ mod query_coverage_tests {
         let coverage = QueryCoverage::new("wait handler before shutdown");
         assert!(coverage.is_weak(1));
         assert!(!coverage.is_weak(2));
-        // A one-word query is either found or not; nothing to call weak.
+        // A one-word query either matched or not: never "weak".
         assert!(!QueryCoverage::new("shutdown").is_weak(0));
     }
 }
@@ -384,38 +384,34 @@ impl Default for EngineOptions {
     }
 }
 
-/// How much of a keyword query a search hit actually contains.
-///
-/// BM25 returns a document as soon as one query term (or one of its code
-/// synonyms) occurs in it, so a natural-language query with no words in common
-/// with the code still yields a full page of hits. Counting covered query terms
-/// lets `semantic_search` say so instead of presenting them as answers.
+/// BM25 returns any document sharing a single query term, so a query unrelated
+/// to the code still fills a page; coverage tells real hits from those.
 struct QueryCoverage {
-    /// Distinct query tokens with their code synonyms.
-    terms: Vec<(String, Vec<String>)>,
+    tokens_with_synonyms: Vec<(String, Vec<String>)>,
 }
 
 impl QueryCoverage {
     fn new(query: &str) -> Self {
         let synonyms = crate::search::build_code_synonyms();
-        let mut terms: Vec<(String, Vec<String>)> = Vec::new();
+        let mut tokens_with_synonyms: Vec<(String, Vec<String>)> = Vec::new();
         for token in crate::search::tokenize_code(query) {
-            if terms.iter().any(|(t, _)| *t == token) {
+            if tokens_with_synonyms.iter().any(|(t, _)| *t == token) {
                 continue;
             }
             let alternatives = synonyms.get(&token).cloned().unwrap_or_default();
-            terms.push((token, alternatives));
+            tokens_with_synonyms.push((token, alternatives));
         }
-        Self { terms }
+        Self {
+            tokens_with_synonyms,
+        }
     }
 
     fn len(&self) -> usize {
-        self.terms.len()
+        self.tokens_with_synonyms.len()
     }
 
-    /// Query tokens present in `matched`, directly or through a synonym.
     fn covered(&self, matched: &[String]) -> usize {
-        self.terms
+        self.tokens_with_synonyms
             .iter()
             .filter(|(token, alternatives)| {
                 matched.contains(token) || alternatives.iter().any(|a| matched.contains(a))
@@ -423,9 +419,8 @@ impl QueryCoverage {
             .count()
     }
 
-    /// True when even the best hit holds less than half of a multi-word query.
     fn is_weak(&self, best_covered: usize) -> bool {
-        self.terms.len() >= 2 && best_covered * 2 < self.terms.len()
+        self.tokens_with_synonyms.len() >= 2 && best_covered * 2 < self.tokens_with_synonyms.len()
     }
 }
 
@@ -447,8 +442,6 @@ pub struct CodeIntelEngine {
     /// "trusted" for this tool and why `ahash` here is still an accepted
     /// tradeoff rather than a real DoS exposure.
     file_cache: FastMap<PathBuf, ()>,
-    /// Chunk boundaries + interned token sets for `search_chunks`, filled
-    /// lazily on first use and revalidated per file against size + mtime.
     chunk_cache: crate::index::text::chunk_cache::ChunkTokenCache,
     /// Synthetic normalized documents indexed separately from raw files
     normalized_docs: DashMap<String, Vec<NormalizedDocument>>,
@@ -841,8 +834,7 @@ impl CodeIntelEngine {
                 .graph_path
                 .clone()
                 .unwrap_or_else(|| expanded_index.join("graph"));
-            // `open` may sleep up to 30 s waiting for a previous process to
-            // release the store, so keep it off the async worker threads.
+            // `open` may block for up to 30 s waiting on the store lock.
             let opened = {
                 let graph_path = graph_path.clone();
                 tokio::task::spawn_blocking(move || {
@@ -5672,7 +5664,7 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
-    // Phase 2: Enhanced Search & Embeddings (hybrid_search, search_chunks: see search.rs)
+    // Phase 2: Enhanced Search & Embeddings
 
     /// Get AST-aware chunks for a file
     pub async fn get_chunks(

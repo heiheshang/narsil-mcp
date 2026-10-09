@@ -19,7 +19,6 @@ pub struct HybridSearchConfig {
     pub bm25_weight: f64,
     /// Weight for TF-IDF/semantic results (0.0 to 1.0)
     pub tfidf_weight: f64,
-    /// Weight for an extra, caller-ranked list (e.g. chunk bodies)
     pub extra_weight: f64,
     /// Boost factor for exact name matches
     pub exact_match_boost: f64,
@@ -48,7 +47,7 @@ impl Default for HybridSearchConfig {
 pub struct HybridResult {
     /// Unique identifier
     pub id: String,
-    /// Repository the document belongs to (empty for transient indexes)
+    /// Empty for transient indexes.
     #[serde(default)]
     pub repo: String,
     /// File path
@@ -126,15 +125,12 @@ impl HybridSearchEngine {
         self.search_in(query, limit, None)
     }
 
-    /// Hybrid search restricted to one repository when `repo` is set. Both
-    /// indexes filter before ranking, so `limit` is spent on that repository.
+    /// Filters before ranking, so `limit` is spent inside `repo`.
     pub fn search_in(&self, query: &str, limit: usize, repo: Option<&str>) -> Vec<HybridResult> {
         self.search_in_with(query, limit, repo, &[])
     }
 
-    /// Hybrid search fusing a third, already-ranked list into RRF. `extra`
-    /// items are keyed by `(repo, id)` like the index results, so an item
-    /// whose id matches a BM25/TF-IDF document reinforces it.
+    /// `extra` items reinforce an index document only if they carry its `(repo, id)`.
     pub fn search_in_with(
         &self,
         query: &str,
@@ -162,7 +158,6 @@ impl HybridSearchEngine {
         self.search_bm25_in(query, limit, None)
     }
 
-    /// BM25-only search, optionally restricted to one repository
     pub fn search_bm25_in(
         &self,
         query: &str,
@@ -196,7 +191,6 @@ impl HybridSearchEngine {
         self.search_tfidf_in(query, limit, None)
     }
 
-    /// TF-IDF-only search, optionally restricted to one repository
     pub fn search_tfidf_in(
         &self,
         query: &str,
@@ -303,7 +297,6 @@ impl HybridSearchEngine {
             });
         }
 
-        // Process the extra list (ranked by the caller)
         for (rank, result) in extra.iter().enumerate() {
             let key = fusion_key(&result.repo, &result.id);
             let mut boost = 1.0;
@@ -553,8 +546,6 @@ mod tests {
         };
         let plain = engine.search_in_with("parse", 10, None, &[]);
         let fused = engine.search_in_with("parse", 10, None, &[extra("b")]);
-        // A body hit on "b" adds to b's index entries instead of becoming a
-        // separate result.
         assert!(
             score_of(&fused, "b") > score_of(&plain, "b"),
             "{plain:?}\n{fused:?}"

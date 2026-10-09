@@ -43,8 +43,6 @@ use tantivy::{
 
 use crate::search::{tokenize_code, DocType, SearchDocument, TOKENIZER_VERSION};
 
-/// File in a persisted index directory recording the [`TOKENIZER_VERSION`]
-/// its terms were produced with.
 #[cfg(feature = "native")]
 const TOKENIZER_MARKER: &str = "narsil-tokenizer-version";
 
@@ -252,8 +250,7 @@ impl TantivyIndex {
     pub fn open_or_create(path: &std::path::Path) -> Result<Self> {
         use tantivy::directory::MmapDirectory;
 
-        // Terms indexed under another tokenizer version never match today's
-        // queries; the index is a cache, so drop it and let indexing refill it.
+        // The index is a cache: drop it, indexing refills it.
         let marker = path.join(TOKENIZER_MARKER);
         let indexed_with = std::fs::read_to_string(&marker)
             .ok()
@@ -458,8 +455,6 @@ impl TantivyIndex {
 
         let mut body_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        // Every term queried against `body`, literal tokens first, so a hit can
-        // report which of them its document actually contains.
         let mut body_terms: Vec<&str> = Vec::new();
 
         for t in &tokens {
@@ -521,9 +516,7 @@ impl TantivyIndex {
             .filter_map(|(score, addr)| {
                 let td: TantivyDocument = searcher.doc(addr).ok()?;
                 let doc = self.document_from(&td)?;
-                // Tantivy does not report which clauses matched, so look the
-                // queried terms up in this document's postings. Callers show
-                // these to explain a hit and to flag weak, one-word matches.
+                // Tantivy does not report which clauses matched.
                 let segment = searcher.segment_reader(addr.segment_ord);
                 let matched = terms_in_doc(segment, f.body, &body_terms, addr.doc_id);
                 Some((doc, score as f64, matched))
@@ -728,7 +721,6 @@ impl ConcurrentTantivyIndex {
     }
 }
 
-/// The subset of `terms` that occur in document `doc` of `segment`'s `field`.
 fn terms_in_doc(segment: &SegmentReader, field: Field, terms: &[&str], doc: DocId) -> Vec<String> {
     let Ok(inverted) = segment.inverted_index(field) else {
         return Vec::new();
@@ -738,8 +730,7 @@ fn terms_in_doc(segment: &SegmentReader, field: Field, terms: &[&str], doc: DocI
         .filter(|t| {
             let term = Term::from_field_text(field, t);
             match inverted.read_postings(&term, IndexRecordOption::Basic) {
-                // `seek` must not move backwards: a posting list that starts
-                // past `doc` simply does not contain it.
+                // `seek` must not move backwards (tantivy asserts on it).
                 Ok(Some(mut postings)) => postings.doc() <= doc && postings.seek(doc) == doc,
                 _ => false,
             }

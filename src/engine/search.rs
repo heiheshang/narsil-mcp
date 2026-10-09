@@ -1,8 +1,3 @@
-//! Search services: `hybrid_search` and `search_chunks`.
-//!
-//! Both rank from indexes built at indexing time (tantivy symbol cards,
-//! TF-IDF, the lazy `chunk_cache`) and re-read file text only for output.
-
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,15 +8,11 @@ use super::{
 };
 use crate::index::text::chunk_cache::ChunkSig;
 
-/// Cached chunk signatures of one file (see `index::text::chunk_cache`).
 type FileChunkSigs = Arc<[ChunkSig]>;
 /// `(file index, chunk index, score)` from `score_cached_chunks`.
 type ChunkHit = (usize, usize, f64);
 
 impl CodeIntelEngine {
-    /// Hybrid search: fuses three rankings with RRF — BM25 over symbol cards,
-    /// TF-IDF over signatures, and query-token overlap with function bodies
-    /// from `chunk_cache`. `mode` = `bm25` | `tfidf` uses a single index.
     pub async fn hybrid_search(
         &self,
         query: &str,
@@ -39,10 +30,8 @@ impl CodeIntelEngine {
             _ => None,
         };
 
-        // Fuse the indexes the engine already maintains (BM25 over symbol
-        // cards, TF-IDF over signatures) instead of re-chunking and
-        // re-indexing the whole repository per query: that took ~80 s a call
-        // on a 2.3k-module 1C dump.
+        // Never build an index per query here: on a large repository that costs
+        // tens of seconds per call.
         let hybrid_engine =
             create_hybrid_engine(self.search_index.clone(), self.embedding_engine.clone());
         let fetch = if exclude_tests {
@@ -55,9 +44,8 @@ impl CodeIntelEngine {
             "bm25" => hybrid_engine.search_bm25_in(query, fetch, scope),
             "tfidf" => hybrid_engine.search_tfidf_in(query, fetch, scope),
             _ => {
-                // Symbol cards hold names, signatures and doc comments, not
-                // bodies; rank bodies from the chunk token cache as a third
-                // list so code that only *uses* the query terms is found too.
+                // Symbol cards have no bodies; without this list code that only
+                // uses the query terms is not found.
                 let bodies = self.rank_chunk_bodies(query, target_repo.as_deref(), fetch * 3);
                 hybrid_engine.search_in_with(query, fetch, scope, &bodies)
             }
@@ -129,9 +117,7 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
-    /// Chunk bodies ranked by query-token overlap, as hybrid-search results
-    /// keyed like the symbol cards (`file::symbol`) so RRF fuses a body hit
-    /// with the card of the same function.
+    /// Ids must match the symbol cards' `file::symbol` for RRF to fuse them.
     fn rank_chunk_bodies(
         &self,
         query: &str,
@@ -212,13 +198,7 @@ impl CodeIntelEngine {
         out
     }
 
-    /// Score every chunk of `files` by the share of distinct `query_tokens`
-    /// it contains, from the token cache. Only a cold or changed file is read
-    /// and chunked; the first call warms the cache in parallel.
-    ///
-    /// Returns the chunk signatures aligned with `files` (`None` for files
-    /// that could not be read or chunked) and the non-zero hits as
-    /// `(file index, chunk index, score)`, unsorted.
+    /// Signatures are aligned with `files`; hits are unsorted.
     fn score_cached_chunks(
         &self,
         query_tokens: &std::collections::HashSet<String>,
@@ -290,8 +270,7 @@ impl CodeIntelEngine {
             _ => None,
         });
 
-        // Files of the requested repos, then normalized documents (scored
-        // directly — there are few of them and they are not files on disk).
+        // Normalized documents are not files on disk: scored directly below.
         let mut files: Vec<PathBuf> = Vec::new();
         let mut normalized_hits: Vec<(crate::chunking::CodeChunk, f64)> = Vec::new();
         for repo_entry in self.repos.iter() {
@@ -354,9 +333,7 @@ impl CodeIntelEngine {
 
         let (_, file_hits) = self.score_cached_chunks(&query_tokens, &files, target_type);
 
-        // Rank on scores alone, then materialize only the winners: re-chunk
-        // each winning file once. Ties break on path and position so the
-        // order no longer depends on hash-map iteration.
+        // Ties break on path and position: hash-map order is not stable.
         enum Hit {
             File(usize, usize),
             Normalized(usize),
@@ -400,8 +377,7 @@ impl CodeIntelEngine {
                             })
                             .unwrap_or_default()
                     });
-                    // The file changed between scoring and display: skip it
-                    // rather than show a chunk the score was not computed on.
+                    // Changed since scoring: the score is not about this chunk.
                     if let Some(chunk) = chunks.get(i) {
                         all_chunks.push((chunk.clone(), score));
                     }

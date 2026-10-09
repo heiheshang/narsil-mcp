@@ -57,20 +57,13 @@ pub struct KnowledgeGraph {
     store: Store,
 }
 
-/// How long `open` waits for another process to release the store.
-///
-/// A `systemctl restart` starts the new process while the old one is still
-/// exiting: unmapping ~10 GB takes a while, and RocksDB's lock is only dropped
-/// when its file descriptors close at the very end.
+/// `systemctl restart` starts the new process while the old one still holds
+/// RocksDB's lock: it is released only when the old process's files close.
 const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Waits until no other process holds the RocksDB lock of the store at `path`.
-///
-/// This is not just politeness: oxigraph 0.5.9 wraps RocksDB's "lock held"
-/// message — allocated by C `malloc` — in a Rust `CString` and frees it with
-/// the Rust global allocator. Under mimalloc that is a segfault, so RocksDB
-/// must never get the chance to report the lock. A store that stays locked
-/// fails here with an ordinary error instead.
+/// RocksDB must never get to report a held lock: oxigraph 0.5.9 frees its
+/// C-`malloc`ed error message with the Rust allocator, which segfaults under
+/// mimalloc.
 #[cfg(unix)]
 fn wait_for_store_lock(path: &Path, timeout: std::time::Duration) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
@@ -102,9 +95,7 @@ fn wait_for_store_lock(_path: &Path, _timeout: std::time::Duration) -> Result<()
     Ok(())
 }
 
-/// Pid of another process holding RocksDB's `fcntl` write lock on
-/// `lock_path`, or `None` when the file is absent or unlocked. `F_GETLK` only
-/// inspects: it never takes the lock, so there is nothing to release.
+/// `F_GETLK` only inspects the lock; it never takes it.
 #[cfg(unix)]
 fn store_lock_holder(lock_path: &Path) -> Option<i32> {
     use std::os::fd::AsRawFd;
@@ -150,11 +141,8 @@ impl KnowledgeGraph {
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
         wait_for_store_lock(path, STORE_LOCK_WAIT)?;
-        // Only the lock case is guarded. Any other error RocksDB reports here
-        // (corrupt files, permissions, disk full) goes through the same
-        // oxigraph `ErrorStatus` drop and still segfaults under mimalloc; see
-        // `wait_for_store_lock`. Fixing that needs oxigraph to free the message
-        // with `libc::free`, or mimalloc's `override` feature.
+        // Any other RocksDB error here still segfaults (see `wait_for_store_lock`).
+        // Needs an oxigraph fix or mimalloc's `override` feature.
         let store = Store::open(path).map_err(|e| anyhow!("Failed to open store: {e}"))?;
         Ok(Self { store })
     }
@@ -588,8 +576,6 @@ impl KnowledgeGraph {
 #[cfg(test)]
 mod tests {
 
-    /// A store locked by another process makes `open` wait and then fail with
-    /// an error; before the probe existed this path segfaulted under mimalloc.
     #[cfg(unix)]
     #[test]
     fn open_waits_for_a_store_locked_by_another_process() {
@@ -631,7 +617,6 @@ mod tests {
         let err = wait_for_store_lock(&store, std::time::Duration::from_millis(300)).unwrap_err();
         assert!(err.to_string().contains("still locked"), "{err}");
 
-        // Once the holder exits, opening succeeds without a restart.
         let graph = KnowledgeGraph::open(&store);
         unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
         assert!(graph.is_ok(), "{:?}", graph.err());
