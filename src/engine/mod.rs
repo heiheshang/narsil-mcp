@@ -108,6 +108,33 @@ fn expand_braces(pattern: &str) -> std::result::Result<Vec<String>, String> {
 }
 
 #[cfg(test)]
+mod query_coverage_tests {
+    use super::QueryCoverage;
+
+    fn terms(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn counts_query_tokens_found_directly_or_through_a_synonym() {
+        let coverage = QueryCoverage::new("wait handler error");
+        assert_eq!(coverage.len(), 3);
+        assert_eq!(coverage.covered(&terms(&["handler"])), 1);
+        // `exception` is a code synonym of `error`.
+        assert_eq!(coverage.covered(&terms(&["handler", "exception"])), 2);
+    }
+
+    #[test]
+    fn flags_a_best_hit_holding_less_than_half_of_the_query() {
+        let coverage = QueryCoverage::new("wait handler before shutdown");
+        assert!(coverage.is_weak(1));
+        assert!(!coverage.is_weak(2));
+        // A one-word query is either found or not; nothing to call weak.
+        assert!(!QueryCoverage::new("shutdown").is_weak(0));
+    }
+}
+
+#[cfg(test)]
 mod contains_ignore_case_tests {
     use super::{contains_ignore_case, line_matches, normalize_needle};
 
@@ -354,6 +381,51 @@ impl Default for EngineOptions {
             #[cfg(feature = "graph")]
             graph_path: None,
         }
+    }
+}
+
+/// How much of a keyword query a search hit actually contains.
+///
+/// BM25 returns a document as soon as one query term (or one of its code
+/// synonyms) occurs in it, so a natural-language query with no words in common
+/// with the code still yields a full page of hits. Counting covered query terms
+/// lets `semantic_search` say so instead of presenting them as answers.
+struct QueryCoverage {
+    /// Distinct query tokens with their code synonyms.
+    terms: Vec<(String, Vec<String>)>,
+}
+
+impl QueryCoverage {
+    fn new(query: &str) -> Self {
+        let synonyms = crate::search::build_code_synonyms();
+        let mut terms: Vec<(String, Vec<String>)> = Vec::new();
+        for token in crate::search::tokenize_code(query) {
+            if terms.iter().any(|(t, _)| *t == token) {
+                continue;
+            }
+            let alternatives = synonyms.get(&token).cloned().unwrap_or_default();
+            terms.push((token, alternatives));
+        }
+        Self { terms }
+    }
+
+    fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Query tokens present in `matched`, directly or through a synonym.
+    fn covered(&self, matched: &[String]) -> usize {
+        self.terms
+            .iter()
+            .filter(|(token, alternatives)| {
+                matched.contains(token) || alternatives.iter().any(|a| matched.contains(a))
+            })
+            .count()
+    }
+
+    /// True when even the best hit holds less than half of a multi-word query.
+    fn is_weak(&self, best_covered: usize) -> bool {
+        self.terms.len() >= 2 && best_covered * 2 < self.terms.len()
     }
 }
 
@@ -4184,12 +4256,30 @@ impl CodeIntelEngine {
             .map(|r| r.document.file_path.clone())
             .collect();
 
+        let coverage = QueryCoverage::new(query);
+        let best_covered = results
+            .iter()
+            .map(|r| coverage.covered(&r.matched_terms))
+            .max()
+            .unwrap_or(0);
+
         let mut output = String::new();
         output.push_str(&format!("# Semantic Search: `{}`\n\n", query));
         if let Some(ref r) = repo_name {
             output.push_str(&format!("Repository: {}\n", r));
         }
         output.push_str(&format!("Found {} results\n\n", results.len()));
+        if !results.is_empty() && coverage.is_weak(best_covered) {
+            output.push_str(&format!(
+                "> ⚠️ Weak keyword match: no result contains more than {} of the {} query \
+                 terms. This tool ranks by shared words (BM25), not by meaning, so these \
+                 results may be unrelated. For meaning-based or cross-language queries use \
+                 `neural_search` (needs --neural), or rephrase with identifiers likely used \
+                 in the code; if you know a name, `search_code` / `find_symbols` are exact.\n\n",
+                best_covered,
+                coverage.len()
+            ));
+        }
 
         for (i, result) in results.iter().enumerate() {
             output.push_str(&format!(
@@ -4199,8 +4289,12 @@ impl CodeIntelEngine {
                 result.score
             ));
             output.push_str(&format!(
-                "Lines {}-{}\n\n",
-                result.document.start_line, result.document.end_line
+                "Lines {}-{} · matched {}/{}: {}\n\n",
+                result.document.start_line,
+                result.document.end_line,
+                coverage.covered(&result.matched_terms),
+                coverage.len(),
+                result.matched_terms.join(", ")
             ));
             output.push_str("```\n");
             let snippet = match self
@@ -4224,7 +4318,12 @@ impl CodeIntelEngine {
         }
 
         if results.is_empty() {
-            output.push_str("*No results found.*\n");
+            output.push_str(
+                "*No results found.* None of the query words occur in indexed symbols. \
+                 This tool matches words, not meaning: use `neural_search` (needs --neural) \
+                 for meaning-based or cross-language queries, or rephrase with identifiers \
+                 likely used in the code.\n",
+            );
         }
 
         // Cache the result with file dependencies for smart invalidation

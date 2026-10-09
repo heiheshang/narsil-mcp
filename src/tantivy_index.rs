@@ -36,7 +36,10 @@ use tantivy::schema::{
     STRING,
 };
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{
+    DocId, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, SegmentReader, TantivyDocument,
+    Term,
+};
 
 use crate::search::{tokenize_code, DocType, SearchDocument};
 
@@ -429,6 +432,9 @@ impl TantivyIndex {
 
         let mut body_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Every term queried against `body`, literal tokens first, so a hit can
+        // report which of them its document actually contains.
+        let mut body_terms: Vec<&str> = Vec::new();
 
         for t in &tokens {
             // The name field carries the literal query terms only: a synonym
@@ -453,6 +459,7 @@ impl TantivyIndex {
             if !seen.insert(t) {
                 continue;
             }
+            body_terms.push(t);
             let term = Term::from_field_text(f.body, t);
             body_clauses.push((
                 Occur::Should,
@@ -488,10 +495,12 @@ impl TantivyIndex {
             .filter_map(|(score, addr)| {
                 let td: TantivyDocument = searcher.doc(addr).ok()?;
                 let doc = self.document_from(&td)?;
-                // Tantivy does not report which clauses matched. The query's
-                // own tokens are what snippet generation highlights, and a term
-                // absent from the document simply fails to highlight.
-                Some((doc, score as f64, tokens.clone()))
+                // Tantivy does not report which clauses matched, so look the
+                // queried terms up in this document's postings. Callers show
+                // these to explain a hit and to flag weak, one-word matches.
+                let segment = searcher.segment_reader(addr.segment_ord);
+                let matched = terms_in_doc(segment, f.body, &body_terms, addr.doc_id);
+                Some((doc, score as f64, matched))
             })
             .collect()
     }
@@ -693,6 +702,26 @@ impl ConcurrentTantivyIndex {
     }
 }
 
+/// The subset of `terms` that occur in document `doc` of `segment`'s `field`.
+fn terms_in_doc(segment: &SegmentReader, field: Field, terms: &[&str], doc: DocId) -> Vec<String> {
+    let Ok(inverted) = segment.inverted_index(field) else {
+        return Vec::new();
+    };
+    terms
+        .iter()
+        .filter(|t| {
+            let term = Term::from_field_text(field, t);
+            match inverted.read_postings(&term, IndexRecordOption::Basic) {
+                // `seek` must not move backwards: a posting list that starts
+                // past `doc` simply does not contain it.
+                Ok(Some(mut postings)) => postings.doc() <= doc && postings.seek(doc) == doc,
+                _ => false,
+            }
+        })
+        .map(|t| (*t).to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +783,28 @@ mod tests {
         let hits = idx.search_in("target", 1, Some("wanted"));
         assert_eq!(hits.len(), 1);
         assert_eq!(&*hits[0].0.repo, "wanted");
+    }
+
+    #[test]
+    fn hits_report_only_the_query_terms_their_document_contains() {
+        let idx = TantivyIndex::in_memory().unwrap();
+        idx.add_document(doc("a.rs::f", "r", "shutdown waits for handlers"))
+            .unwrap();
+        idx.add_document(doc("b.rs::g", "r", "handlers registry"))
+            .unwrap();
+        // Indexed last, so its posting list starts after both documents above.
+        idx.add_document(doc("c.rs::h", "r", "jira client"))
+            .unwrap();
+
+        let hits = idx.search_in("shutdown handlers jira", 5, None);
+        let matched = |id: &str| {
+            let mut terms = hits.iter().find(|h| h.0.id == id).unwrap().2.clone();
+            terms.sort();
+            terms
+        };
+        assert_eq!(matched("a.rs::f"), ["handlers", "shutdown"]);
+        assert_eq!(matched("b.rs::g"), ["handlers"]);
+        assert_eq!(matched("c.rs::h"), ["jira"]);
     }
 
     #[test]

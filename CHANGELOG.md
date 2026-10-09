@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`semantic_search` says when it is guessing.** Without `--neural` it is
+  keyword search (BM25), so a query whose words the code does not use — e.g.
+  Russian against English identifiers — used to return a confident-looking page
+  of unrelated hits. Each hit now lists the query terms it actually contains
+  (`matched 1/5: handlers`), a page where no hit holds half of the query starts
+  with a weak-match warning, and an empty result points to `neural_search`.
+  The tool description no longer claims it suits natural-language queries.
+  Matched terms come from the document's postings, so `hybrid_search` and
+  snippets also stop treating every query term as matched.
+
 - **Library module paths changed (`narsil_mcp::…`).** `index` is now
   `engine` (`narsil_mcp::engine::CodeIntelEngine`, `EngineOptions`), and
   `chunk_cache` moved to `index::text::chunk_cache`. The name `index` now

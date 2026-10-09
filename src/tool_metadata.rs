@@ -528,7 +528,7 @@ lazy_static! {
 
         map.insert("semantic_search", ToolMetadata {
             name: "semantic_search",
-            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries. Pass `repo` to search inside a single repository.",
+            description: "Keyword search ranked by BM25 over symbols (name, signature, doc comment) with code-aware tokenization and code synonyms. Not meaning-based despite the name: query words must occur in the code, so a query in another language than the code, or phrased in words the code does not use, returns unrelated hits (the output flags weak matches and lists matched terms per hit). For meaning-based or cross-language search use `neural_search` (requires --neural); for a known name use `search_code` or `find_symbols`. Pass `repo` to search inside a single repository.",
             category: ToolCategory::Search,
             tags: ["search", "semantic", "bm25", "ranking"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
