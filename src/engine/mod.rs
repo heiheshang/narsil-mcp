@@ -355,8 +355,8 @@ impl Default for EngineOptions {
     }
 }
 
-/// Cached chunk signatures of one file (see `chunk_cache`).
-type FileChunkSigs = Arc<[crate::chunk_cache::ChunkSig]>;
+/// Cached chunk signatures of one file (see `index::text::chunk_cache`).
+type FileChunkSigs = Arc<[crate::index::text::chunk_cache::ChunkSig]>;
 /// `(file index, chunk index, score)` from `score_cached_chunks`.
 type ChunkHit = (usize, usize, f64);
 
@@ -380,7 +380,7 @@ pub struct CodeIntelEngine {
     file_cache: FastMap<PathBuf, ()>,
     /// Chunk boundaries + interned token sets for `search_chunks`, filled
     /// lazily on first use and revalidated per file against size + mtime.
-    chunk_cache: crate::chunk_cache::ChunkTokenCache,
+    chunk_cache: crate::index::text::chunk_cache::ChunkTokenCache,
     /// Synthetic normalized documents indexed separately from raw files
     normalized_docs: DashMap<String, Vec<NormalizedDocument>>,
     /// Language parser
@@ -855,7 +855,7 @@ impl CodeIntelEngine {
             repos: DashMap::new(),
             symbols: DashMap::new(),
             file_cache: DashMap::default(),
-            chunk_cache: crate::chunk_cache::ChunkTokenCache::new(),
+            chunk_cache: crate::index::text::chunk_cache::ChunkTokenCache::new(),
             normalized_docs: DashMap::new(),
             parser: Arc::new(LanguageParser::new()?),
             git_repos: DashMap::new(),

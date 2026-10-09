@@ -54,13 +54,13 @@ pub mod ccg;
 
 // Native-only modules (require tokio, octocrab, lsp, etc.)
 #[cfg(feature = "native")]
-pub mod chunk_cache;
-#[cfg(feature = "native")]
 pub mod engine;
 #[cfg(feature = "native")]
 pub mod git;
 #[cfg(feature = "native")]
 pub mod http_server;
+#[cfg(feature = "native")]
+pub mod index;
 #[cfg(feature = "native")]
 pub mod lsp;
 #[cfg(feature = "native")]
