@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supervisor's next retry. `KnowledgeGraph::open` now probes the lock with
   `fcntl(F_GETLK)` first and waits up to 30 s for the holder to exit, then
   fails with an ordinary error if the store stays locked.
+- **`get_function_hotspots` ranks by edges the graph identified.** Name-only
+  picks among namesakes, calls leaving the graph and same-file picks on a
+  value no longer count as connections. On narsil's own source the top four
+  rows were `AnalysisCache::len`/`insert`/`is_empty`/`get` with ~500 callers
+  each — every `.len()` and `.insert()` in the tree — against a handful of
+  real calls. `exclude_tests` now filters: test functions are neither listed
+  nor counted as callers. "Most Called Functions" in `get_call_graph` uses
+  the same counting.
+- **`get_complexity` names the function it measured.** A bare name shared by
+  several functions used to report one of them silently (`with_options`
+  gave the 3-line `CcgImporter` constructor, not the 318-line engine one);
+  it now says which and lists the rest, as `get_callers` does. A qualifier
+  that picks out one namesake (`Big::with_options`) no longer triggers the
+  ambiguity warning in any call-graph tool.
+- **`get_hotspots` follows renames and reports complexity.** History before a
+  `git mv` counts under the current path (the leader on narsil was the
+  deleted `src/index.rs`, whose 35 commits belong to `src/engine/mod.rs`);
+  deleted files are left out. With the call graph enabled each file shows its
+  most complex function, and `min_complexity`, previously ignored, keeps the
+  files that reach it.
 
 ### Changed
 

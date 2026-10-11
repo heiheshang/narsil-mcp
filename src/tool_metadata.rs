@@ -872,7 +872,7 @@ lazy_static! {
 
         map.insert("get_function_hotspots", ToolMetadata {
             name: "get_function_hotspots",
-            description: "Find highly connected functions (potential refactoring targets) based on call graph analysis. Requires --call-graph flag.",
+            description: "Find highly connected functions (potential refactoring targets) based on call graph analysis. Counts only edges the graph identified: name-only picks among namesakes (`v.len()` landing on some project `len`) and calls leaving the graph are not connections. Measures coupling, not complexity or churn — see get_complexity and get_hotspots. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["hotspots", "refactoring", "analysis", "complexity"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -883,7 +883,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "min_connections": {"type": "integer", "description": "Minimum total connections (incoming + outgoing) to be considered a hotspot (default: 5)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
+                    "exclude_tests": {"type": "boolean", "description": "Leave functions in test files out of the list and out of the caller counts (default: false)"}
                 },
                 "required": ["repo"]
             }),
@@ -958,7 +958,7 @@ lazy_static! {
 
         map.insert("get_hotspots", ToolMetadata {
             name: "get_hotspots",
-            description: "Find code hotspots - files with high churn and complexity. Requires --git flag.",
+            description: "Find code hotspots - files changed most often in the last `days`, with the most complex function of each file when the call graph is enabled (`min_complexity` then keeps files whose most complex function reaches it). History before a rename counts under the current path; deleted files are left out. Requires --git flag; complexity also needs --call-graph.",
             category: ToolCategory::Git,
             tags: ["git", "hotspots", "churn", "complexity", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,

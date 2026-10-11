@@ -2582,6 +2582,58 @@ impl CallGraph {
         counts
     }
 
+    /// Does this edge of `caller` count as a connection when ranking functions?
+    ///
+    /// A name-only pick is a guess among namesakes: every `v.len()` on a `Vec`
+    /// lands on whichever project `len` was picked, which made a three-line
+    /// cache accessor the most-called function in narsil itself. A same-file
+    /// pick on a value (`v.len()` next to some `fn len`) is a guess too,
+    /// unless caller and callee are methods of one type — `self.add_edge()`
+    /// inside `CfgBuilder` — and a plain `helper()` goes, by scoping, to the
+    /// function in its own file.
+    fn counts_as_connection(caller: &str, edge: &CallEdge) -> bool {
+        match edge.resolution {
+            CallResolution::NameOnly => false,
+            CallResolution::SameFile if edge.call_type == CallType::Method => {
+                let receiver = Self::key_receiver(caller);
+                receiver.is_some() && receiver == Self::key_receiver(&edge.target)
+            }
+            resolution => !resolution.is_outside_graph(),
+        }
+    }
+
+    /// The type of a method key `file::Type::name`; `None` for `file::name`.
+    fn key_receiver(key: &str) -> Option<&str> {
+        let mut parts = key.rsplitn(3, "::");
+        let _name = parts.next()?;
+        let receiver = parts.next()?;
+        parts.next().map(|_| receiver)
+    }
+
+    /// Incoming connection counts (callee key -> callers), over edges that
+    /// [`counts_as_connection`](Self::counts_as_connection) and whose caller
+    /// passes `include_caller`.
+    fn connection_counts(
+        &self,
+        include_caller: impl Fn(&CallNode) -> bool,
+    ) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for entry in self.nodes.iter() {
+            if !include_caller(entry.value()) {
+                continue;
+            }
+            for e in entry
+                .value()
+                .calls
+                .iter()
+                .filter(|e| Self::counts_as_connection(entry.key(), e))
+            {
+                *counts.entry(e.target.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     pub fn get_callers(&self, function: &str) -> Vec<CallEdge> {
         let actual_name = self
             .find_function(function)
@@ -2777,30 +2829,42 @@ impl CallGraph {
         }
     }
 
-    /// Get highly connected functions (potential refactoring targets).
-    /// Filters out generic trait methods and limits output.
-    pub fn get_hotspots(&self, min_connections: usize) -> Vec<(String, usize, usize)> {
+    /// Get highly connected functions (potential refactoring targets) as
+    /// `(key, incoming, outgoing)`, most connected first. Generic trait
+    /// methods are skipped and only edges that
+    /// [`count as connections`](Self::counts_as_connection) are counted.
+    /// With `exclude_tests`, functions in test files are neither listed nor
+    /// counted as callers.
+    pub fn get_hotspots(
+        &self,
+        min_connections: usize,
+        exclude_tests: bool,
+    ) -> Vec<(String, usize, usize)> {
+        use crate::security_rules::is_test_file;
+
+        let keep = |node: &CallNode| !exclude_tests || !is_test_file(&node.file_path);
+        let counts = self.connection_counts(keep);
         let mut hotspots = Vec::new();
-        let counts = self.incoming_counts();
 
         for entry in self.nodes.iter() {
             let key = entry.key();
-
-            // Skip generic trait method implementations
-            if Self::is_trait_method(key) {
+            if Self::is_trait_method(key) || !keep(entry.value()) {
                 continue;
             }
 
             let incoming = counts.get(key).copied().unwrap_or(0);
-            let outgoing = entry.calls.len();
-            let total = incoming + outgoing;
+            let outgoing = entry
+                .calls
+                .iter()
+                .filter(|e| Self::counts_as_connection(key, e))
+                .count();
 
-            if total >= min_connections {
+            if incoming + outgoing >= min_connections {
                 hotspots.push((key.clone(), incoming, outgoing));
             }
         }
 
-        hotspots.sort_by_key(|hotspot| std::cmp::Reverse(hotspot.1 + hotspot.2));
+        hotspots.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
         hotspots
     }
 
@@ -2808,9 +2872,10 @@ impl CallGraph {
     pub fn get_hotspots_limited(
         &self,
         min_connections: usize,
+        exclude_tests: bool,
         limit: usize,
     ) -> Vec<(String, usize, usize)> {
-        let mut hotspots = self.get_hotspots(min_connections);
+        let mut hotspots = self.get_hotspots(min_connections, exclude_tests);
         hotspots.truncate(limit);
         hotspots
     }
@@ -2915,7 +2980,7 @@ impl CallGraph {
 
                 // Top callers
                 md.push_str("## Most Called Functions\n\n");
-                let counts = self.incoming_counts();
+                let counts = self.connection_counts(|_| true);
                 let mut by_callers: Vec<_> = self
                     .nodes
                     .iter()
@@ -3863,13 +3928,184 @@ mod tests {
         graph.nodes.insert("hotspot".to_string(), hotspot);
         graph.nodes.insert("normal".to_string(), normal);
 
-        let hotspots = graph.get_hotspots(3);
+        let hotspots = graph.get_hotspots(3, false);
 
         // Should find hotspot (5 connections) but not normal (1 connection)
         assert_eq!(hotspots.len(), 1);
         assert_eq!(hotspots[0].0, "hotspot");
         assert_eq!(hotspots[0].1, 3); // incoming
         assert_eq!(hotspots[0].2, 2); // outgoing
+    }
+
+    fn hotspot_node(name: &str, file: &str, calls: &[(&str, CallResolution)]) -> CallNode {
+        CallNode {
+            name: name.to_string(),
+            file_path: file.to_string(),
+            line: 1,
+            calls: calls
+                .iter()
+                .map(|(target, resolution)| CallEdge {
+                    target: target.to_string(),
+                    file_path: file.to_string(),
+                    line: 2,
+                    column: 1,
+                    call_type: CallType::Method,
+                    scope_hint: None,
+                    resolved: !resolution.is_outside_graph(),
+                    resolution: *resolution,
+                })
+                .collect(),
+            metrics: FunctionMetrics::default(),
+            receiver: None,
+            result_type: None,
+        }
+    }
+
+    #[test]
+    fn test_get_hotspots_skips_name_only_edges() {
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "src/cache.rs::Cache::len".to_string(),
+            hotspot_node("len", "/repo/src/cache.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/core.rs::Core::run".to_string(),
+            hotspot_node("run", "/repo/src/core.rs", &[]),
+        );
+        for i in 0..6 {
+            graph.nodes.insert(
+                format!("src/user{i}.rs::work"),
+                hotspot_node(
+                    "work",
+                    &format!("/repo/src/user{i}.rs"),
+                    &[
+                        ("src/cache.rs::Cache::len", CallResolution::NameOnly),
+                        ("src/core.rs::Core::run", CallResolution::Receiver),
+                        ("", CallResolution::Unresolved),
+                    ],
+                ),
+            );
+        }
+
+        let hotspots = graph.get_hotspots(3, false);
+        let row = |key: &str| hotspots.iter().find(|h| h.0 == key).cloned();
+
+        assert_eq!(
+            row("src/core.rs::Core::run"),
+            Some(("src/core.rs::Core::run".to_string(), 6, 0))
+        );
+        assert_eq!(
+            row("src/cache.rs::Cache::len"),
+            None,
+            "name-only callers are not connections"
+        );
+        assert!(
+            hotspots.iter().all(|h| h.0 != "src/user0.rs::work"),
+            "one identified call each is below 3"
+        );
+    }
+
+    #[test]
+    fn test_get_hotspots_same_file_counts_only_for_direct_calls() {
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "src/a.rs::Coverage::len".to_string(),
+            hotspot_node("len", "/repo/src/a.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/a.rs::helper".to_string(),
+            hotspot_node("helper", "/repo/src/a.rs", &[]),
+        );
+        for i in 0..3 {
+            let mut caller = hotspot_node(
+                "work",
+                "/repo/src/a.rs",
+                &[
+                    ("src/a.rs::Coverage::len", CallResolution::SameFile),
+                    ("src/a.rs::helper", CallResolution::SameFile),
+                ],
+            );
+            caller.calls[1].call_type = CallType::Direct;
+            graph.nodes.insert(format!("src/a.rs::work{i}"), caller);
+        }
+
+        graph.nodes.insert(
+            "src/a.rs::Builder::add_edge".to_string(),
+            hotspot_node("add_edge", "/repo/src/a.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/a.rs::Builder::process".to_string(),
+            hotspot_node(
+                "process",
+                "/repo/src/a.rs",
+                &[("src/a.rs::Builder::add_edge", CallResolution::SameFile)],
+            ),
+        );
+
+        let hotspots = graph.get_hotspots(1, false);
+        let incoming = |key: &str| hotspots.iter().find(|h| h.0 == key).map(|h| h.1);
+        assert_eq!(incoming("src/a.rs::helper"), Some(3));
+        assert_eq!(incoming("src/a.rs::Coverage::len"), None);
+        assert_eq!(
+            incoming("src/a.rs::Builder::add_edge"),
+            Some(1),
+            "self-call on the same type"
+        );
+    }
+
+    #[test]
+    fn test_get_hotspots_exclude_tests() {
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "src/lib.rs::helper".to_string(),
+            hotspot_node("helper", "/repo/src/lib.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/app.rs::main".to_string(),
+            hotspot_node(
+                "main",
+                "/repo/src/app.rs",
+                &[("src/lib.rs::helper", CallResolution::Unique)],
+            ),
+        );
+        for i in 0..4 {
+            graph.nodes.insert(
+                format!("tests/t.rs::case{i}"),
+                hotspot_node(
+                    "case",
+                    "/repo/tests/t.rs",
+                    &[
+                        ("src/lib.rs::helper", CallResolution::Unique),
+                        ("tests/t.rs::fixture", CallResolution::Unique),
+                    ],
+                ),
+            );
+        }
+        graph.nodes.insert(
+            "tests/t.rs::fixture".to_string(),
+            hotspot_node("fixture", "/repo/tests/t.rs", &[]),
+        );
+
+        let all = graph.get_hotspots(1, false);
+        assert!(all.iter().any(|h| h.0 == "tests/t.rs::fixture"));
+        assert_eq!(
+            all.iter()
+                .find(|h| h.0 == "src/lib.rs::helper")
+                .map(|h| h.1),
+            Some(5)
+        );
+
+        let prod = graph.get_hotspots(1, true);
+        assert!(
+            prod.iter().all(|h| !h.0.starts_with("tests/")),
+            "test functions are not listed"
+        );
+        assert_eq!(
+            prod.iter()
+                .find(|h| h.0 == "src/lib.rs::helper")
+                .map(|h| h.1),
+            Some(1)
+        );
     }
 
     #[test]

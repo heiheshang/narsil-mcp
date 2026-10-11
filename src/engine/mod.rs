@@ -3804,7 +3804,7 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         days: u32,
-        _min_complexity: Option<usize>,
+        min_complexity: Option<usize>,
     ) -> Result<String> {
         let git_repo = self
             .git_repos
@@ -3812,22 +3812,95 @@ impl CodeIntelEngine {
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let freq = git_repo.change_frequency(days)?;
+        let complexity = self.max_complexity_by_file(repo);
 
         let mut output = String::new();
         output.push_str(&format!("# Code Hotspots (last {} days)\n\n", days));
-        output.push_str("Files with high change frequency (potential maintenance burden):\n\n");
 
-        output.push_str("| File | Commits | Authors | Churn Score |\n");
-        output.push_str("|------|---------|---------|-------------|\n");
+        let Some(complexity) = complexity else {
+            output.push_str("Files with high change frequency (potential maintenance burden). ");
+            output.push_str("Complexity needs the call graph (--call-graph)");
+            if min_complexity.is_some() {
+                output.push_str(", so `min_complexity` was not applied");
+            }
+            output.push_str(".\n\n");
+            output.push_str("| File | Commits | Authors | Churn Score |\n");
+            output.push_str("|------|---------|---------|-------------|\n");
+            for item in freq.iter().take(20) {
+                output.push_str(&format!(
+                    "| `{}` | {} | {} | {:.2} |\n",
+                    item.file_path, item.total_commits, item.unique_authors, item.churn_score
+                ));
+            }
+            return Ok(output);
+        };
 
-        for item in freq.iter().take(20) {
+        output.push_str(
+            "Files with high change frequency, with the most complex function in each \
+             (renames followed; deleted files left out):\n\n",
+        );
+        let rows: Vec<_> = freq
+            .iter()
+            .map(|item| (item, complexity.get(&item.file_path)))
+            .filter(|(_, cx)| match min_complexity {
+                Some(min) => cx.is_some_and(|(cc, _)| *cc >= min),
+                None => true,
+            })
+            .take(20)
+            .collect();
+        if rows.is_empty() {
+            output.push_str("*No files match the criteria.*\n");
+            return Ok(output);
+        }
+        output.push_str("| File | Commits | Authors | Churn Score | Max CC | Function |\n");
+        output.push_str("|------|---------|---------|-------------|--------|----------|\n");
+        for (item, cx) in rows {
+            let (cc, function) = match cx {
+                Some((cc, function)) => (cc.to_string(), format!("`{}`", function)),
+                None => ("—".to_string(), "—".to_string()),
+            };
             output.push_str(&format!(
-                "| `{}` | {} | {} | {:.2} |\n",
-                item.file_path, item.total_commits, item.unique_authors, item.churn_score
+                "| `{}` | {} | {} | {:.2} | {} | {} |\n",
+                item.file_path,
+                item.total_commits,
+                item.unique_authors,
+                item.churn_score,
+                cc,
+                function
             ));
         }
 
         Ok(output)
+    }
+
+    /// Highest cyclomatic complexity per repo-relative file and the function
+    /// carrying it, from the call graph; `None` when there is no call graph.
+    fn max_complexity_by_file(&self, repo: &str) -> Option<HashMap<String, (usize, String)>> {
+        let call_graph = self.call_graphs.get(repo)?;
+        let root = self.get_repo_path(repo).ok();
+        let mut by_file: HashMap<String, (usize, String)> = HashMap::new();
+        for name in call_graph.get_all_function_names() {
+            let Some(node) = call_graph.get_node(&name) else {
+                continue;
+            };
+            let path = std::path::Path::new(&node.file_path);
+            let rel = root
+                .as_ref()
+                .and_then(|r| path.strip_prefix(r).ok())
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let cc = node.metrics.cyclomatic;
+            let label = match &node.receiver {
+                Some(receiver) => format!("{}::{}", receiver, node.name),
+                None => node.name.clone(),
+            };
+            let entry = by_file.entry(rel).or_insert((0, String::new()));
+            if cc > entry.0 {
+                *entry = (cc, label);
+            }
+        }
+        Some(by_file)
     }
 
     /// Get contributors to a file or repository
@@ -4634,7 +4707,14 @@ impl CodeIntelEngine {
             Self::describe_graph_node(call_graph, resolved)
         );
         let candidates = call_graph.find_all_functions(CallGraph::bare_name(function));
-        if candidates.len() > 1 {
+        // `Big::with_options` names one of the `with_options` functions; only
+        // namesakes the qualifier does not rule out make the answer a guess.
+        let qualified = format!("::{}", function.replace("->", "::").replace('.', "::"));
+        let matching_qualifier = candidates
+            .iter()
+            .filter(|c| c.ends_with(&qualified))
+            .count();
+        if candidates.len() > 1 && matching_qualifier != 1 {
             output.push_str(&format!(
                 "> **Ambiguous name**: {} functions are named `{}`; reporting on `{}` only.\n",
                 candidates.len(),
@@ -4795,7 +4875,13 @@ impl CodeIntelEngine {
         let mut output = String::new();
         output.push_str(&format!("# Complexity Metrics: `{}`\n\n", function));
 
-        match call_graph.get_metrics(function) {
+        let Some(resolved) = call_graph.find_function(function) else {
+            output.push_str(&Self::unresolved_function_report(&call_graph, function));
+            return Ok(output);
+        };
+        output.push_str(&Self::resolution_report(&call_graph, function, &resolved));
+
+        match call_graph.get_metrics(&resolved) {
             Some(metrics) => {
                 output.push_str("| Metric | Value |\n");
                 output.push_str("|--------|-------|\n");
@@ -4839,9 +4925,9 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         min_connections: usize,
-        _exclude_tests: Option<bool>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
+        let exclude_tests = exclude_tests.unwrap_or(false);
         let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
@@ -4850,8 +4936,16 @@ impl CodeIntelEngine {
         })?;
 
         let default_limit = 50;
-        let hotspots = call_graph.get_hotspots_limited(min_connections, default_limit);
-        let total_count = call_graph.get_hotspots(min_connections).len();
+        let hotspots =
+            call_graph.get_hotspots_limited(min_connections, exclude_tests, default_limit);
+        let total_count = call_graph
+            .get_hotspots(min_connections, exclude_tests)
+            .len();
+        let filtered = if exclude_tests {
+            "generic trait methods, name-only matches and test files filtered"
+        } else {
+            "generic trait methods and name-only matches filtered"
+        };
 
         let mut output = String::new();
         output.push_str(&format!(
@@ -4864,14 +4958,16 @@ impl CodeIntelEngine {
         } else {
             if total_count > hotspots.len() {
                 output.push_str(&format!(
-                    "Showing top {} of {} highly connected functions (generic trait methods filtered):\n\n",
+                    "Showing top {} of {} highly connected functions ({}):\n\n",
                     hotspots.len(),
-                    total_count
+                    total_count,
+                    filtered
                 ));
             } else {
                 output.push_str(&format!(
-                    "Found {} highly connected functions (generic trait methods filtered):\n\n",
-                    hotspots.len()
+                    "Found {} highly connected functions ({}):\n\n",
+                    hotspots.len(),
+                    filtered
                 ));
             }
             output.push_str("| Function | Incoming | Outgoing | Total |\n");

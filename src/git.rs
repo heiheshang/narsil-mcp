@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -283,13 +283,18 @@ impl GitRepo {
         self.parse_log_output(&String::from_utf8_lossy(&output.stdout))
     }
 
-    /// Calculate change frequency metrics for files
+    /// Calculate change frequency metrics for files present in the working
+    /// tree. Renames are followed, so a file's history before a move counts
+    /// under its current path; files deleted since are left out.
     pub fn change_frequency(&self, days: u32) -> Result<Vec<ChangeFrequency>> {
         let output = Command::new("git")
             .args([
+                "-c",
+                "core.quotePath=false",
                 "log",
-                "--format=%H %ae",
-                "--name-only",
+                "--format=%ae",
+                "--name-status",
+                "-M",
                 &format!("--since={} days ago", days),
             ])
             .current_dir(&self.root)
@@ -301,32 +306,14 @@ impl GitRepo {
             return Err(anyhow!("git log failed: {}", err));
         }
 
-        let mut file_stats: HashMap<String, (usize, std::collections::HashSet<String>, i64)> =
-            HashMap::new();
-        let mut current_author = String::new();
+        let mut file_stats = tally_name_status(&String::from_utf8_lossy(&output.stdout));
+        file_stats.retain(|path, _| self.root.join(path).exists());
 
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.len() > 40 && line.contains(' ') {
-                // Commit line: hash email
-                let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                if parts.len() == 2 {
-                    current_author = parts[1].to_string();
-                }
-            } else if !line.is_empty() && !current_author.is_empty() {
-                // File name
-                let entry = file_stats
-                    .entry(line.to_string())
-                    .or_insert_with(|| (0, std::collections::HashSet::new(), 0));
-                entry.0 += 1;
-                entry.1.insert(current_author.clone());
-            }
-        }
-
-        let max_commits = file_stats.values().map(|(c, _, _)| *c).max().unwrap_or(1) as f32;
+        let max_commits = file_stats.values().map(|(c, _)| *c).max().unwrap_or(1) as f32;
 
         let mut results: Vec<ChangeFrequency> = file_stats
             .into_iter()
-            .map(|(path, (commits, authors, _))| {
+            .map(|(path, (commits, authors))| {
                 ChangeFrequency {
                     file_path: path,
                     total_commits: commits,
@@ -605,9 +592,74 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Commits and authors per file from `git log --format=%ae --name-status -M`
+/// output, newest commit first. A rename is seen before the older commits of
+/// the old path, so those are credited to the path the file has now.
+fn tally_name_status(log: &str) -> HashMap<String, (usize, HashSet<String>)> {
+    let mut stats: HashMap<String, (usize, HashSet<String>)> = HashMap::new();
+    let mut renamed: HashMap<String, String> = HashMap::new();
+    let mut author = "";
+
+    let current = |renamed: &HashMap<String, String>, path: &str| -> String {
+        let mut path = path.to_string();
+        for _ in 0..renamed.len() {
+            match renamed.get(&path) {
+                Some(next) if *next != path => path = next.clone(),
+                _ => break,
+            }
+        }
+        path
+    };
+
+    for line in log.lines().filter(|l| !l.is_empty()) {
+        let Some((status, paths)) = line.split_once('\t') else {
+            author = line;
+            continue;
+        };
+        let path = match paths.split_once('\t') {
+            Some((old, new)) if status.starts_with('R') => {
+                let now = current(&renamed, new);
+                renamed.insert(old.to_string(), now.clone());
+                now
+            }
+            Some((_, new)) => current(&renamed, new),
+            None => current(&renamed, paths),
+        };
+        let entry = stats.entry(path).or_default();
+        entry.0 += 1;
+        entry.1.insert(author.to_string());
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tally_name_status_follows_renames() {
+        let log = "b@x\nM\tsrc/engine/mod.rs\n\n\
+                   a@x\nR100\tsrc/index.rs\tsrc/engine/mod.rs\n\n\
+                   a@x\nM\tsrc/index.rs\n\n\
+                   c@x\nM\tsrc/index.rs\nM\tREADME.md\n";
+        let stats = tally_name_status(log);
+
+        let (commits, authors) = &stats["src/engine/mod.rs"];
+        assert_eq!(*commits, 4);
+        assert_eq!(authors.len(), 3);
+        assert!(!stats.contains_key("src/index.rs"));
+        assert_eq!(stats["README.md"].0, 1);
+    }
+
+    #[test]
+    fn test_tally_name_status_follows_rename_chains() {
+        let log = "a@x\nR090\tmid.rs\tnew.rs\n\n\
+                   a@x\nR095\told.rs\tmid.rs\n\n\
+                   a@x\nM\told.rs\n";
+        let stats = tally_name_status(log);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats["new.rs"].0, 3);
+    }
 
     #[test]
     fn test_chrono_lite() {

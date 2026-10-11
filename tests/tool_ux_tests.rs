@@ -1124,3 +1124,136 @@ async fn limit_and_max_results_are_interchangeable() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn get_complexity_reports_namesakes() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "small.rs",
+        "pub struct Small;\n\nimpl Small {\n    pub fn with_options(x: u32) -> u32 {\n        x\n    }\n}\n",
+    )?;
+    repo.add_file(
+        "big.rs",
+        r#"pub struct Big;
+
+impl Big {
+    pub fn with_options(a: u32, b: u32) -> u32 {
+        let mut n = 0;
+        for i in 0..a {
+            if i % 2 == 0 {
+                if b > i {
+                    n += 1;
+                } else {
+                    n -= 1;
+                }
+            }
+        }
+        n
+    }
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let bare = engine.get_complexity(&repo.name(), "with_options").await?;
+    assert!(
+        bare.contains("Ambiguous name"),
+        "namesake not reported:\n{bare}"
+    );
+    assert!(
+        bare.contains("Resolved to"),
+        "chosen function not named:\n{bare}"
+    );
+
+    let qualified = engine
+        .get_complexity(&repo.name(), "Big::with_options")
+        .await?;
+    assert!(!qualified.contains("Ambiguous name"), "{qualified}");
+    assert!(
+        !qualified.contains("| Cyclomatic Complexity | 1 |"),
+        "qualified name must reach the branching namesake:\n{qualified}"
+    );
+
+    Ok(())
+}
+
+fn git(repo: &TestRepo, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(repo.path())
+        .status()?;
+    anyhow::ensure!(status.success(), "git {args:?} failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_hotspots_follows_renames_and_reports_complexity() -> Result<()> {
+    let repo = TestRepo::new()?;
+    git(&repo, &["init", "-q"])?;
+    repo.add_file(
+        "old.rs",
+        "pub fn tangled(a: u32) -> u32 {\n    if a > 1 {\n        if a > 2 {\n            return 2;\n        }\n        return 1;\n    }\n    0\n}\n",
+    )?;
+    repo.add_file("plain.rs", "pub fn plain() -> u32 {\n    1\n}\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "one"])?;
+    repo.add_file(
+        "old.rs",
+        &format!(
+            "{}// touched\n",
+            std::fs::read_to_string(repo.path().join("old.rs"))?
+        ),
+    )?;
+    git(&repo, &["commit", "-qam", "two"])?;
+    git(&repo, &["mv", "old.rs", "new.rs"])?;
+    git(&repo, &["commit", "-qm", "rename"])?;
+
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: true,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let out = engine.get_hotspots(&repo.name(), 30, None).await?;
+    let new_row = out
+        .lines()
+        .find(|l| l.contains("`new.rs`"))
+        .unwrap_or_default();
+    assert!(
+        new_row.starts_with("| `new.rs` | 3 |"),
+        "history before the rename is lost:\n{out}"
+    );
+    assert!(
+        new_row.contains("`tangled`"),
+        "most complex function missing:\n{out}"
+    );
+    assert!(
+        !out.contains("old.rs"),
+        "renamed-away path still listed:\n{out}"
+    );
+
+    let filtered = engine.get_hotspots(&repo.name(), 30, Some(3)).await?;
+    assert!(
+        filtered.contains("`new.rs`") && !filtered.contains("`plain.rs`"),
+        "{filtered}"
+    );
+
+    Ok(())
+}
