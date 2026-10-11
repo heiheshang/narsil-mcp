@@ -1912,3 +1912,90 @@ func Pay(t assert.TestingT) {
         "{stats:?}"
     );
 }
+
+#[test]
+fn test_rust_call_syntax_overrides_unique_name_match() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let lib = r#"
+pub fn walk(n: u32) -> u32 { n }
+
+pub fn tally(n: u32) -> u32 { n }
+
+pub struct Cache;
+
+impl Cache {
+    pub fn key(&self) -> u32 { 1 }
+    pub fn value(&self) -> u32 { 1 }
+    pub fn refresh(&self) {}
+    pub fn from(_s: &str) -> Self { Cache }
+}
+
+pub mod templates {
+    pub fn all() -> Vec<u32> { Vec::new() }
+}
+"#;
+    let user = r#"
+fn use_all(node: Node, entry: Entry, cache: Cache) {
+    let cursor = node.walk();
+    let k = entry.key();
+    cache.refresh();
+    let p = PathBuf::from("x");
+    let t = templates::all();
+    walk(3);
+    assert!(entry.value() > 0);
+    assert_eq!(tally(1), 1);
+}
+"#;
+    let files: Vec<_> = [("lib.rs", lib), ("user.rs", user)]
+        .into_iter()
+        .map(|(path, code)| {
+            let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+            (path.to_string(), code.to_string(), tree)
+        })
+        .collect();
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = call_graph.get_callees("use_all");
+    let on_line = |line: usize, name: &str| {
+        callees
+            .iter()
+            .find(|e| e.line == line && e.target.rsplit("::").next() == Some(name))
+            .map(|e| e.resolution)
+            .unwrap_or_else(|| panic!("no call of {name} on line {line}: {callees:#?}"))
+    };
+
+    assert_eq!(
+        on_line(3, "walk"),
+        CallResolution::Unresolved,
+        "x.walk() is no free fn"
+    );
+    assert_eq!(
+        on_line(4, "key"),
+        CallResolution::NameOnly,
+        "std defines key() too"
+    );
+    assert_eq!(on_line(5, "refresh"), CallResolution::Unique);
+    assert_eq!(
+        on_line(6, "from"),
+        CallResolution::ExternalPackage,
+        "PathBuf::from is not Cache::from"
+    );
+    assert_eq!(
+        on_line(7, "all"),
+        CallResolution::Unique,
+        "inline module path is kept"
+    );
+    assert_eq!(on_line(8, "walk"), CallResolution::Unique);
+    assert_eq!(
+        on_line(9, "value"),
+        CallResolution::NameOnly,
+        "method call inside a macro"
+    );
+    assert_eq!(
+        on_line(10, "tally"),
+        CallResolution::Unique,
+        "plain call inside a macro"
+    );
+}

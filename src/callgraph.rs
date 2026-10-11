@@ -95,7 +95,9 @@ pub enum CallResolution {
     /// Several namesakes; the one in the caller's own file was taken.
     SameFile,
     /// Several namesakes and nothing to choose between them — the target is a
-    /// deterministic pick, not a fact.
+    /// deterministic pick, not a fact. Also a Rust method call on a value of
+    /// unknown type whose name the standard library defines as well
+    /// (`entry.key()`), where the one project method is only a candidate.
     NameOnly,
     /// No function of that name is in the graph, and nothing at the call site
     /// says where it went: a stdlib or builtin name, a macro, a method on a
@@ -148,7 +150,7 @@ impl CallResolution {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum CallType {
     Direct,       // foo()
     Method,       // obj.foo()
@@ -639,15 +641,21 @@ impl CallGraph {
         described: &(String, CallType, Option<String>, bool),
         ctx: CallCtx,
     ) -> Option<String> {
-        let (name, _, scope_hint, scope_inferred) = described;
+        let (name, call_type, scope_hint, scope_inferred) = described;
         // Resolution is the expensive half; a callee that is not in the graph
         // (stdlib, third party, a type conversion) can be dismissed on an
         // O(1) name lookup instead.
         if !self.name_index.contains_key(name) {
             return None;
         }
-        let (key, resolution) =
-            self.resolve_scoped_callee(name, ctx.file, scope_hint.as_deref(), *scope_inferred);
+        let (key, resolution) = self.refine_rust_resolution(
+            ctx.file,
+            name,
+            *call_type,
+            scope_hint.as_deref(),
+            *scope_inferred,
+            self.resolve_scoped_callee(name, ctx.file, scope_hint.as_deref(), *scope_inferred),
+        );
         if resolution.is_certain() || resolution == CallResolution::FactoryReceiver {
             return self
                 .nodes
@@ -1159,11 +1167,18 @@ impl CallGraph {
                         // Resolve callee with scope hint for disambiguation
                         let (callee_key, resolution) = match by_local.or(by_package) {
                             Some(resolved) => resolved,
-                            None => self.resolve_scoped_callee(
-                                &edge.target,
+                            None => self.refine_rust_resolution(
                                 file.path,
+                                &edge.target,
+                                edge.call_type,
                                 edge.scope_hint.as_deref(),
                                 scope_inferred,
+                                self.resolve_scoped_callee(
+                                    &edge.target,
+                                    file.path,
+                                    edge.scope_hint.as_deref(),
+                                    scope_inferred,
+                                ),
                             ),
                         };
 
@@ -1271,7 +1286,15 @@ impl CallGraph {
                     continue;
                 }
 
-                let (callee_key, resolution) = self.resolve_callee(ident, caller_file, None);
+                let (call_type, scope) = Self::macro_call_shape(&text[..start]);
+                let (callee_key, resolution) = self.refine_rust_resolution(
+                    caller_file,
+                    ident,
+                    call_type,
+                    scope,
+                    false,
+                    self.resolve_callee(ident, caller_file, scope),
+                );
 
                 // Add to caller's outgoing calls
                 // Compute `resolved` *before* taking the caller's write lock
@@ -1286,8 +1309,8 @@ impl CallGraph {
                             file_path: caller_file.to_string(),
                             line,
                             column: 0,
-                            call_type: CallType::Direct,
-                            scope_hint: None,
+                            call_type,
+                            scope_hint: scope.map(str::to_string),
                             resolved,
                             resolution,
                         });
@@ -1296,6 +1319,28 @@ impl CallGraph {
 
                 i = j + 1;
             }
+        }
+    }
+
+    /// What precedes a call found in macro text: `x.f(` is a method call,
+    /// `a::b::f(` a call qualified by `a::b`, anything else a plain call.
+    fn macro_call_shape(before: &str) -> (CallType, Option<&str>) {
+        let before = before.trim_end();
+        if before.ends_with('.') {
+            return (CallType::Method, None);
+        }
+        let Some(path) = before.strip_suffix("::") else {
+            return (CallType::Direct, None);
+        };
+        let start = path
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let qualifier = path[start..].trim_start_matches(':');
+        if qualifier.is_empty() {
+            (CallType::Direct, None)
+        } else {
+            (CallType::StaticMethod, Some(qualifier))
         }
     }
 
@@ -1453,6 +1498,201 @@ impl CallGraph {
         scope_hint: Option<&str>,
     ) -> (String, CallResolution) {
         self.resolve_scoped_callee(bare_name, caller_file, scope_hint, false)
+    }
+
+    /// Rust method names that the standard library defines on its own types.
+    /// A call `x.key()` on a value of unknown type is as likely to be
+    /// `Entry::key` as the one project method of that name.
+    const RUST_STD_METHOD_NAMES: &'static [&'static str] = &[
+        "all",
+        "and_then",
+        "any",
+        "append",
+        "as_bytes",
+        "as_mut",
+        "as_path",
+        "as_ref",
+        "as_str",
+        "borrow",
+        "borrow_mut",
+        "bytes",
+        "canonicalize",
+        "chain",
+        "chars",
+        "chunks",
+        "clear",
+        "clone",
+        "cloned",
+        "cmp",
+        "collect",
+        "components",
+        "contains",
+        "contains_key",
+        "copied",
+        "count",
+        "dedup",
+        "deref",
+        "drain",
+        "ends_with",
+        "entry",
+        "enumerate",
+        "eq",
+        "exists",
+        "extend",
+        "extension",
+        "file_name",
+        "file_stem",
+        "filter",
+        "filter_map",
+        "find",
+        "first",
+        "flat_map",
+        "flush",
+        "fmt",
+        "fold",
+        "get",
+        "get_mut",
+        "hash",
+        "insert",
+        "into_iter",
+        "is_dir",
+        "is_empty",
+        "is_err",
+        "is_file",
+        "is_none",
+        "is_ok",
+        "is_some",
+        "iter",
+        "iter_mut",
+        "join",
+        "key",
+        "keys",
+        "last",
+        "len",
+        "lines",
+        "lock",
+        "map",
+        "matches",
+        "max",
+        "metadata",
+        "min",
+        "next",
+        "nth",
+        "ok",
+        "parent",
+        "parse",
+        "partial_cmp",
+        "peekable",
+        "pop",
+        "position",
+        "push",
+        "push_str",
+        "read",
+        "read_to_string",
+        "recv",
+        "remove",
+        "replace",
+        "retain",
+        "rev",
+        "reverse",
+        "send",
+        "skip",
+        "sort",
+        "sort_by",
+        "sort_by_key",
+        "split",
+        "split_once",
+        "starts_with",
+        "success",
+        "strip_prefix",
+        "sum",
+        "swap",
+        "take",
+        "to_lowercase",
+        "to_owned",
+        "to_str",
+        "to_string",
+        "to_string_lossy",
+        "to_uppercase",
+        "trim",
+        "truncate",
+        "unwrap",
+        "unwrap_or",
+        "value",
+        "values",
+        "windows",
+        "write",
+        "write_all",
+        "zip",
+    ];
+
+    const RUST_PRIMITIVE_TYPES: &'static [&'static str] = &[
+        "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8",
+        "u16", "u32", "u64", "u128", "usize",
+    ];
+
+    /// Correct a `Unique` answer for a Rust call site, where the syntax says
+    /// more than "one function in the graph has this name":
+    ///
+    /// - `x.f()` is a method call and cannot reach a free function `f`;
+    /// - `T::f()` and `std::…::f()` name where `f` lives, and a namesake that
+    ///   is neither on that type nor in that module is not it (`PathBuf::from`,
+    ///   `std::fs::write`);
+    /// - `x.len()` on a value of unknown type is a name match when the
+    ///   standard library defines the method too.
+    ///
+    /// Without this `node.walk()` (tree-sitter) became 115 calls of
+    /// `callgraph::walk`, and `entry.key()` 115 calls of `EmbeddingCache::key`,
+    /// all reported as exact.
+    fn refine_rust_resolution(
+        &self,
+        caller_file: &str,
+        bare_name: &str,
+        call_type: CallType,
+        scope_hint: Option<&str>,
+        scope_inferred: bool,
+        resolved: (String, CallResolution),
+    ) -> (String, CallResolution) {
+        let (key, resolution) = &resolved;
+        if *resolution != CallResolution::Unique || !caller_file.ends_with(".rs") {
+            return resolved;
+        }
+        let is_method_target = Self::key_receiver(key).is_some();
+        if call_type == CallType::Method {
+            if !is_method_target {
+                return (bare_name.to_string(), CallResolution::Unresolved);
+            }
+            if Self::RUST_STD_METHOD_NAMES.contains(&bare_name) {
+                return (key.clone(), CallResolution::NameOnly);
+            }
+            return resolved;
+        }
+        let Some(scope) = scope_hint.filter(|_| !scope_inferred) else {
+            return resolved;
+        };
+        // A lowercase module path may be an inline `mod` that no file path
+        // shows (`templates::all()` inside `sparql.rs`), so only a standard
+        // library path or a type names a place the namesake demonstrably is not.
+        let tail = scope.rsplit("::").next().unwrap_or(scope);
+        let names_type = tail != "Self" && tail.starts_with(|c: char| c.is_ascii_uppercase())
+            || Self::RUST_PRIMITIVE_TYPES.contains(&tail);
+        let std_path = ["std", "core", "alloc"]
+            .iter()
+            .any(|root| scope == *root || scope.starts_with(&format!("{root}::")));
+        if !names_type && !std_path {
+            return resolved;
+        }
+        let in_scope_module = self
+            .key_file_path_lower(key)
+            .map(|path| {
+                Self::path_fragment_matches(&Self::scope_path_fragment(scope), &format!("/{path}"))
+            })
+            .unwrap_or(false);
+        if in_scope_module || self.receiver_matches(key, scope, true) {
+            resolved
+        } else {
+            (bare_name.to_string(), CallResolution::ExternalPackage)
+        }
     }
 
     /// [`resolve_callee`](Self::resolve_callee) with the provenance of the
@@ -2559,7 +2799,7 @@ impl CallGraph {
                     file_path: e.file_path.clone(),
                     line: e.line,
                     column: e.column,
-                    call_type: e.call_type.clone(),
+                    call_type: e.call_type,
                     scope_hint: None,
                     resolved: true,
                     // How the *forward* edge was matched is what a reader of
@@ -2661,7 +2901,7 @@ impl CallGraph {
                     file_path: e.file_path.clone(),
                     line: e.line,
                     column: e.column,
-                    call_type: e.call_type.clone(),
+                    call_type: e.call_type,
                     scope_hint: None,
                     resolved: true,
                     // How the *forward* edge was matched is what a reader of

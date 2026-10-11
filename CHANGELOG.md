@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supervisor's next retry. `KnowledgeGraph::open` now probes the lock with
   `fcntl(F_GETLK)` first and waits up to 30 s for the holder to exit, then
   fails with an ordinary error if the store stays locked.
+- **Rust calls are no longer tied to the one project function of that name
+  when the call syntax rules it out.** An edge whose target was the only
+  function of its name in the graph was reported as exact; in Rust that made
+  `node.walk()` (tree-sitter) 115 calls of a free `callgraph::walk`,
+  `entry.key()` 115 calls of `EmbeddingCache::key`, and `PathBuf::from`
+  calls of `AgentId::from`. Now `x.f()` cannot reach a free function (not in
+  graph), `T::f()` and `std::…::f()` cannot reach an `f` that is neither on
+  `T` nor in that module (outside the index), and `x.f()` on a value of
+  unknown type is a name match when the standard library defines `f` too.
+  Calls found inside macros (`assert!(v.len() > 0)`) keep their method or
+  path shape instead of all counting as plain calls. On narsil's `src/`
+  (27 237 edges) 561 edges lost their exact label — 182 to not-in-graph, 182
+  to outside-the-index, 197 to name match — and a 40-edge sample of the
+  remaining exact method edges had one error left. Go and other languages are
+  unchanged (Go corpus edges identical before and after).
 - **`get_function_hotspots` ranks by edges the graph identified.** Name-only
   picks among namesakes, calls leaving the graph and same-file picks on a
   value no longer count as connections. On narsil's own source the top four

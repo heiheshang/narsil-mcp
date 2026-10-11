@@ -1,9 +1,13 @@
 //! Resolution quality over a real corpus, not a fixture.
 //!
-//! Ignored by default and driven by `NARSIL_GO_CORPUS=<path to a Go repo>`:
+//! Ignored by default and driven by `NARSIL_GO_CORPUS=<path to a repo>`;
+//! `NARSIL_CORPUS_EXT` picks the files (default `go`), and `NARSIL_EDGES_OUT`
+//! writes every edge as TSV, so two builds can be compared edge by edge:
 //!
 //! ```text
 //! NARSIL_GO_CORPUS=~/src/some-go-service \
+//!     cargo test --release --test callgraph_corpus_measure -- --ignored --nocapture
+//! NARSIL_GO_CORPUS=src NARSIL_CORPUS_EXT=rs NARSIL_EDGES_OUT=/tmp/edges.tsv \
 //!     cargo test --release --test callgraph_corpus_measure -- --ignored --nocapture
 //! ```
 //!
@@ -19,6 +23,7 @@ use std::path::Path;
 
 fn load(
     root: &str,
+    ext: &str,
 ) -> (
     CallGraph,
     HashMap<String, Vec<String>>,
@@ -38,7 +43,7 @@ fn load(
                 if name != ".git" && name != "vendor" {
                     stack.push(path);
                 }
-            } else if path.extension().map(|e| e == "go").unwrap_or(false) {
+            } else if path.extension().map(|e| e == ext).unwrap_or(false) {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let rel = path
                         .strip_prefix(root)
@@ -67,7 +72,33 @@ fn load(
 #[ignore]
 fn measure() {
     let root = std::env::var("NARSIL_GO_CORPUS").expect("NARSIL_GO_CORPUS");
-    let (cg, sources, n, elapsed) = load(&root);
+    let ext = std::env::var("NARSIL_CORPUS_EXT").unwrap_or_else(|_| "go".to_string());
+    let (cg, sources, n, elapsed) = load(&root, &ext);
+    if let Ok(out) = std::env::var("NARSIL_EDGES_OUT") {
+        let mut rows = Vec::new();
+        for node in cg.iter_nodes() {
+            for e in &node.calls {
+                let line = sources
+                    .get(&e.file_path)
+                    .and_then(|lines| lines.get(e.line.saturating_sub(1)))
+                    .map(|l| l.trim().replace('\t', " "))
+                    .unwrap_or_default();
+                rows.push(format!(
+                    "{}:{}\t{}\t{:?}\t{:?}\t{}\t{}\t{}",
+                    e.file_path,
+                    e.line,
+                    e.column,
+                    e.call_type,
+                    e.resolution,
+                    e.target,
+                    e.scope_hint.as_deref().unwrap_or(""),
+                    line
+                ));
+            }
+        }
+        rows.sort();
+        std::fs::write(&out, rows.join("\n") + "\n").unwrap();
+    }
     println!("files {n}, nodes {}, built in {elapsed:?}", cg.node_count());
 
     let mut totals: HashMap<String, usize> = HashMap::new();
