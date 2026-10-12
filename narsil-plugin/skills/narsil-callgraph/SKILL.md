@@ -45,7 +45,7 @@ Each entry says what its target was matched on:
 | Marker | Meaning | What you may claim |
 |---|---|---|
 | *(no marker)* | Unique name, receiver type, or module scope matched | A fact |
-| `receiver inferred from factory name` | The call was chained onto a factory or constructor (`XFactory(c).M()`, `NewX().M()`) and exactly one namesake is defined on type `X` | Strong candidate - the type came from a naming convention, not from the call site |
+| `receiver inferred from a naming convention` | The call was chained onto a factory or constructor (`XFactory(c).M()`, `NewX().M()`) and exactly one namesake is defined on type `X`; in BSL, `МодульX.M()` went to common module `X` | Strong candidate - the type came from a naming convention, not from the call site |
 | `single implementation of the interface` | The receiver's type is an interface, and exactly one type in the index carries every method it declares | Strong candidate - dispatch is dynamic, another implementation could be injected |
 | `same-file match` | Namesakes exist; the one in the caller's file was taken | Likely, say so |
 | `name match only` | Namesakes exist and nothing distinguished them | A candidate - verify before acting |
@@ -88,7 +88,9 @@ checker, so what is covered is what is written nearby:
 | `svc.Create(dto)` where `svc` is a parameter, `var svc T`, `svc := NewT()`, `svc := &T{}`, or `svc, err := build()` | On the declared type, `Receiver`; a package-level `var` counts too |
 | `accountRepo(ctx).FindByUuid(id)` | On the declared **result type** of the inner call, `Receiver`; when the inner call is one of several namesakes, only if they all declare the same result type |
 | `self.C.Logger().SendError(err)` | Field type from the struct declaration, then the method's result type - from the interface declaration when the field is an interface |
-| `XFactory(c).M()`, `NewX().M()` | On type `X` from the factory/constructor name - `receiver inferred from factory name`; fires for `Factory`/`Provider`/`Builder` suffixes and `New`/`Make` prefixes, snake_case included |
+| `XFactory(c).M()`, `NewX().M()` | On type `X` from the factory/constructor name - `receiver inferred from a naming convention`; fires for `Factory`/`Provider`/`Builder` suffixes and `New`/`Make` prefixes, snake_case included |
+| `МодульX.Процедура()` (BSL, `МодульX = ОбщегоНазначения.ОбщийМодуль("X")`) | Common module `X`, when it has the procedure - `receiver inferred from a naming convention` |
+| `Структура.Вставить(...)`, `Таблица.ВыгрузитьКолонку(...)` (BSL, receiver names no module) | A platform method: **no target** (`not in graph`); other names are `name match only` - a configuration procedure is reached only through its module's name or its object |
 | `self.Provider.Deliver(to)` where the field is an interface | The one indexed type carrying every method the interface declares - `single implementation of the interface`; a mock in the test tree loses to production code |
 | `config.Get()` where `config` is an imported package of this repo | Narrowed to that package's own directory (not its subpackages), package-level functions only - `Scope` |
 | `assert.Len(t, x, 3)`, `err.Error()`, `wg.Add(1)` - a third-party package, or a name declared as a builtin, container or foreign type | **No target at all** - `not in graph, outside the index` (or plain `not in graph` for a builtin), instead of some namesake of this repo |

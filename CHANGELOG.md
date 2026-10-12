@@ -17,6 +17,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supervisor's next retry. `KnowledgeGraph::open` now probes the lock with
   `fcntl(F_GETLK)` first and waits up to 30 s for the holder to exit, then
   fails with an ordinary error if the store stays locked.
+- **BSL calls point at the right procedure.** Three faults in reading 1C
+  code, measured on a full УТ 11 dump (10 612 modules, 1 338 393 edges):
+  - The callee of `Модуль.Процедура(А, Результат)` was the *last identifier*
+    in the call, i.e. its last argument (`Результат`), and the receiver of
+    `Справочники.Склады.Ф()` was `Справочники`. The method name now comes
+    from the call's `name` field and the receiver is the last link (`Склады`);
+    a link of a chain `Х.М().Д()` is a method call on `Х`, not a plain call.
+  - A call on a receiver now reaches a configuration procedure only through
+    the module or object the receiver names. `Структура.Вставить(...)` was an
+    exact call of a form procedure named `Вставить` — 152 891 times; platform
+    methods (`Вставить`, `ПолноеИмя`, `ВыгрузитьКолонку`, `ПолучитьЭлементы`…)
+    now leave the graph, other names on an unnamed receiver are `name match
+    only`, and a plain `Процедура()` does not reach another module's form,
+    object or manager procedures.
+  - `Модуль.Процедура()` is looked up in that module's files instead of among
+    every namesake: the named module now wins over the caller's own namesake
+    (21 484 edges changed target, e.g. `ПроведениеДокументов.ОтразитьДвижения`
+    went to `ЗапасыСервер`), and `МодульX.Процедура()` — the standard library's
+    `ОбщегоНазначения.ОбщийМодуль("X")` idiom — goes to common module `X`
+    (5 827 edges, `receiver inferred from a naming convention`, the caveat
+    formerly worded `receiver inferred from factory name`).
+
+  Exact (`Unique`) edges fell from 247 713 to 102 632 and module-scoped ones
+  rose from 33 735 to 252 349; a 40-edge sample of the remaining exact edges
+  was all correct. The most-called procedures are now
+  `ПодставитьПараметрыВСтроку`, `ОбщийМодуль`, `ЗначениеРеквизитаОбъекта`
+  instead of `Вставить`, `ПолноеИмя`, `Ошибки`. Building the graph takes
+  17.5 s instead of 16.0 s, since real method names now get resolved; Go and
+  Rust edges are unchanged.
 - **Rust calls are no longer tied to the one project function of that name
   when the call syntax rules it out.** An edge whose target was the only
   function of its name in the graph was reported as exact; in Rust that made

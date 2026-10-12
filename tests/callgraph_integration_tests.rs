@@ -1999,3 +1999,113 @@ fn use_all(node: Node, entry: Entry, cache: Cache) {
         "plain call inside a macro"
     );
 }
+
+#[test]
+fn test_bsl_call_shapes_resolve_like_the_platform() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let raschety = "Процедура Посчитать(А, Б) Экспорт\nКонецПроцедуры\n\nПроцедура ОтразитьДвижения(Т) Экспорт\nКонецПроцедуры\n";
+    let obshchiy = "Функция ТолькоЗдесь() Экспорт\n    Возврат 1;\nКонецФункции\n";
+    let sklady = "Функция СкладПоУмолчанию() Экспорт\n    Возврат Неопределено;\nКонецФункции\n";
+    let other_form = "Процедура Вставить(К, З)\nКонецПроцедуры\n\nПроцедура ПолучитьЭлементы()\nКонецПроцедуры\n\nПроцедура ЧужаяФорменная()\nКонецПроцедуры\n";
+    let form = r#"Процедура ОтразитьДвижения(Т)
+КонецПроцедуры
+
+Процедура Обработать(Структура, Таблица, Переменная, Результат)
+    Структура.Вставить("Ключ", 1);
+    Расчеты.Посчитать(Структура, Результат);
+    МодульРасчеты.Посчитать(1, 2);
+    С = Справочники.Склады.СкладПоУмолчанию();
+    Н = Таблица.ПолучитьЭлементы().Количество();
+    Переменная.ТолькоЗдесь();
+    Расчеты.ОтразитьДвижения(Таблица);
+    ЧужаяФорменная();
+КонецПроцедуры
+"#;
+    let files: Vec<_> = [
+        ("CommonModules/Расчеты/Ext/Module.bsl", raschety),
+        ("CommonModules/Общий/Ext/Module.bsl", obshchiy),
+        ("Catalogs/Склады/Ext/ManagerModule.bsl", sklady),
+        (
+            "Documents/Чужой/Forms/ФормаДокумента/Ext/Form/Module.bsl",
+            other_form,
+        ),
+        (
+            "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl",
+            form,
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect();
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = call_graph
+        .get_callees("Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl::Обработать");
+    let on_line = |line: usize| {
+        let edges: Vec<_> = callees.iter().filter(|e| e.line == line).collect();
+        assert_eq!(edges.len(), 1, "line {line}: {edges:#?}");
+        (edges[0].target.clone(), edges[0].resolution)
+    };
+
+    assert_eq!(
+        on_line(5),
+        ("Вставить".into(), CallResolution::Unresolved),
+        "platform method"
+    );
+    assert_eq!(
+        on_line(6),
+        (
+            "CommonModules/Расчеты/Ext/Module.bsl::Посчитать".into(),
+            CallResolution::Scope
+        ),
+        "the method name, not the last argument"
+    );
+    assert_eq!(
+        on_line(7),
+        (
+            "CommonModules/Расчеты/Ext/Module.bsl::Посчитать".into(),
+            CallResolution::FactoryReceiver
+        ),
+        "МодульРасчеты holds common module Расчеты"
+    );
+    assert_eq!(
+        on_line(8),
+        (
+            "Catalogs/Склады/Ext/ManagerModule.bsl::СкладПоУмолчанию".into(),
+            CallResolution::Scope
+        ),
+        "the receiver is the last link, Склады"
+    );
+    let chain: Vec<_> = callees
+        .iter()
+        .filter(|e| e.line == 9)
+        .map(|e| (e.target.as_str(), e.resolution))
+        .collect();
+    assert!(
+        chain.contains(&("ПолучитьЭлементы", CallResolution::Unresolved)),
+        "{chain:?}"
+    );
+    assert_eq!(
+        on_line(10).1,
+        CallResolution::NameOnly,
+        "a variable receiver names no module"
+    );
+    assert_eq!(
+        on_line(11),
+        (
+            "CommonModules/Расчеты/Ext/Module.bsl::ОтразитьДвижения".into(),
+            CallResolution::Scope
+        ),
+        "the named module wins over the caller's own namesake"
+    );
+    assert_eq!(
+        on_line(12),
+        ("ЧужаяФорменная".into(), CallResolution::Unresolved),
+        "another form's procedure"
+    );
+}

@@ -82,7 +82,8 @@ pub enum CallResolution {
     /// a factory or constructor call, and the type came from *its* name
     /// (`SfxOperationUseFactory(c).Pay()` -> type `SfxOperationUse`). Exactly
     /// one namesake is defined on that type, so this is a strong candidate —
-    /// but the type was inferred from a naming convention, not read.
+    /// but the type was inferred from a naming convention, not read. In BSL,
+    /// a `МодульX.Процедура()` call resolved to common module `X`.
     FactoryReceiver,
     /// The qualifier named an interface, and exactly one type in the index
     /// implements it — carries every method the interface declares — so the
@@ -137,7 +138,7 @@ impl CallResolution {
     /// Short label for reports; `None` for edges that need no caveat.
     pub fn caveat(self) -> Option<&'static str> {
         match self {
-            Self::FactoryReceiver => Some("receiver inferred from factory name"),
+            Self::FactoryReceiver => Some("receiver inferred from a naming convention"),
             Self::InterfaceImpl => Some("single implementation of the interface"),
             Self::SameFile => Some("same-file match"),
             Self::NameOnly => Some("name match only"),
@@ -177,6 +178,9 @@ pub struct FunctionMetrics {
     /// Cognitive complexity
     pub cognitive: usize,
 }
+
+/// BSL module name (lowercased path segment) -> files under it.
+type BslModuleFiles = Arc<HashMap<String, Vec<String>>>;
 
 /// The call graph for a repository
 pub struct CallGraph {
@@ -224,6 +228,10 @@ pub struct CallGraph {
     /// interface-qualified call site, and `TypeIndex` has to clone the vector
     /// to hand it out; once per interface is enough.
     interface_methods_cache: FastMap<String, Arc<Vec<String>>>,
+    /// BSL module name (a lowercased path segment: `общегоназначения`,
+    /// `склады`) -> the files under it. Built on first use, dropped whenever
+    /// functions are added or removed.
+    bsl_module_files: std::sync::RwLock<Option<BslModuleFiles>>,
 }
 
 impl Default for CallGraph {
@@ -406,6 +414,7 @@ impl CallGraph {
             types: types::TypeIndex::new(),
             implements_cache: DashMap::default(),
             interface_methods_cache: DashMap::default(),
+            bsl_module_files: std::sync::RwLock::new(None),
         }
     }
 
@@ -429,6 +438,7 @@ impl CallGraph {
         self.import_dir_cache.clear();
         self.implements_cache.clear();
         self.interface_methods_cache.clear();
+        self.drop_bsl_module_files();
         Ok(())
     }
 
@@ -445,6 +455,7 @@ impl CallGraph {
     /// Remove all functions defined in a file from the call graph.
     /// Call this before re-indexing a file to clean up stale function definitions.
     pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {
+        self.drop_bsl_module_files();
         self.import_dir_cache.clear();
         self.implements_cache.clear();
         self.interface_methods_cache.clear();
@@ -648,7 +659,7 @@ impl CallGraph {
         if !self.name_index.contains_key(name) {
             return None;
         }
-        let (key, resolution) = self.refine_rust_resolution(
+        let (key, resolution) = self.refine_by_call_syntax(
             ctx.file,
             name,
             *call_type,
@@ -1164,10 +1175,17 @@ impl CallGraph {
                             self.resolve_package_qualified(&edge.target, import_path)
                         });
 
+                        let by_module = (by_local.is_none() && by_package.is_none())
+                            .then(|| {
+                                self.resolve_bsl_module_variable(&edge, file.path)
+                                    .or_else(|| self.resolve_bsl_module_qualified(&edge, file.path))
+                            })
+                            .flatten();
+
                         // Resolve callee with scope hint for disambiguation
-                        let (callee_key, resolution) = match by_local.or(by_package) {
+                        let (callee_key, resolution) = match by_local.or(by_package).or(by_module) {
                             Some(resolved) => resolved,
-                            None => self.refine_rust_resolution(
+                            None => self.refine_by_call_syntax(
                                 file.path,
                                 &edge.target,
                                 edge.call_type,
@@ -1287,7 +1305,7 @@ impl CallGraph {
                 }
 
                 let (call_type, scope) = Self::macro_call_shape(&text[..start]);
-                let (callee_key, resolution) = self.refine_rust_resolution(
+                let (callee_key, resolution) = self.refine_by_call_syntax(
                     caller_file,
                     ident,
                     call_type,
@@ -1631,6 +1649,287 @@ impl CallGraph {
         "u16", "u32", "u64", "u128", "usize",
     ];
 
+    fn drop_bsl_module_files(&self) {
+        *self
+            .bsl_module_files
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn bsl_module_files(&self) -> BslModuleFiles {
+        if let Some(map) = self
+            .bsl_module_files
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return map.clone();
+        }
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in self.file_functions.iter() {
+            let file = entry.key();
+            if !(file.ends_with(".bsl") || file.ends_with(".os")) {
+                continue;
+            }
+            let dirs = file.rsplit_once('/').map_or("", |(dirs, _)| dirs);
+            for segment in dirs.split('/').filter(|s| !s.is_empty()) {
+                map.entry(segment.to_lowercase())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+        let map = Arc::new(map);
+        *self
+            .bsl_module_files
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
+        map
+    }
+
+    /// `Модуль.Процедура()` and `Справочники.Склады.Процедура()`: the
+    /// procedure in the module named by the receiver, looked up through that
+    /// module's files rather than by scanning every namesake — a form event
+    /// such as `ПриСозданииНаСервере` has thousands of them.
+    fn resolve_bsl_module_qualified(
+        &self,
+        edge: &CallEdge,
+        caller_file: &str,
+    ) -> Option<(String, CallResolution)> {
+        if !(caller_file.ends_with(".bsl") || caller_file.ends_with(".os")) {
+            return None;
+        }
+        let module = edge.scope_hint.as_deref()?.to_lowercase();
+        let modules = self.bsl_module_files();
+        let mut found = modules
+            .get(&module)?
+            .iter()
+            .map(|file| Self::qualified_key(file, &edge.target))
+            .filter(|key| self.nodes.contains_key(key));
+        let first = found.next()?;
+        found
+            .next()
+            .is_none()
+            .then_some((first, CallResolution::Scope))
+    }
+
+    /// `МодульX.Процедура()`: by the convention of the 1C standard subsystems
+    /// library, `МодульX` holds `ОбщегоНазначения.ОбщийМодуль("X")`, so the
+    /// call goes to common module `X` — when that module has the procedure.
+    /// Before this, such a call went to a namesake in the caller's own module.
+    fn resolve_bsl_module_variable(
+        &self,
+        edge: &CallEdge,
+        caller_file: &str,
+    ) -> Option<(String, CallResolution)> {
+        if !(caller_file.ends_with(".bsl") || caller_file.ends_with(".os")) {
+            return None;
+        }
+        let receiver = edge.scope_hint.as_deref()?.to_lowercase();
+        let module = receiver
+            .strip_prefix("модуль")
+            .filter(|module| !module.is_empty())?;
+        let candidates = self.name_index.get(&edge.target)?;
+        let mut in_module = candidates.iter().filter(|key| {
+            self.key_file_path_lower(key).is_some_and(|path| {
+                path.contains("commonmodules/") && path.split('/').any(|segment| segment == module)
+            })
+        });
+        let first = in_module.next()?;
+        in_module
+            .next()
+            .is_none()
+            .then(|| (first.clone(), CallResolution::FactoryReceiver))
+    }
+
+    /// Correct a `Unique` answer — "one function in the graph has this name" —
+    /// with what the call site's syntax rules out, for the languages where
+    /// that is known (Rust, BSL).
+    fn refine_by_call_syntax(
+        &self,
+        caller_file: &str,
+        bare_name: &str,
+        call_type: CallType,
+        scope_hint: Option<&str>,
+        scope_inferred: bool,
+        resolved: (String, CallResolution),
+    ) -> (String, CallResolution) {
+        if resolved.1 != CallResolution::Unique {
+            return resolved;
+        }
+        if caller_file.ends_with(".rs") {
+            self.refine_rust_resolution(bare_name, call_type, scope_hint, scope_inferred, resolved)
+        } else if caller_file.ends_with(".bsl") || caller_file.ends_with(".os") {
+            self.refine_bsl_resolution(caller_file, bare_name, call_type, scope_hint, resolved)
+        } else {
+            resolved
+        }
+    }
+
+    /// Methods of 1C platform objects (`Структура`, `Массив`, `ТаблицаЗначений`,
+    /// `Запрос`, metadata, form items). `Параметры.Вставить(...)` is the
+    /// platform's, whatever procedure of that name the configuration has.
+    const BSL_PLATFORM_METHOD_NAMES: &'static [&'static str] = &[
+        "вставить",
+        "добавить",
+        "удалить",
+        "очистить",
+        "количество",
+        "получить",
+        "установить",
+        "найти",
+        "найтистроки",
+        "свойство",
+        "выгрузитьколонку",
+        "загрузитьколонку",
+        "выгрузить",
+        "загрузить",
+        "сортировать",
+        "свернуть",
+        "итог",
+        "скопировать",
+        "скопироватьколонки",
+        "индекс",
+        "сдвинуть",
+        "заполнитьзначения",
+        "заполнитьсвойствазначения",
+        "получитьэлементы",
+        "получитьродителя",
+        "получитьидентификатор",
+        "найтипоидентификатору",
+        "найтиподанным",
+        "полноеимя",
+        "имя",
+        "представление",
+        "синоним",
+        "содержит",
+        "получитьобъект",
+        "записать",
+        "прочитать",
+        "заблокировать",
+        "разблокировать",
+        "модифицированность",
+        "выполнить",
+        "выполнитьпакет",
+        "выполнитьпакетспромежуточнымиданными",
+        "установитьпараметр",
+        "выбрать",
+        "следующий",
+        "пустой",
+        "пустая",
+        "ссылка",
+        "получитьмакет",
+        "получитьформу",
+        "получитьобласть",
+        "вывести",
+        "присоединить",
+        "новаястрока",
+        "текущиеданные",
+        "получитьтекст",
+        "установитьтекст",
+        "добавитьстроку",
+        "получитьстроку",
+        "вставитьстроку",
+        "удалитьстроку",
+        "заменитьстроку",
+        "количествострок",
+        "отбор",
+        "отменитьизменения",
+        "insert",
+        "add",
+        "delete",
+        "clear",
+        "count",
+        "get",
+        "set",
+        "find",
+        "findrows",
+        "property",
+        "unloadcolumn",
+        "loadcolumn",
+        "unload",
+        "load",
+        "sort",
+        "groupby",
+        "total",
+        "copy",
+        "getitems",
+        "getparent",
+        "fullname",
+        "name",
+        "write",
+        "read",
+        "lock",
+        "execute",
+        "executebatch",
+        "setparameter",
+        "select",
+        "next",
+        "isempty",
+        "ref",
+        "gettemplate",
+        "getform",
+        "getarea",
+        "put",
+        "join",
+        "currentdata",
+    ];
+
+    /// Correct a `Unique` answer for a BSL call site. A call on a receiver —
+    /// `Структура.Вставить()`, `Таблица.ВыгрузитьКолонку()`, a link of a chain
+    /// — reaches a procedure of a common or manager module only through that
+    /// module's name, and one of a form or object module only through an
+    /// object of that form or object; when the receiver names neither, the
+    /// one procedure of that name is not shown to be the target: the call
+    /// leaves the graph if the platform defines the method, and is a name
+    /// match otherwise. A plain `Процедура()` cannot reach a form, object or
+    /// manager module other than its own (common modules can be global).
+    ///
+    /// Without this the 152 891 `.Вставить(` calls of a УТ 11 dump were exact
+    /// calls of one form's `Вставить` procedure.
+    fn refine_bsl_resolution(
+        &self,
+        caller_file: &str,
+        bare_name: &str,
+        call_type: CallType,
+        scope_hint: Option<&str>,
+        resolved: (String, CallResolution),
+    ) -> (String, CallResolution) {
+        let Some(target_file) = self.key_file_path(&resolved.0) else {
+            return resolved;
+        };
+        let same_file = target_file == caller_file;
+        if call_type != CallType::Method {
+            let common = target_file.contains("CommonModules/");
+            return if same_file || common {
+                resolved
+            } else {
+                (bare_name.to_string(), CallResolution::Unresolved)
+            };
+        }
+        let receiver = scope_hint.map(str::to_lowercase);
+        if same_file
+            && matches!(
+                receiver.as_deref(),
+                Some("этотобъект" | "этаформа" | "thisobject" | "thisform")
+            )
+        {
+            return resolved;
+        }
+        let named_by_receiver = receiver.as_deref().is_some_and(|receiver| {
+            target_file
+                .trim_end_matches(".bsl")
+                .split('/')
+                .any(|segment| segment.to_lowercase() == receiver)
+        });
+        if named_by_receiver {
+            resolved
+        } else if Self::BSL_PLATFORM_METHOD_NAMES.contains(&bare_name.to_lowercase().as_str()) {
+            (bare_name.to_string(), CallResolution::Unresolved)
+        } else {
+            (resolved.0, CallResolution::NameOnly)
+        }
+    }
+
     /// Correct a `Unique` answer for a Rust call site, where the syntax says
     /// more than "one function in the graph has this name":
     ///
@@ -1646,17 +1945,13 @@ impl CallGraph {
     /// all reported as exact.
     fn refine_rust_resolution(
         &self,
-        caller_file: &str,
         bare_name: &str,
         call_type: CallType,
         scope_hint: Option<&str>,
         scope_inferred: bool,
         resolved: (String, CallResolution),
     ) -> (String, CallResolution) {
-        let (key, resolution) = &resolved;
-        if *resolution != CallResolution::Unique || !caller_file.ends_with(".rs") {
-            return resolved;
-        }
+        let (key, _) = &resolved;
         let is_method_target = Self::key_receiver(key).is_some();
         if call_type == CallType::Method {
             if !is_method_target {
@@ -1882,10 +2177,16 @@ impl CallGraph {
     /// `/{scope_path}.`? `scope_path` comes from [`scope_path_fragment`] and
     /// `file_path_lower` from [`key_file_path_lower`] — both precomputed so
     /// this call itself does no case-folding.
+    /// It runs once per namesake of a qualified call, so it allocates nothing:
+    /// `ПодключаемыеКоманды.ПриСозданииНаСервере()` alone has 4 163 namesakes.
     fn path_fragment_matches(scope_path: &str, file_path_lower: &str) -> bool {
-        let with_slash = format!("/{}/", scope_path);
-        let with_dot = format!("/{}.", scope_path);
-        file_path_lower.contains(&with_slash) || file_path_lower.contains(&with_dot)
+        file_path_lower.match_indices(scope_path).any(|(at, _)| {
+            file_path_lower[..at].ends_with('/')
+                && matches!(
+                    file_path_lower[at + scope_path.len()..].chars().next(),
+                    Some('/' | '.')
+                )
+        })
     }
 
     /// Single-shot convenience combining [`scope_path_fragment`] and
@@ -2343,6 +2644,9 @@ impl CallGraph {
         if let Some(found) = self.extract_call_edge_by_fields(node, source, ctx) {
             return Some(found);
         }
+        if node.kind() == "method_call" {
+            return Self::bsl_method_call_edge(node, source, ctx);
+        }
 
         let mut cursor = node.walk();
         cursor.goto_first_child();
@@ -2376,12 +2680,13 @@ impl CallGraph {
                 }
                 "access" => {
                     // BSL qualified call `Module.Func()`: `access` holds the
-                    // module name, used as the scope hint for resolution.
-                    scope_hint = self.get_last_identifier(child, source);
+                    // receiver, used as the scope hint for resolution.
+                    scope_hint = Self::bsl_receiver_name(child, source);
                 }
                 "method_call" => {
-                    // BSL `name: (identifier)` inside a `call_expression`.
-                    if let Some(method) = self.get_last_identifier(child, source) {
+                    // BSL `name: (identifier)` inside a `call_expression`; the
+                    // arguments are identifiers too, so only the name field.
+                    if let Some(method) = Self::bsl_method_name(child, source) {
                         target = Some(method);
                         call_type = CallType::Method;
                     }
@@ -2409,6 +2714,54 @@ impl CallGraph {
                 false,
             )
         })
+    }
+
+    fn bsl_method_name(method_call: Node, source: &[u8]) -> Option<String> {
+        let name = method_call.child_by_field_name("name")?;
+        name.utf8_text(source).ok().map(str::to_string)
+    }
+
+    /// The name a BSL receiver ends in: `Модуль` for `Модуль.Ф()`, `Склады`
+    /// for `Справочники.Склады.Ф()`. `None` when the receiver is itself a call
+    /// result (`Х.Элементы().Ф()`) — then no name says what it is.
+    fn bsl_receiver_name(receiver: Node, source: &[u8]) -> Option<String> {
+        match receiver.kind() {
+            "identifier" | "property" => receiver.utf8_text(source).ok().map(str::to_string),
+            "access" => {
+                let mut cursor = receiver.walk();
+                let last = receiver.named_children(&mut cursor).last()?;
+                Self::bsl_receiver_name(last, source)
+            }
+            _ => None,
+        }
+    }
+
+    /// A BSL `method_call` on its own: a plain call `Процедура()`, or a link
+    /// of a chain `Х.Метод().Другой()` whose receiver is the node before it
+    /// inside the parent `access`.
+    fn bsl_method_call_edge(node: Node, source: &[u8], ctx: CallCtx) -> Option<(CallEdge, bool)> {
+        let target = Self::bsl_method_name(node, source)?;
+        let (call_type, scope_hint) = match node.parent().filter(|p| p.kind() == "access") {
+            Some(_) => (
+                CallType::Method,
+                node.prev_named_sibling()
+                    .and_then(|receiver| Self::bsl_receiver_name(receiver, source)),
+            ),
+            None => (CallType::Direct, None),
+        };
+        Some((
+            CallEdge {
+                target,
+                file_path: ctx.file.to_string(),
+                line: node.start_position().row + 1,
+                column: node.start_position().column + 1,
+                call_type,
+                scope_hint,
+                resolved: false,
+                resolution: CallResolution::Unknown,
+            },
+            false,
+        ))
     }
 
     fn get_last_identifier(&self, node: Node, source: &[u8]) -> Option<String> {
@@ -3325,7 +3678,7 @@ impl CallGraph {
             ("receiver type read", counts[1]),
             ("package or module scope", counts[2]),
             ("single interface implementation", counts[3]),
-            ("receiver inferred from factory name", counts[4]),
+            ("receiver inferred from a naming convention", counts[4]),
             ("same file as caller", counts[5]),
             ("name match only", counts[6]),
             ("not in graph: outside the index", counts[7]),
@@ -3388,6 +3741,7 @@ impl CallGraph {
         self.nodes.clear();
         self.name_index.clear();
         self.file_functions.clear();
+        self.drop_bsl_module_files();
 
         let mut per_file: HashMap<String, Vec<String>> = HashMap::new();
         for (key, node) in nodes {
