@@ -2166,14 +2166,14 @@ fn test_bsl_notify_description_is_a_call_of_its_handler() {
             (
                 2,
                 in_form("ПолучитьВесЗавершение").as_str(),
-                CallResolution::SameFile
+                CallResolution::Scope
             ),
             (
                 4,
                 "CommonModules/МенеджерОборудованияКлиент/Ext/Module.bsl::ВесПолученОбщий",
                 CallResolution::Scope
             ),
-            (4, in_form("ОшибкаВеса").as_str(), CallResolution::SameFile),
+            (4, in_form("ОшибкаВеса").as_str(), CallResolution::Scope),
             (
                 5,
                 "Documents/Чужой/Forms/ФормаВыбора/Ext/Form/Module.bsl::ВыборЗавершение",

@@ -1314,8 +1314,9 @@ impl CallGraph {
     }
 
     /// Where the handler of an `ОписаниеОповещения` lives. `ЭтотОбъект` and
-    /// `ЭтаФорма` are the module that builds the description, and a handler
-    /// missing from it is a dangling name; a common module name or `МодульX`
+    /// `ЭтаФорма` name the module that builds the description — a module
+    /// stated at the call site, not a same-file guess — and a handler missing
+    /// from it is a dangling name; a common module name or `МодульX`
     /// resolves as `Модуль.Обработчик()` would. Any other module argument is
     /// a variable holding some form or object, so a namesake elsewhere is
     /// only a name match.
@@ -1327,7 +1328,7 @@ impl CallGraph {
         ) {
             let key = Self::qualified_key(caller_file, &edge.target);
             return if self.nodes.contains_key(&key) {
-                (key, CallResolution::SameFile)
+                (key, CallResolution::Scope)
             } else {
                 (edge.target.clone(), CallResolution::Unresolved)
             };
