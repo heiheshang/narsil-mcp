@@ -159,6 +159,7 @@ pub enum CallType {
     Closure,      // let f = foo; f()
     Async,        // foo().await
     Spawn,        // spawn(foo)
+    Callback,     // Новый ОписаниеОповещения("Обработчик", ЭтотОбъект)
     Unknown,
 }
 
@@ -1200,19 +1201,18 @@ impl CallGraph {
                             ),
                         };
 
-                        // Add to caller's outgoing calls (with resolved key as target)
-                        // Compute `resolved` *before* taking the caller's write
-                        // lock: `contains_key` takes a read lock on the callee's
-                        // shard, and a self-call (caller == callee) would
-                        // otherwise deadlock (read-under-write on one shard).
-                        let resolved = self.nodes.contains_key(&callee_key);
-                        if let Some(mut caller_node) = self.nodes.get_mut(caller_key.as_str()) {
-                            let mut resolved_edge = edge.clone();
-                            resolved_edge.target = callee_key.clone();
-                            resolved_edge.resolved = resolved;
-                            resolved_edge.resolution = resolution;
-                            caller_node.calls.push(resolved_edge);
-                        }
+                        self.push_call(caller_key, edge, callee_key, resolution);
+                    }
+                }
+            }
+
+            if kind == "new_expression"
+                && (file.path.ends_with(".bsl") || file.path.ends_with(".os"))
+            {
+                if let Some(ref caller_key) = scope.function {
+                    for edge in Self::bsl_notify_description_edges(node, source, ctx) {
+                        let (callee_key, resolution) = self.resolve_bsl_callback(&edge, file.path);
+                        self.push_call(caller_key, edge, callee_key, resolution);
                     }
                 }
             }
@@ -1239,6 +1239,110 @@ impl CallGraph {
             if !cursor.goto_next_sibling() {
                 break;
             }
+        }
+    }
+
+    fn push_call(
+        &self,
+        caller_key: &str,
+        mut edge: CallEdge,
+        callee_key: String,
+        resolution: CallResolution,
+    ) {
+        // Compute `resolved` *before* taking the caller's write lock:
+        // `contains_key` takes a read lock on the callee's shard, and a
+        // self-call (caller == callee) would otherwise deadlock
+        // (read-under-write on one shard).
+        let resolved = self.nodes.contains_key(&callee_key);
+        if let Some(mut caller_node) = self.nodes.get_mut(caller_key) {
+            edge.target = callee_key;
+            edge.resolved = resolved;
+            edge.resolution = resolution;
+            caller_node.calls.push(edge);
+        }
+    }
+
+    /// `Новый ОписаниеОповещения("Обработчик", Модуль, Параметры,
+    /// "ОбработчикОшибки", МодульОшибки)`: the platform calls the named
+    /// procedures of the named modules later, so the procedure that builds
+    /// the description is where the call comes from. One edge per handler;
+    /// the receiver is the module argument, as in `Модуль.Обработчик()`.
+    fn bsl_notify_description_edges(node: Node, source: &[u8], ctx: CallCtx) -> Vec<CallEdge> {
+        let is_notify_description = node
+            .child_by_field_name("type")
+            .and_then(|t| t.utf8_text(source).ok())
+            .is_some_and(|t| {
+                t.eq_ignore_ascii_case("NotifyDescription")
+                    || t.to_lowercase() == "описаниеоповещения"
+            });
+        let Some(arguments) = node
+            .child_by_field_name("arguments")
+            .filter(|_| is_notify_description)
+        else {
+            return Vec::new();
+        };
+        let mut cursor = arguments.walk();
+        let args: Vec<Node> = arguments.named_children(&mut cursor).collect();
+        let procedure_name = |arg: &Node| {
+            let mut node = *arg;
+            while node.kind() != "string_content" {
+                node = node.named_child(0)?;
+            }
+            let name = node.utf8_text(source).ok()?.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        };
+        let module_name = |arg: &Node| {
+            let inner = arg.named_child(0)?;
+            Self::bsl_receiver_name(inner, source)
+        };
+        [(0, 1), (3, 4)]
+            .into_iter()
+            .filter_map(|(name_at, module_at)| {
+                let name_arg = args.get(name_at)?;
+                Some(CallEdge {
+                    target: procedure_name(name_arg)?,
+                    file_path: ctx.file.to_string(),
+                    line: name_arg.start_position().row + 1,
+                    column: name_arg.start_position().column + 1,
+                    call_type: CallType::Callback,
+                    scope_hint: args.get(module_at).and_then(module_name),
+                    resolved: false,
+                    resolution: CallResolution::Unknown,
+                })
+            })
+            .collect()
+    }
+
+    /// Where the handler of an `ОписаниеОповещения` lives. `ЭтотОбъект` and
+    /// `ЭтаФорма` are the module that builds the description, and a handler
+    /// missing from it is a dangling name; a common module name or `МодульX`
+    /// resolves as `Модуль.Обработчик()` would. Any other module argument is
+    /// a variable holding some form or object, so a namesake elsewhere is
+    /// only a name match.
+    fn resolve_bsl_callback(&self, edge: &CallEdge, caller_file: &str) -> (String, CallResolution) {
+        let receiver = edge.scope_hint.as_deref().map(str::to_lowercase);
+        if matches!(
+            receiver.as_deref(),
+            Some("этотобъект" | "этаформа" | "thisobject" | "thisform")
+        ) {
+            let key = Self::qualified_key(caller_file, &edge.target);
+            return if self.nodes.contains_key(&key) {
+                (key, CallResolution::SameFile)
+            } else {
+                (edge.target.clone(), CallResolution::Unresolved)
+            };
+        }
+        if let Some(found) = self
+            .resolve_bsl_module_variable(edge, caller_file)
+            .or_else(|| self.resolve_bsl_module_qualified(edge, caller_file))
+        {
+            return found;
+        }
+        match self.resolve_scoped_callee(&edge.target, caller_file, None, false) {
+            (key, CallResolution::Unique | CallResolution::SameFile) => {
+                (key, CallResolution::NameOnly)
+            }
+            other => other,
         }
     }
 
@@ -2727,7 +2831,7 @@ impl CallGraph {
     fn bsl_receiver_name(receiver: Node, source: &[u8]) -> Option<String> {
         match receiver.kind() {
             "identifier" | "property" => receiver.utf8_text(source).ok().map(str::to_string),
-            "access" => {
+            "access" | "property_access" => {
                 let mut cursor = receiver.walk();
                 let last = receiver.named_children(&mut cursor).last()?;
                 Self::bsl_receiver_name(last, source)

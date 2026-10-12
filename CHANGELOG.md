@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **BSL notify descriptions are calls.** `Новый ОписаниеОповещения("Обработчик",
+  ЭтотОбъект)` is how 1C calls a procedure asynchronously; the graph now has a
+  `Callback` edge from the procedure that builds the description to the
+  handler, and to the error handler when the 4th and 5th arguments name one.
+  The module argument resolves like a receiver: `ЭтотОбъект`/`ЭтаФорма` is the
+  building module (a handler missing there stays unresolved), a common module
+  name or `МодульX` goes to that module, any other variable is a name match.
+  On УТ 11: 9 987 edges, 95% into the same module, 7 880 handlers that had no
+  caller at all. Of the 9 unresolved, 8 name procedures that do not exist and
+  one is a name with `ё`, which tree-sitter-bsl splits in the definition.
+
 ### Fixed
 
 - **Restarting a `--graph` server no longer segfaults once.** A restarted

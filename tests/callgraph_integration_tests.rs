@@ -1,4 +1,4 @@
-use narsil_mcp::callgraph::{CallGraph, CallResolution};
+use narsil_mcp::callgraph::{CallGraph, CallResolution, CallType};
 use narsil_mcp::parser::LanguageParser;
 use std::path::Path;
 
@@ -2107,5 +2107,85 @@ fn test_bsl_call_shapes_resolve_like_the_platform() {
         on_line(12),
         ("ЧужаяФорменная".into(), CallResolution::Unresolved),
         "another form's procedure"
+    );
+}
+
+#[test]
+fn test_bsl_notify_description_is_a_call_of_its_handler() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let equipment = "Процедура НачатьПолученияВеса(Оповещение, Ид) Экспорт\nКонецПроцедуры\n\nПроцедура ВесПолученОбщий(Р, П) Экспорт\nКонецПроцедуры\n";
+    let other_form = "Процедура ВыборЗавершение(Р, П)\nКонецПроцедуры\n";
+    let form = r#"Процедура ПолучитьВес(Команда)
+    Оповещение = Новый ОписаниеОповещения("ПолучитьВесЗавершение", ЭтотОбъект, ТекущаяСтрока);
+    МенеджерОборудованияКлиент.НачатьПолученияВеса(Оповещение, УникальныйИдентификатор);
+    О = Новый ОписаниеОповещения("ВесПолученОбщий", МенеджерОборудованияКлиент, , "ОшибкаВеса", ЭтаФорма);
+    Ф = Новый ОписаниеОповещения("ВыборЗавершение", Параметры.Владелец);
+    Н = Новый ОписаниеОповещения("НетТакой", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ПолучитьВесЗавершение(Результат, ДополнительныеПараметры) Экспорт
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ОшибкаВеса(Информация, СтандартнаяОбработка, ДополнительныеПараметры) Экспорт
+КонецПроцедуры
+"#;
+    let form_path = "DataProcessors/Весы/Forms/Форма/Ext/Form/Module.bsl";
+    let files: Vec<_> = [
+        (
+            "CommonModules/МенеджерОборудованияКлиент/Ext/Module.bsl",
+            equipment,
+        ),
+        (
+            "Documents/Чужой/Forms/ФормаВыбора/Ext/Form/Module.bsl",
+            other_form,
+        ),
+        (form_path, form),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect();
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = call_graph.get_callees(&format!("{form_path}::ПолучитьВес"));
+    let callbacks: Vec<_> = callees
+        .iter()
+        .filter(|e| e.call_type == CallType::Callback)
+        .map(|e| (e.line, e.target.as_str(), e.resolution))
+        .collect();
+    let in_form = |name: &str| format!("{form_path}::{name}");
+    assert_eq!(
+        callbacks,
+        vec![
+            (
+                2,
+                in_form("ПолучитьВесЗавершение").as_str(),
+                CallResolution::SameFile
+            ),
+            (
+                4,
+                "CommonModules/МенеджерОборудованияКлиент/Ext/Module.bsl::ВесПолученОбщий",
+                CallResolution::Scope
+            ),
+            (4, in_form("ОшибкаВеса").as_str(), CallResolution::SameFile),
+            (
+                5,
+                "Documents/Чужой/Forms/ФормаВыбора/Ext/Form/Module.bsl::ВыборЗавершение",
+                CallResolution::NameOnly
+            ),
+            (6, "НетТакой", CallResolution::Unresolved),
+        ]
+    );
+
+    let callers = call_graph.get_callers(&in_form("ПолучитьВесЗавершение"));
+    assert!(
+        callers.iter().any(|c| c.target.ends_with("::ПолучитьВес")),
+        "{callers:?}"
     );
 }
