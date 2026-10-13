@@ -827,6 +827,7 @@ mod tests {
             },
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -869,6 +870,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let caller_iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -904,6 +906,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -923,6 +926,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -933,6 +937,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         CallGraphTransformer::transform_node(&graph, "test-repo", &node_a).unwrap();

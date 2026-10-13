@@ -92,9 +92,17 @@ checker, so what is covered is what is written nearby:
 | `МодульX.Процедура()` (BSL, `МодульX = ОбщегоНазначения.ОбщийМодуль("X")`) | Common module `X`, when it has the procedure - `receiver inferred from a naming convention` |
 | `Структура.Вставить(...)`, `Таблица.ВыгрузитьКолонку(...)` (BSL, receiver names no module) | A platform method: **no target** (`not in graph`); other names are `name match only` - a configuration procedure is reached only through its module's name or its object |
 | `Новый ОписаниеОповещения("Обработчик", Модуль, , "ОбработчикОшибки", МодульОшибки)` (BSL) | A `Callback` edge from the procedure building the description to each handler: `ЭтотОбъект`/`ЭтаФорма` - the same module, or **no target** when the module lacks the procedure (a dangling handler name); a common module or `МодульX` - as `Модуль.Обработчик()`; any other variable (`Форма`, `ВладелецФормы`) - `name match only` |
+| `&Перед("Метод")`, `&После`, `&Вместо`, `&ИзменениеИКонтроль` (BSL extension) | An `Extension` edge from `Метод` of the same module in the extended configuration (longest common path tail, at least `Категория/Объект/Ext/Модуль.bsl`) to the extension procedure, and back when it calls `ПродолжитьВызов()`. Only within one indexed repository: an extension indexed as a separate repo is not linked |
 | `self.Provider.Deliver(to)` where the field is an interface | The one indexed type carrying every method the interface declares - `single implementation of the interface`; a mock in the test tree loses to production code |
 | `config.Get()` where `config` is an imported package of this repo | Narrowed to that package's own directory (not its subpackages), package-level functions only - `Scope` |
 | `assert.Len(t, x, 3)`, `err.Error()`, `wg.Add(1)` - a third-party package, or a name declared as a builtin, container or foreign type | **No target at all** - `not in graph, outside the index` (or plain `not in graph` for a builtin), instead of some namesake of this repo |
+
+For a BSL procedure the platform calls by itself, `get_callers` says so instead of
+"No callers found": an event of its module (`ПередЗаписью` in an object module,
+`ОбработкаКоманды`, `УстановкаПараметровСеанса`, ...), a handler named in metadata
+XML (form and element events and command actions in `Form.xml`, event
+subscriptions, scheduled jobs, HTTP and web services), or an extension procedure.
+Handlers from XML are read at indexing time; `--watch` does not refresh them.
 
 `get_index_status` reports the mix (`## Call Edge Resolution`), which is how you
 tell a corpus that resolves well from one that mostly guesses. The three

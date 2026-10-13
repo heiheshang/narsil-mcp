@@ -2189,3 +2189,118 @@ fn test_bsl_notify_description_is_a_call_of_its_handler() {
         "{callers:?}"
     );
 }
+
+#[test]
+fn test_bsl_extension_annotations_link_the_extended_method() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let base_path = "cf/Documents/Перемещение/Ext/ObjectModule.bsl";
+    let base = "Процедура ОбработкаЗаполнения(Данные)\n    ЗаполнитьПоЗаказу(Данные);\nКонецПроцедуры\n\nПроцедура ЗаполнитьПоЗаказу(Структура)\nКонецПроцедуры\n\nПроцедура ПередЗаписью(Отказ)\nКонецПроцедуры\n";
+    // A namesake in another document: the extension of Перемещение does not touch it.
+    let other_path = "cf/Documents/Списание/Ext/ObjectModule.bsl";
+    let other = "Процедура ЗаполнитьПоЗаказу(Структура)\nКонецПроцедуры\n";
+    let ext_path = "cfe/Расширение1/Documents/Перемещение/Ext/ObjectModule.bsl";
+    let ext = r#"&Вместо("ЗаполнитьПоЗаказу")
+Процедура Расш_ЗаполнитьПоЗаказу(Структура)
+    ПродолжитьВызов(Структура);
+КонецПроцедуры
+
+&НаСервере
+&После("ПередЗаписью")
+Процедура Расш_ПередЗаписью(Отказ)
+КонецПроцедуры
+
+&Перед("НетТакого")
+Процедура Расш_НетТакого()
+КонецПроцедуры
+"#;
+    let files: Vec<_> = [(base_path, base), (other_path, other), (ext_path, ext)]
+        .into_iter()
+        .map(|(path, code)| {
+            let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+            (path.to_string(), code.to_string(), tree)
+        })
+        .collect();
+    call_graph.build_from_files(&files).unwrap();
+
+    let extension_edges = |key: &str| -> Vec<(String, CallResolution)> {
+        call_graph
+            .get_callees(key)
+            .iter()
+            .filter(|e| e.call_type == CallType::Extension)
+            .map(|e| (e.target.clone(), e.resolution))
+            .collect()
+    };
+    let in_base = |name: &str| format!("{base_path}::{name}");
+    let in_ext = |name: &str| format!("{ext_path}::{name}");
+
+    assert_eq!(
+        extension_edges(&in_base("ЗаполнитьПоЗаказу")),
+        vec![(in_ext("Расш_ЗаполнитьПоЗаказу"), CallResolution::Scope)]
+    );
+    assert_eq!(
+        extension_edges(&in_base("ПередЗаписью")),
+        vec![(in_ext("Расш_ПередЗаписью"), CallResolution::Scope)]
+    );
+    assert!(extension_edges(&format!("{other_path}::ЗаполнитьПоЗаказу")).is_empty());
+    assert_eq!(
+        extension_edges(&in_ext("Расш_ЗаполнитьПоЗаказу")),
+        vec![(in_base("ЗаполнитьПоЗаказу"), CallResolution::Scope)],
+        "ПродолжитьВызов() runs the extended method"
+    );
+    assert!(
+        extension_edges(&in_ext("Расш_ПередЗаписью")).is_empty(),
+        "no ПродолжитьВызов, no edge back"
+    );
+
+    let callers = call_graph.get_callers(&in_ext("Расш_ПередЗаписью"));
+    assert!(
+        callers.iter().any(|c| c.target == in_base("ПередЗаписью")),
+        "{callers:?}"
+    );
+    assert!(call_graph.get_callers(&in_ext("Расш_НетТакого")).is_empty());
+
+    // Relinking replaces the edges instead of adding a second copy.
+    call_graph.link_extensions();
+    assert_eq!(extension_edges(&in_base("ЗаполнитьПоЗаказу")).len(), 1);
+}
+
+#[test]
+fn test_bsl_platform_entry_reasons() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let object_path = "Documents/Заказ/Ext/ObjectModule.bsl";
+    let object = "Процедура ПередЗаписью(Отказ)\nКонецПроцедуры\n\nПроцедура Пересчитать()\nКонецПроцедуры\n";
+    let form_path = "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl";
+    let form =
+        "&НаСервере\nПроцедура ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\nКонецПроцедуры\n";
+    let files: Vec<_> = [(object_path, object), (form_path, form)]
+        .into_iter()
+        .map(|(path, code)| {
+            let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+            (path.to_string(), code.to_string(), tree)
+        })
+        .collect();
+    call_graph.build_from_files(&files).unwrap();
+    call_graph.add_platform_entry(
+        form_path,
+        "ПриСозданииНаСервере",
+        "form event OnCreateAtServer".to_string(),
+    );
+
+    assert_eq!(
+        call_graph.platform_entry_reason(&format!("{object_path}::ПередЗаписью")),
+        Some("object module event ПередЗаписью".to_string())
+    );
+    assert_eq!(
+        call_graph.platform_entry_reason(&format!("{form_path}::ПриСозданииНаСервере")),
+        Some("form event OnCreateAtServer".to_string())
+    );
+    assert_eq!(
+        call_graph.platform_entry_reason(&format!("{object_path}::Пересчитать")),
+        None,
+        "an ordinary procedure is not called by the platform"
+    );
+}

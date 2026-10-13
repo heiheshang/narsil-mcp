@@ -39,6 +39,13 @@ pub struct CallNode {
     /// guessed among namesakes.
     #[serde(default)]
     pub result_type: Option<String>,
+    /// The method a BSL configuration extension intercepts here:
+    /// `&Перед("Имя")`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`. The
+    /// platform runs this procedure when `Имя` of the extended module is
+    /// called, so nothing in the source calls it by its own name;
+    /// [`CallGraph::link_extensions`] turns this into edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercepts: Option<String>,
 }
 
 /// An edge in the call graph
@@ -161,6 +168,7 @@ pub enum CallType {
     Async,        // foo().await
     Spawn,        // spawn(foo)
     Callback,     // Новый ОписаниеОповещения("Обработчик", ЭтотОбъект)
+    Extension,    // &Вместо("Метод"): the extended method runs the extension's
     Unknown,
 }
 
@@ -234,6 +242,10 @@ pub struct CallGraph {
     /// `склады`) -> the files under it. Built on first use, dropped whenever
     /// functions are added or removed.
     bsl_module_files: std::sync::RwLock<Option<BslModuleFiles>>,
+    /// `file::procedure` (procedure lowercased) -> why the 1C platform calls
+    /// it, from metadata XML: form handlers, event subscriptions, scheduled
+    /// jobs, services. See [`platform_entry_reason`](Self::platform_entry_reason).
+    platform_entries: DashMap<String, String>,
 }
 
 impl Default for CallGraph {
@@ -417,13 +429,16 @@ impl CallGraph {
             implements_cache: DashMap::default(),
             interface_methods_cache: DashMap::default(),
             bsl_module_files: std::sync::RwLock::new(None),
+            platform_entries: DashMap::default(),
         }
     }
 
     /// Build call graph from parsed files (two passes over the same slice).
     pub fn build_from_files(&self, files: &[(String, String, Tree)]) -> Result<()> {
         self.collect_functions(files)?;
-        self.collect_calls(files)
+        self.collect_calls(files)?;
+        self.link_extensions();
+        Ok(())
     }
 
     /// First pass: collect function definitions from a batch of parsed files.
@@ -474,6 +489,147 @@ impl CallGraph {
     /// is taken for writing.
     pub fn collect_file_calls(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
         self.extract_calls(path, content, tree)
+    }
+
+    /// Edges for BSL extension procedures, which no source line calls by
+    /// name: from the extended method to each procedure intercepting it
+    /// (`&Перед`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`), and from an
+    /// interceptor that calls `ПродолжитьВызов()` back to the method.
+    ///
+    /// The extended method is the namesake in a file of the same module: the
+    /// longest common path tail, at least `Категория/Объект/Ext/Модуль.bsl`,
+    /// so a dump of the configuration and one of the extension side by side
+    /// line up. Runs after [`collect_calls`](Self::collect_calls), on one
+    /// thread, and replaces the edges a previous run added.
+    pub fn link_extensions(&self) {
+        // The module path tail must at least name the object and the module.
+        const MIN_COMMON_TAIL: usize = 4;
+
+        for mut node in self.nodes.iter_mut() {
+            node.calls
+                .retain(|edge| edge.call_type != CallType::Extension);
+        }
+
+        let mut hooks: Vec<(String, String, usize, String, bool)> = self
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let method = node.intercepts.clone()?;
+                let proceeds = node.calls.iter().any(|edge| {
+                    let name = edge.target.rsplit("::").next().unwrap_or(&edge.target);
+                    name.eq_ignore_ascii_case("ProceedWithCall")
+                        || name.to_lowercase() == "продолжитьвызов"
+                });
+                Some((
+                    node.key().clone(),
+                    node.file_path.clone(),
+                    node.line,
+                    method,
+                    proceeds,
+                ))
+            })
+            .collect();
+        hooks.sort();
+
+        let tail =
+            |path: &str| -> Vec<String> { path.rsplit('/').map(str::to_lowercase).collect() };
+        for (hook_key, hook_file, hook_line, method, proceeds) in hooks {
+            let hook_tail = tail(&hook_file);
+            // BSL names are case-insensitive; the scan is only for an
+            // annotation spelled differently from the definition.
+            let candidates = self
+                .name_index
+                .get(&method)
+                .map(|entry| entry.clone())
+                .or_else(|| {
+                    let lower = method.to_lowercase();
+                    self.name_index
+                        .iter()
+                        .find(|entry| entry.key().to_lowercase() == lower)
+                        .map(|entry| entry.value().clone())
+                });
+            let Some(candidates) = candidates else {
+                continue;
+            };
+            let mut best = 0;
+            let mut targets: Vec<String> = Vec::new();
+            for candidate in candidates {
+                let Some(file) = self.nodes.get(&candidate).map(|n| n.file_path.clone()) else {
+                    continue;
+                };
+                if file == hook_file {
+                    continue;
+                }
+                let common = hook_tail
+                    .iter()
+                    .zip(tail(&file))
+                    .take_while(|(a, b)| *a == b)
+                    .count();
+                if common < MIN_COMMON_TAIL || common < best {
+                    continue;
+                }
+                if common > best {
+                    best = common;
+                    targets.clear();
+                }
+                targets.push(candidate);
+            }
+            targets.sort();
+            let resolution = if targets.len() == 1 {
+                CallResolution::Scope
+            } else {
+                CallResolution::NameOnly
+            };
+            for target in targets {
+                let edge = |to: &str| CallEdge {
+                    target: to.to_string(),
+                    file_path: hook_file.clone(),
+                    line: hook_line,
+                    column: 0,
+                    call_type: CallType::Extension,
+                    scope_hint: None,
+                    resolved: true,
+                    resolution,
+                };
+                if let Some(mut base) = self.nodes.get_mut(&target) {
+                    base.calls.push(edge(&hook_key));
+                }
+                if proceeds {
+                    if let Some(mut hook) = self.nodes.get_mut(&hook_key) {
+                        hook.calls.push(edge(&target));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record that the 1C platform calls `procedure` of the module at
+    /// `module_path` by itself, and why.
+    pub fn add_platform_entry(&self, module_path: &str, procedure: &str, reason: String) {
+        self.platform_entries.insert(
+            format!("{module_path}::{}", procedure.to_lowercase()),
+            reason,
+        );
+    }
+
+    /// Why a BSL function has callers the source does not show: the platform
+    /// calls it (an event of its module, a handler named in metadata XML), or
+    /// it is an extension procedure the platform runs in place of, before or
+    /// after the method it intercepts.
+    pub fn platform_entry_reason(&self, key: &str) -> Option<String> {
+        let node = self.nodes.get(key)?;
+        if let Some(method) = &node.intercepts {
+            return Some(format!("extension procedure intercepting `{method}`"));
+        }
+        let procedure = node.name.to_lowercase();
+        if let Some(reason) = self
+            .platform_entries
+            .get(&format!("{}::{procedure}", node.file_path))
+        {
+            return Some(reason.clone());
+        }
+        bsl_module_event(&node.file_path, &procedure)
+            .map(|module| format!("{module} event {}", node.name))
     }
 
     /// Remove all functions defined in a file from the call graph.
@@ -628,7 +784,59 @@ impl CallGraph {
             metrics,
             receiver: extract_receiver_type(node, source),
             result_type: Self::extract_result_type(node, source),
+            intercepts: Self::bsl_extension_target(node, source, path),
         })
+    }
+
+    /// The base method named by an extension annotation on a BSL procedure:
+    /// `ЗаполнитьПоЗаказу` for `&Вместо("ЗаполнитьПоЗаказу")`. The grammar
+    /// puts each `&...` line in a `preprocessor` node just before the
+    /// definition, holding an `annotation` and, for these, a `string`.
+    fn bsl_extension_target(node: Node, source: &[u8], path: &str) -> Option<String> {
+        if !(path.ends_with(".bsl") || path.ends_with(".os")) {
+            return None;
+        }
+        let mut previous = node.prev_named_sibling();
+        while let Some(preprocessor) = previous.filter(|p| p.kind() == "preprocessor") {
+            let mut cursor = preprocessor.walk();
+            let mut annotation = None;
+            let mut argument = None;
+            for child in preprocessor.named_children(&mut cursor) {
+                match child.kind() {
+                    "annotation" => annotation = child.utf8_text(source).ok(),
+                    "string" => {
+                        argument = child
+                            .named_child(0)
+                            .filter(|content| content.kind() == "string_content")
+                            .and_then(|content| content.utf8_text(source).ok())
+                    }
+                    _ => {}
+                }
+            }
+            let intercepting = annotation
+                .map(|a| a.trim_start_matches('&').to_lowercase())
+                .is_some_and(|a| {
+                    matches!(
+                        a.as_str(),
+                        "перед"
+                            | "после"
+                            | "вместо"
+                            | "изменениеиконтроль"
+                            | "before"
+                            | "after"
+                            | "around"
+                            | "changeandvalidate"
+                    )
+                });
+            if let (true, Some(method)) = (intercepting, argument) {
+                let method = method.trim();
+                if !method.is_empty() {
+                    return Some(method.to_string());
+                }
+            }
+            previous = preprocessor.prev_named_sibling();
+        }
+        None
     }
 
     /// The declared return type of a function, reduced to the identifier a
@@ -3923,6 +4131,117 @@ fn extract_function_name(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// The events the platform raises on the module a file holds, by the file's
+/// name: (module kind, events), each event in Russian and English.
+/// An event's procedure name, lowercased: (Russian, English).
+type BslEventName = (&'static str, &'static str);
+
+const BSL_MODULE_EVENTS: &[(&str, &str, &[BslEventName])] = &[
+    (
+        "ObjectModule.bsl",
+        "object module",
+        &[
+            ("передзаписью", "beforewrite"),
+            ("призаписи", "onwrite"),
+            ("передудалением", "beforedelete"),
+            ("обработказаполнения", "filling"),
+            ("обработкапроверкизаполнения", "fillcheckprocessing"),
+            ("прикопировании", "oncopy"),
+            ("обработкапроведения", "posting"),
+            ("обработкаудаленияпроведения", "undoposting"),
+            ("приустановкеновогономера", "onsetnewnumber"),
+            ("приустановкеновогокода", "onsetnewcode"),
+        ],
+    ),
+    (
+        "ManagerModule.bsl",
+        "manager module",
+        &[
+            ("обработкаполученияданныхвыбора", "choicedatagetprocessing"),
+            (
+                "обработкаполученияпредставления",
+                "presentationgetprocessing",
+            ),
+            (
+                "обработкаполученияполейпредставления",
+                "presentationfieldsgetprocessing",
+            ),
+            ("обработкаполученияформы", "formgetprocessing"),
+        ],
+    ),
+    (
+        "RecordSetModule.bsl",
+        "record set module",
+        &[
+            ("передзаписью", "beforewrite"),
+            ("призаписи", "onwrite"),
+            ("обработкапроверкизаполнения", "fillcheckprocessing"),
+        ],
+    ),
+    (
+        "ValueManagerModule.bsl",
+        "constant value manager module",
+        &[
+            ("передзаписью", "beforewrite"),
+            ("призаписи", "onwrite"),
+            ("обработкапроверкизаполнения", "fillcheckprocessing"),
+        ],
+    ),
+    (
+        "CommandModule.bsl",
+        "command module",
+        &[("обработкакоманды", "commandprocessing")],
+    ),
+    (
+        "SessionModule.bsl",
+        "session module",
+        &[("установкапараметровсеанса", "sessionparameterssetting")],
+    ),
+    (
+        "ManagedApplicationModule.bsl",
+        "application module",
+        &[
+            ("передначаломработысистемы", "beforestart"),
+            ("приначалеработысистемы", "onstart"),
+            ("передзавершениемработысистемы", "beforeexit"),
+            ("призавершенииработысистемы", "onexit"),
+            ("обработкавнешнегособытия", "externaleventprocessing"),
+        ],
+    ),
+    (
+        "OrdinaryApplicationModule.bsl",
+        "application module",
+        &[
+            ("передначаломработысистемы", "beforestart"),
+            ("приначалеработысистемы", "onstart"),
+            ("передзавершениемработысистемы", "beforeexit"),
+            ("призавершенииработысистемы", "onexit"),
+            ("обработкавнешнегособытия", "externaleventprocessing"),
+        ],
+    ),
+    (
+        "ExternalConnectionModule.bsl",
+        "external connection module",
+        &[
+            ("приначалеработысистемы", "onstart"),
+            ("призавершенииработысистемы", "onexit"),
+        ],
+    ),
+];
+
+/// The module kind when `procedure` (lowercased) is an event the platform
+/// raises on the module in `file_path`.
+fn bsl_module_event(file_path: &str, procedure: &str) -> Option<&'static str> {
+    let file = file_path.rsplit('/').next()?;
+    let (_, module, events) = BSL_MODULE_EVENTS
+        .iter()
+        .find(|(name, _, _)| file == *name)?;
+    events
+        .iter()
+        .any(|(ru, en)| procedure == *ru || procedure == *en)
+        .then_some(*module)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3966,6 +4285,7 @@ mod tests {
             },
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph
@@ -3993,6 +4313,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let callee = CallNode {
@@ -4003,6 +4324,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -4066,6 +4388,7 @@ mod tests {
                     metrics: FunctionMetrics::default(),
                     receiver: None,
                     result_type: None,
+                    intercepts: None,
                 },
             );
         }
@@ -4079,6 +4402,7 @@ mod tests {
                 metrics: FunctionMetrics::default(),
                 receiver: None,
                 result_type: None,
+                intercepts: None,
             },
         );
 
@@ -4101,6 +4425,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("isolated".to_string(), node);
@@ -4151,6 +4476,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -4175,6 +4501,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("leaf".to_string(), node);
@@ -4212,6 +4539,7 @@ mod tests {
             metrics: metrics.clone(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("complex_function".to_string(), node);
@@ -4257,6 +4585,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -4276,6 +4605,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -4295,6 +4625,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_d = CallNode {
@@ -4305,6 +4636,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -4349,6 +4681,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -4359,6 +4692,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("b".to_string(), node_b);
@@ -4395,6 +4729,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -4414,6 +4749,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -4433,6 +4769,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_d = CallNode {
@@ -4443,6 +4780,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -4487,6 +4825,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -4506,6 +4845,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -4516,6 +4856,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -4541,6 +4882,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -4551,6 +4893,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -4594,6 +4937,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         // Create a less connected function
@@ -4614,6 +4958,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         // Three callers point at "hotspot" (forward edges).
@@ -4637,6 +4982,7 @@ mod tests {
                     metrics: FunctionMetrics::default(),
                     receiver: None,
                     result_type: None,
+                    intercepts: None,
                 },
             );
         }
@@ -4674,6 +5020,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         }
     }
 
@@ -4879,6 +5226,7 @@ mod tests {
             },
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("test_func".to_string(), node);
@@ -4902,6 +5250,7 @@ mod tests {
                 metrics: FunctionMetrics::default(),
                 receiver: None,
                 result_type: None,
+                intercepts: None,
             },
         );
 
@@ -4943,6 +5292,7 @@ mod tests {
             },
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("func1".to_string(), node1);
@@ -4983,6 +5333,7 @@ mod tests {
             },
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("func".to_string(), node);
@@ -5060,6 +5411,7 @@ mod tests {
                 metrics: FunctionMetrics::default(),
                 receiver: None,
                 result_type: None,
+                intercepts: None,
             };
             graph.nodes.insert(name.to_string(), node);
         }
@@ -5122,6 +5474,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -5131,6 +5484,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -5162,6 +5516,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -5171,6 +5526,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -5205,6 +5561,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
         let node_b = CallNode {
             name: "helper".to_string(),
@@ -5214,6 +5571,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: None,
             result_type: None,
+            intercepts: None,
         };
 
         graph
@@ -5242,6 +5600,7 @@ mod tests {
                 metrics: FunctionMetrics::default(),
                 receiver: None,
                 result_type: None,
+                intercepts: None,
             };
             graph
                 .nodes
@@ -5264,6 +5623,7 @@ mod tests {
             metrics: FunctionMetrics::default(),
             receiver: receiver.map(str::to_string),
             result_type: None,
+            intercepts: None,
         }
     }
 

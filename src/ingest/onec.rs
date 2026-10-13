@@ -713,6 +713,177 @@ fn parse_domain_model(xml: &str) -> OneCDomainModel {
     model
 }
 
+/// A procedure the platform calls by itself, as configured in metadata XML:
+/// no line of BSL calls it, so a call graph shows it with no callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformEntryPoint {
+    /// Repository-relative path of the module that defines the procedure.
+    pub module_path: String,
+    pub procedure: String,
+    /// What makes the platform call it, e.g. `form event OnCreateAtServer`.
+    pub reason: String,
+}
+
+/// The entry points a metadata XML file declares, given its
+/// repository-relative path (`/` separators) and text:
+///
+/// - `.../Ext/Form.xml`: form and element event handlers, command actions,
+///   all in the form's `Ext/Form/Module.bsl`;
+/// - `EventSubscriptions/X.xml`, `ScheduledJobs/X.xml`: the
+///   `CommonModule.Модуль.Процедура` they name;
+/// - `HTTPServices/X.xml`, `WebServices/X.xml`: handlers in the service's
+///   `Ext/Module.bsl`.
+///
+/// Anything else yields nothing.
+pub fn platform_entry_points(relative_path: &str, xml: &str) -> Vec<PlatformEntryPoint> {
+    let entry = |module_path: String, procedure: &str, reason: String| PlatformEntryPoint {
+        module_path,
+        procedure: procedure.to_string(),
+        reason,
+    };
+
+    if let Some(form_dir) = relative_path.strip_suffix("Ext/Form.xml") {
+        let module = format!("{form_dir}Ext/Form/Module.bsl");
+        return scan_entry_tags(xml, &["Event", "Action"])
+            .into_iter()
+            .map(|tag| {
+                let reason = match (tag.tag, tag.event, tag.owner) {
+                    ("Event", Some(event), Some(owner)) => {
+                        format!("form element event {event} of {owner}")
+                    }
+                    ("Event", Some(event), None) => format!("form event {event}"),
+                    (_, _, Some(owner)) => format!("form command {owner}"),
+                    _ => "form handler".to_string(),
+                };
+                entry(module.clone(), &tag.text, reason)
+            })
+            .collect();
+    }
+
+    let (dir, file) = relative_path
+        .rsplit_once('/')
+        .unwrap_or(("", relative_path));
+    let Some(object) = file.strip_suffix(".xml") else {
+        return Vec::new();
+    };
+    let (prefix, kind) = match dir.rsplit_once('/') {
+        Some((prefix, kind)) => (format!("{prefix}/"), kind),
+        None => (String::new(), dir),
+    };
+    let common_module_method = |reference: &str| -> Option<(String, String)> {
+        let rest = reference
+            .strip_prefix("CommonModule.")
+            .or_else(|| reference.strip_prefix("ОбщийМодуль."))?;
+        let (module, procedure) = rest.split_once('.')?;
+        Some((
+            format!("{prefix}CommonModules/{module}/Ext/Module.bsl"),
+            procedure.to_string(),
+        ))
+    };
+    match kind {
+        "EventSubscriptions" => {
+            let tags = scan_entry_tags(xml, &["Event", "Handler"]);
+            let event = tags
+                .iter()
+                .find(|t| t.tag == "Event")
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            tags.iter()
+                .filter(|t| t.tag == "Handler")
+                .filter_map(|t| common_module_method(&t.text))
+                .map(|(module, procedure)| {
+                    entry(
+                        module,
+                        &procedure,
+                        format!("event subscription {object} ({event})"),
+                    )
+                })
+                .collect()
+        }
+        "ScheduledJobs" => scan_entry_tags(xml, &["MethodName"])
+            .iter()
+            .filter_map(|t| common_module_method(&t.text))
+            .map(|(module, procedure)| entry(module, &procedure, format!("scheduled job {object}")))
+            .collect(),
+        "HTTPServices" | "WebServices" => {
+            let module = format!("{prefix}{kind}/{object}/Ext/Module.bsl");
+            let (tag, label) = if kind == "HTTPServices" {
+                ("Handler", "HTTP service")
+            } else {
+                ("ProcedureName", "web service")
+            };
+            scan_entry_tags(xml, &[tag])
+                .iter()
+                .map(|t| entry(module.clone(), &t.text, format!("{label} {object}")))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The text of each `tag` element, with the `name` of an enclosing `<Event
+/// name>` and of the nearest named ancestor other than the root.
+struct EntryTag {
+    tag: &'static str,
+    text: String,
+    event: Option<String>,
+    owner: Option<String>,
+}
+
+fn scan_entry_tags(xml: &str, tags: &[&'static str]) -> Vec<EntryTag> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    // (local name, `name` attribute) of every open element.
+    let mut stack: Vec<(String, Option<String>)> = Vec::new();
+    let mut found = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name_attr = e
+                    .attributes()
+                    .flatten()
+                    .find(|attr| attr.key.as_ref() == b"name")
+                    .and_then(|attr| String::from_utf8(attr.value.into_owned()).ok());
+                stack.push((local_name(e.name().as_ref()), name_attr));
+            }
+            Ok(Event::Text(e)) => {
+                let Some((top, top_name)) = stack.last() else {
+                    continue;
+                };
+                let Some(tag) = tags.iter().find(|t| **t == top.as_str()) else {
+                    continue;
+                };
+                let text = e.decode().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let event = (*tag == "Event").then(|| top_name.clone()).flatten();
+                // Between the root and the tag itself, if there is anything.
+                let owner = stack
+                    .get(1..stack.len().saturating_sub(1))
+                    .unwrap_or_default()
+                    .iter()
+                    .rev()
+                    .find_map(|(_, name)| name.clone());
+                found.push(EntryTag {
+                    tag,
+                    text,
+                    event,
+                    owner,
+                });
+            }
+            Ok(Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    found
+}
+
 /// Parse a managed-form composition XML (`Ext/Form.xml`, root `<Form>`).
 /// Returns `None` when the XML is not a form composition. Best-effort: a
 /// streaming pass that tracks the `<ChildItems>` nesting and the open
@@ -1757,5 +1928,121 @@ mod tests {
             .contains("Failed to parse 1C metadata XML"));
 
         fs::remove_file(malformed).unwrap();
+    }
+
+    fn entries(path: &str, xml: &str) -> Vec<(String, String, String)> {
+        platform_entry_points(path, xml)
+            .into_iter()
+            .map(|e| (e.module_path, e.procedure, e.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_form_xml_entry_points() {
+        let xml = r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform">
+	<Events>
+		<Event name="OnCreateAtServer">ПриСозданииНаСервере</Event>
+	</Events>
+	<ChildItems>
+		<Table name="Список" id="1">
+			<Events>
+				<Event name="Selection">СписокВыбор</Event>
+			</Events>
+		</Table>
+	</ChildItems>
+	<Commands>
+		<Command name="ИзменитьВыделенные" id="3">
+			<Action>ИзменитьВыделенные</Action>
+		</Command>
+	</Commands>
+</Form>"#;
+        let module = "cf/Documents/Заказ/Forms/ФормаСписка/Ext/Form/Module.bsl".to_string();
+        assert_eq!(
+            entries("cf/Documents/Заказ/Forms/ФормаСписка/Ext/Form.xml", xml),
+            vec![
+                (
+                    module.clone(),
+                    "ПриСозданииНаСервере".into(),
+                    "form event OnCreateAtServer".into()
+                ),
+                (
+                    module.clone(),
+                    "СписокВыбор".into(),
+                    "form element event Selection of Список".into()
+                ),
+                (
+                    module,
+                    "ИзменитьВыделенные".into(),
+                    "form command ИзменитьВыделенные".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_metadata_xml_entry_points() {
+        let subscription = r#"<MetaDataObject><EventSubscription><Properties>
+			<Name>ВариантОтчетаПередУдалением</Name>
+			<Event>BeforeDelete</Event>
+			<Handler>CommonModule.Мониторинг.ВариантОтчетаПередУдалением</Handler>
+		</Properties></EventSubscription></MetaDataObject>"#;
+        assert_eq!(
+            entries(
+                "EventSubscriptions/ВариантОтчетаПередУдалением.xml",
+                subscription
+            ),
+            vec![(
+                "CommonModules/Мониторинг/Ext/Module.bsl".into(),
+                "ВариантОтчетаПередУдалением".into(),
+                "event subscription ВариантОтчетаПередУдалением (BeforeDelete)".into()
+            )]
+        );
+
+        let job = "<MetaDataObject><ScheduledJob><Properties><MethodName>CommonModule.Классификация.Выполнить</MethodName></Properties></ScheduledJob></MetaDataObject>";
+        assert_eq!(
+            entries("cfe/Расш/ScheduledJobs/Классификация.xml", job),
+            vec![(
+                "cfe/Расш/CommonModules/Классификация/Ext/Module.bsl".into(),
+                "Выполнить".into(),
+                "scheduled job Классификация".into()
+            )]
+        );
+
+        let http = "<MetaDataObject><HTTPService><ChildObjects><URLTemplate><ChildObjects><Method><Properties><Handler>ВерсияПолучить</Handler></Properties></Method></ChildObjects></URLTemplate></ChildObjects></HTTPService></MetaDataObject>";
+        assert_eq!(
+            entries("HTTPServices/API.xml", http),
+            vec![(
+                "HTTPServices/API/Ext/Module.bsl".into(),
+                "ВерсияПолучить".into(),
+                "HTTP service API".into()
+            )]
+        );
+
+        let web = "<MetaDataObject><WebService><ChildObjects><Operation><Properties><ProcedureName>FillCatalogs</ProcedureName></Properties></Operation></ChildObjects></WebService></MetaDataObject>";
+        assert_eq!(
+            entries("WebServices/Exchange.xml", web),
+            vec![(
+                "WebServices/Exchange/Ext/Module.bsl".into(),
+                "FillCatalogs".into(),
+                "web service Exchange".into()
+            )]
+        );
+
+        assert!(entries("Catalogs/Склады.xml", subscription).is_empty());
+    }
+
+    #[test]
+    fn test_entry_points_survive_odd_xml() {
+        // The tag sought is the root: no ancestors to name an owner.
+        assert_eq!(
+            entries(
+                "ScheduledJobs/X.xml",
+                "<MethodName>CommonModule.М.П</MethodName>"
+            )
+            .len(),
+            1
+        );
+        assert!(entries("Forms/Ф/Ext/Form.xml", "<Event").is_empty());
+        assert!(entries("Forms/Ф/Ext/Form.xml", "").is_empty());
     }
 }

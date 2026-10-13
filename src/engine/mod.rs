@@ -1480,11 +1480,21 @@ impl CodeIntelEngine {
                                     }
                                 };
                                 metrics.record_file_parse(parse_start.elapsed());
-                                let prepared = PreparedDocuments::new(
+                                let mut prepared = PreparedDocuments::new(
                                     parsed.as_ref(),
                                     &content,
                                     !(search_warm && reused),
                                 );
+                                if file_path.extension().is_some_and(|ext| ext == "xml") {
+                                    let relative = file_path
+                                        .strip_prefix(path)
+                                        .unwrap_or(file_path)
+                                        .to_string_lossy();
+                                    prepared.platform_entries =
+                                        crate::ingest::onec::platform_entry_points(
+                                            &relative, &content,
+                                        );
+                                }
                                 Some((file_path.clone(), content, parsed, reused, prepared))
                             })
                             .collect();
@@ -1629,6 +1639,16 @@ impl CodeIntelEngine {
                         // Index the whole file into search only when the parser
                         // extracted no symbols (text-only / unsupported languages).
                         // Parsed files index per-symbol cards above instead.
+                        if let Some(cg) = call_graph.as_ref() {
+                            for entry in prepared.platform_entries {
+                                cg.add_platform_entry(
+                                    &entry.module_path,
+                                    &entry.procedure,
+                                    entry.reason,
+                                );
+                            }
+                        }
+
                         if !has_parser_support && index_into_search {
                             self.search_index.index_file_counted(
                                 Arc::clone(&repo_tag),
@@ -1688,6 +1708,7 @@ impl CodeIntelEngine {
                         .to_string_lossy();
                     cg.collect_file_calls(&relative_path, &content, &tree)
                 })?;
+                cg.link_extensions();
                 info!(
                     "Built call graph for {} with {} files",
                     repo_name, file_count
@@ -3581,6 +3602,7 @@ impl CodeIntelEngine {
                                             content.clone(),
                                             tree.clone(),
                                         )]);
+                                        cg.link_extensions();
                                     }
                                 }
                             }
@@ -3653,6 +3675,9 @@ impl CodeIntelEngine {
                     if self.options.call_graph_enabled {
                         if let Some(cg) = self.call_graphs.get(&repo_name) {
                             let _ = cg.remove_functions_for_file(&rel_path);
+                            // An extension procedure of the deleted file must
+                            // not stay reachable from the method it extended.
+                            cg.link_extensions();
                         }
                     }
 
@@ -4840,8 +4865,16 @@ impl CodeIntelEngine {
             output.push_str(&Self::format_call_edges(&callers));
         }
 
+        let platform = call_graph.platform_entry_reason(function);
         if output.ends_with("\n\n") {
-            output.push_str("*No callers found.*\n");
+            match &platform {
+                Some(reason) => output.push_str(&format!(
+                    "*No callers in the source: the 1C platform calls it ({reason}).*\n"
+                )),
+                None => output.push_str("*No callers found.*\n"),
+            }
+        } else if let Some(reason) = &platform {
+            output.push_str(&format!("\nAlso called by the 1C platform: {reason}.\n"));
         }
 
         Ok(output)
@@ -10372,6 +10405,8 @@ struct PreparedDocuments {
     /// `tokenize_code(content).len()` of a file the parser does not support,
     /// when it goes into search.
     file_len: Option<u64>,
+    /// Procedures a 1C metadata XML says the platform calls.
+    platform_entries: Vec<crate::ingest::onec::PlatformEntryPoint>,
 }
 
 struct PreparedSymbol {
@@ -10388,6 +10423,7 @@ impl PreparedDocuments {
             return Self {
                 symbols: Vec::new(),
                 file_len: into_search.then(|| token_count(content)),
+                platform_entries: Vec::new(),
             };
         };
         let symbols = parsed
@@ -10410,6 +10446,7 @@ impl PreparedDocuments {
         Self {
             symbols,
             file_len: None,
+            platform_entries: Vec::new(),
         }
     }
 }

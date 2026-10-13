@@ -872,6 +872,7 @@ fn call_type_string(ct: &CallType) -> String {
         CallType::Async => "async",
         CallType::Spawn => "spawn",
         CallType::Callback => "callback",
+        CallType::Extension => "extension",
         CallType::Unknown => "unknown",
     }
     .to_string()
