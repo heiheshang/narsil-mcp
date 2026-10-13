@@ -341,16 +341,23 @@ impl TantivyIndex {
     /// It becomes visible to searches after the next refresh, which happens
     /// automatically on the next read.
     pub fn add_document(&self, doc: SearchDocument) -> Result<()> {
-        self.add(doc, false)
+        self.add(doc, false, None)
+    }
+
+    /// [`add_document`](Self::add_document) with the document length
+    /// (`tokenize_code(content).len()`) already counted by the caller, which
+    /// can do it in parallel; this runs on the indexing thread.
+    pub fn add_document_counted(&self, doc: SearchDocument, doc_len: u64) -> Result<()> {
+        self.add(doc, false, Some(doc_len))
     }
 
     /// Add a document and keep its raw text, so it round-trips through
     /// [`SearchDocument::content`]. Only for callers that read it back.
     pub fn add_document_retaining_text(&self, doc: SearchDocument) -> Result<()> {
-        self.add(doc, true)
+        self.add(doc, true, None)
     }
 
-    fn add(&self, doc: SearchDocument, retain_text: bool) -> Result<()> {
+    fn add(&self, doc: SearchDocument, retain_text: bool, doc_len: Option<u64>) -> Result<()> {
         let f = &self.fields;
         let mut td = TantivyDocument::new();
 
@@ -375,7 +382,13 @@ impl TantivyIndex {
             doc.content.clone()
         };
 
-        let doc_len = tokenize_code(&body).len() as u64;
+        let doc_len = match doc_len {
+            Some(counted) => {
+                debug_assert_eq!(counted, tokenize_code(&body).len() as u64);
+                counted
+            }
+            None => tokenize_code(&body).len() as u64,
+        };
         td.add_u64(f.doc_len, doc_len);
         td.add_text(f.body, &body);
 

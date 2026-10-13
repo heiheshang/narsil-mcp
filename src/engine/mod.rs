@@ -1480,25 +1480,12 @@ impl CodeIntelEngine {
                                     }
                                 };
                                 metrics.record_file_parse(parse_start.elapsed());
-                                // TF-IDF tokens of each signature, computed here
-                                // on the pool: tokenizing is pure, unlike the IDF
-                                // update the indexing thread does in order.
-                                let signature_tokens: Vec<Option<Vec<String>>> = parsed
-                                    .as_ref()
-                                    .map(|parsed| {
-                                        parsed
-                                            .symbols
-                                            .iter()
-                                            .map(|symbol| {
-                                                symbol
-                                                    .signature
-                                                    .as_deref()
-                                                    .map(crate::search::tokenize_code)
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                Some((file_path.clone(), content, parsed, reused, signature_tokens))
+                                let prepared = PreparedDocuments::new(
+                                    parsed.as_ref(),
+                                    &content,
+                                    !(search_warm && reused),
+                                );
+                                Some((file_path.clone(), content, parsed, reused, prepared))
                             })
                             .collect();
                         drop(parse_guard);
@@ -1514,7 +1501,7 @@ impl CodeIntelEngine {
                     let documents_guard = documents_span.enter();
                     let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-                    for (file_path, content, parsed, reused, signature_tokens) in parsed_chunk {
+                    for (file_path, content, parsed, reused, prepared) in parsed_chunk {
                         file_count += 1;
                         if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty()) {
                             symbol_files += 1;
@@ -1576,23 +1563,12 @@ impl CodeIntelEngine {
                         if let Some(parsed) = parsed {
                             let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
 
-                            for (mut symbol, tokens) in symbols.into_iter().zip(signature_tokens) {
+                            for (mut symbol, prepared) in symbols.into_iter().zip(prepared.symbols)
+                            {
                                 symbol.file_path = relative_path.clone();
 
-                                // Index the symbol "card" (name + signature + doc) as
-                                // the search document — search returns the procedure,
-                                // not the whole module (Phase 4: document = function).
-                                let mut card = symbol.name.clone();
-                                if let Some(ref sig) = symbol.signature {
-                                    card.push(' ');
-                                    card.push_str(sig);
-                                }
-                                if let Some(ref doc) = symbol.doc_comment {
-                                    card.push('\n');
-                                    card.push_str(doc);
-                                }
-                                if index_into_search {
-                                    self.search_index.index_symbol(
+                                if let Some((card, card_len)) = prepared.card {
+                                    self.search_index.index_symbol_counted(
                                         Arc::clone(&repo_tag),
                                         &relative_path,
                                         &symbol.name,
@@ -1600,8 +1576,10 @@ impl CodeIntelEngine {
                                         symbol_kind_to_doc_type(&symbol.kind),
                                         symbol.start_line,
                                         symbol.end_line,
+                                        Some(card_len),
                                     );
                                 }
+                                let tokens = prepared.signature_tokens;
 
                                 // Index symbol into embedding engine for similarity search
                                 if let (Some(ref sig), Some(tokens)) = (&symbol.signature, tokens) {
@@ -1652,10 +1630,11 @@ impl CodeIntelEngine {
                         // extracted no symbols (text-only / unsupported languages).
                         // Parsed files index per-symbol cards above instead.
                         if !has_parser_support && index_into_search {
-                            self.search_index.index_file(
+                            self.search_index.index_file_counted(
                                 Arc::clone(&repo_tag),
                                 &relative_path,
                                 &content,
+                                prepared.file_len,
                             );
                         }
 
@@ -10382,6 +10361,71 @@ fn calculate_relevance(line: &str, query: &str) -> f32 {
     score += (100.0 / line.len() as f32).min(1.0);
 
     score
+}
+
+/// The pure part of indexing one file's documents — symbol cards, TF-IDF
+/// tokens, BM25 lengths — done on the parse pool. What depends on order (the
+/// TF-IDF statistics, the tantivy writer) stays on the indexing thread.
+struct PreparedDocuments {
+    /// One per symbol of the parsed file, in its order.
+    symbols: Vec<PreparedSymbol>,
+    /// `tokenize_code(content).len()` of a file the parser does not support,
+    /// when it goes into search.
+    file_len: Option<u64>,
+}
+
+struct PreparedSymbol {
+    /// The search card (name + signature + doc) and its length in tokens,
+    /// when the file goes into search.
+    card: Option<(String, u64)>,
+    signature_tokens: Option<Vec<String>>,
+}
+
+impl PreparedDocuments {
+    fn new(parsed: Option<&crate::parser::ParsedFile>, content: &str, into_search: bool) -> Self {
+        let token_count = |text: &str| crate::search::tokenize_code(text).len() as u64;
+        let Some(parsed) = parsed else {
+            return Self {
+                symbols: Vec::new(),
+                file_len: into_search.then(|| token_count(content)),
+            };
+        };
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|symbol| PreparedSymbol {
+                card: into_search.then(|| {
+                    // Search returns the procedure, not the whole module
+                    // (Phase 4: document = function).
+                    let card = symbol_card(symbol);
+                    let len = token_count(&card);
+                    (card, len)
+                }),
+                signature_tokens: symbol
+                    .signature
+                    .as_deref()
+                    .map(crate::search::tokenize_code),
+            })
+            .collect();
+        Self {
+            symbols,
+            file_len: None,
+        }
+    }
+}
+
+/// The search document of a symbol: name, signature and doc comment.
+fn symbol_card(symbol: &Symbol) -> String {
+    let mut card = symbol.name.clone();
+    if let Some(ref sig) = symbol.signature {
+        card.push(' ');
+        card.push_str(sig);
+    }
+    if let Some(ref doc) = symbol.doc_comment {
+        card.push('\n');
+        card.push_str(doc);
+    }
+    card
 }
 
 fn ext_to_language(ext: &str) -> String {

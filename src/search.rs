@@ -167,18 +167,43 @@ impl SearchIndex {
 
     /// Index content from a file.
     pub fn index_file(&self, repo: Arc<str>, file_path: &str, content: &str) {
-        self.add_document(SearchDocument {
-            id: file_path.to_string(),
-            repo,
-            file_path: file_path.to_string(),
-            // Handed to tantivy for tokenization and dropped; the corpus index
-            // indexes this text without storing it.
-            content: content.to_string(),
-            doc_type: DocType::File,
-            start_line: 1,
-            end_line: content.lines().count(),
-            term_freq: HashMap::new(),
-        });
+        self.index_file_counted(repo, file_path, content, None);
+    }
+
+    /// [`index_file`](Self::index_file) with `doc_len =
+    /// tokenize_code(content).len()` counted by the caller when `Some`.
+    pub fn index_file_counted(
+        &self,
+        repo: Arc<str>,
+        file_path: &str,
+        content: &str,
+        doc_len: Option<u64>,
+    ) {
+        self.add_counted(
+            SearchDocument {
+                id: file_path.to_string(),
+                repo,
+                file_path: file_path.to_string(),
+                // Handed to tantivy for tokenization and dropped; the corpus index
+                // indexes this text without storing it.
+                content: content.to_string(),
+                doc_type: DocType::File,
+                start_line: 1,
+                end_line: content.lines().count(),
+                term_freq: HashMap::new(),
+            },
+            doc_len,
+        );
+    }
+
+    fn add_counted(&self, doc: SearchDocument, doc_len: Option<u64>) {
+        let added = match doc_len {
+            Some(doc_len) => self.inner.add_document_counted(doc, doc_len),
+            None => self.inner.add_document(doc),
+        };
+        if let Err(e) = added {
+            tracing::warn!("Failed to index document: {}", e);
+        }
     }
 
     /// Index a symbol (function, class, etc.)
@@ -193,16 +218,38 @@ impl SearchIndex {
         start_line: usize,
         end_line: usize,
     ) {
-        self.add_document(SearchDocument {
-            id: format!("{}::{}", file_path, name),
-            repo,
-            file_path: file_path.to_string(),
-            content: content.to_string(),
-            doc_type,
-            start_line,
-            end_line,
-            term_freq: HashMap::new(),
-        });
+        self.index_symbol_counted(
+            repo, file_path, name, content, doc_type, start_line, end_line, None,
+        );
+    }
+
+    /// [`index_symbol`](Self::index_symbol) with `doc_len =
+    /// tokenize_code(content).len()` counted by the caller when `Some`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_symbol_counted(
+        &self,
+        repo: Arc<str>,
+        file_path: &str,
+        name: &str,
+        content: &str,
+        doc_type: DocType,
+        start_line: usize,
+        end_line: usize,
+        doc_len: Option<u64>,
+    ) {
+        self.add_counted(
+            SearchDocument {
+                id: format!("{}::{}", file_path, name),
+                repo,
+                file_path: file_path.to_string(),
+                content: content.to_string(),
+                doc_type,
+                start_line,
+                end_line,
+                term_freq: HashMap::new(),
+            },
+            doc_len,
+        );
     }
 
     /// Search the index with BM25 ranking across every indexed repository.
@@ -613,6 +660,17 @@ impl ConcurrentSearchIndex {
         self.inner.index_file(repo, file_path, content);
     }
 
+    pub fn index_file_counted(
+        &self,
+        repo: Arc<str>,
+        file_path: &str,
+        content: &str,
+        doc_len: Option<u64>,
+    ) {
+        self.inner
+            .index_file_counted(repo, file_path, content, doc_len);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn index_symbol(
         &self,
@@ -626,6 +684,23 @@ impl ConcurrentSearchIndex {
     ) {
         self.inner.index_symbol(
             repo, file_path, name, content, doc_type, start_line, end_line,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_symbol_counted(
+        &self,
+        repo: Arc<str>,
+        file_path: &str,
+        name: &str,
+        content: &str,
+        doc_type: DocType,
+        start_line: usize,
+        end_line: usize,
+        doc_len: Option<u64>,
+    ) {
+        self.inner.index_symbol_counted(
+            repo, file_path, name, content, doc_type, start_line, end_line, doc_len,
         );
     }
 
