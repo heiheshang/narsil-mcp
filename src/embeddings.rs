@@ -7,7 +7,8 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::search::tokenize_code;
@@ -38,6 +39,9 @@ pub trait EmbeddingProvider: Send + Sync {
 pub struct TfIdfEmbedding {
     /// Global term frequencies across all documents
     document_freq: HashMap<String, usize>,
+    /// The terms of `document_freq` in pruning order, best first: by document
+    /// frequency, highest first, then by the term. Pruning drops from the end.
+    ranked: BTreeSet<(Reverse<usize>, String)>,
     /// Total number of documents
     total_docs: usize,
     /// Vector dimensionality, and the modulus of the term-slot hash
@@ -49,6 +53,7 @@ impl TfIdfEmbedding {
     pub fn new(max_vocab_size: usize) -> Self {
         Self {
             document_freq: HashMap::new(),
+            ranked: BTreeSet::new(),
             total_docs: 0,
             max_vocab_size,
         }
@@ -65,12 +70,18 @@ impl TfIdfEmbedding {
         let unique_tokens: std::collections::HashSet<&String> = tokens.iter().collect();
 
         for token in unique_tokens {
-            match self.document_freq.get_mut(token) {
-                Some(df) => *df += 1,
+            let df = match self.document_freq.get_mut(token) {
+                Some(df) => {
+                    self.ranked.remove(&(Reverse(*df), token.clone()));
+                    *df += 1;
+                    *df
+                }
                 None => {
                     self.document_freq.insert(token.clone(), 1);
+                    1
                 }
-            }
+            };
+            self.ranked.insert((Reverse(df), token.clone()));
         }
 
         self.total_docs += 1;
@@ -106,19 +117,13 @@ impl TfIdfEmbedding {
         }
 
         // Once the map is full this runs on almost every insert, usually to
-        // drop a single term, so the overflow is selected, not sorted.
-        let mut ranked: Vec<(&str, usize)> = self
-            .document_freq
-            .iter()
-            .map(|(term, &df)| (term.as_str(), df))
-            .collect();
-        ranked.select_nth_unstable_by(limit, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        let dropped: Vec<String> = ranked[limit..]
-            .iter()
-            .map(|(term, _)| (*term).to_string())
-            .collect();
-        for term in &dropped {
-            self.document_freq.remove(term);
+        // drop a single term. `ranked` is kept in order as counts change, so
+        // that is a pop, not a pass over the whole vocabulary.
+        while self.document_freq.len() > limit {
+            let Some((_, term)) = self.ranked.pop_last() else {
+                break;
+            };
+            self.document_freq.remove(&term);
         }
     }
 
@@ -529,14 +534,60 @@ impl EmbeddingEngine {
     ) {
         // Tokenized once: the IDF update and the embedding read the same tokens.
         let tokens = tokenize_code(&content);
+        let stored_text = if keep_text { content } else { String::new() };
+        self.index_tokens_inner(
+            id,
+            repo,
+            file_path,
+            stored_text,
+            &tokens,
+            start_line,
+            end_line,
+        );
+    }
+
+    /// [`index_snippet_embed_only`](Self::index_snippet_embed_only) for a
+    /// snippet already run through [`tokenize_code`].
+    ///
+    /// Tokenizing is pure, so a caller may do it in parallel; the IDF update
+    /// and the embedding are not, and must still arrive in indexing order.
+    pub fn index_tokens_embed_only(
+        &self,
+        id: String,
+        repo: Arc<str>,
+        file_path: String,
+        tokens: &[String],
+        start_line: usize,
+        end_line: usize,
+    ) {
+        self.index_tokens_inner(
+            id,
+            repo,
+            file_path,
+            String::new(),
+            tokens,
+            start_line,
+            end_line,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn index_tokens_inner(
+        &self,
+        id: String,
+        repo: Arc<str>,
+        file_path: String,
+        stored_text: String,
+        tokens: &[String],
+        start_line: usize,
+        end_line: usize,
+    ) {
         let embedding = {
             let mut provider = self.provider.write();
-            provider.add_document_tokens(&tokens);
+            provider.add_document_tokens(tokens);
             // Generate embedding (dense), then pack it sparse before storing.
-            to_sparse(&provider.embed_tokens(&tokens))
+            to_sparse(&provider.embed_tokens(tokens))
         };
-
-        let stored_text = if keep_text { content } else { String::new() };
 
         // Store the embedded document
         self.store.add(EmbeddedDocument {
@@ -610,6 +661,7 @@ impl EmbeddingEngine {
         self.store.clear();
         let mut provider = self.provider.write();
         provider.document_freq.clear();
+        provider.ranked.clear();
         provider.total_docs = 0;
     }
 }
@@ -687,6 +739,12 @@ mod tests {
                 tfidf.document_freq, reference,
                 "diverged after document {i}"
             );
+            let ranked: HashMap<String, usize> = tfidf
+                .ranked
+                .iter()
+                .map(|(Reverse(df), term)| (term.clone(), *df))
+                .collect();
+            assert_eq!(ranked, reference, "ranking out of sync after document {i}");
         }
     }
 

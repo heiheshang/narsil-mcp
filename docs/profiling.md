@@ -86,6 +86,8 @@ Spans:
 | `walk` | debug | directory walk and exclusion filters |
 | `parse` | debug | tree-sitter parsing, summed over all chunks |
 | `index_documents` | debug | BM25 symbol cards, TF-IDF, trigram and 1C documents |
+| `parse_wait` | debug | parsing waits for indexing to take the next chunk |
+| `index_documents_wait` | debug | indexing waits for the next parsed chunk |
 | `callgraph_functions` | debug | call graph pass 1: function definitions |
 | `callgraph_calls{files}` | debug | call graph pass 2: re-parsing and call resolution, in parallel |
 | `neural_embeddings` | debug | neural embedding batch |

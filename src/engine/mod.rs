@@ -1432,6 +1432,10 @@ impl CodeIntelEngine {
             let parse_span = debug_span!("parse", files = files.len());
             let documents_span = debug_span!("index_documents");
             let functions_span = debug_span!("callgraph_functions");
+            // Which side of the parse pipeline is the bottleneck: parsing
+            // waits on a full channel, indexing waits on an empty one.
+            let parse_wait_span = debug_span!("parse_wait");
+            let documents_wait_span = debug_span!("index_documents_wait");
             debug!(
                 "Parsing {} files in chunks of {} (reusing cached symbols: {})",
                 files.len(),
@@ -1476,22 +1480,41 @@ impl CodeIntelEngine {
                                     }
                                 };
                                 metrics.record_file_parse(parse_start.elapsed());
-                                Some((file_path.clone(), content, parsed, reused))
+                                // TF-IDF tokens of each signature, computed here
+                                // on the pool: tokenizing is pure, unlike the IDF
+                                // update the indexing thread does in order.
+                                let signature_tokens: Vec<Option<Vec<String>>> = parsed
+                                    .as_ref()
+                                    .map(|parsed| {
+                                        parsed
+                                            .symbols
+                                            .iter()
+                                            .map(|symbol| {
+                                                symbol
+                                                    .signature
+                                                    .as_deref()
+                                                    .map(crate::search::tokenize_code)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                Some((file_path.clone(), content, parsed, reused, signature_tokens))
                             })
                             .collect();
                         drop(parse_guard);
                         // The receiver is gone only when indexing stopped on an error.
-                        if parsed_tx.send(parsed_chunk).is_err() {
+                        let sent = parse_wait_span.in_scope(|| parsed_tx.send(parsed_chunk));
+                        if sent.is_err() {
                             break;
                         }
                     }
                 });
 
-                for parsed_chunk in parsed_rx {
+                while let Ok(parsed_chunk) = documents_wait_span.in_scope(|| parsed_rx.recv()) {
                     let documents_guard = documents_span.enter();
                     let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-                    for (file_path, content, parsed, reused) in parsed_chunk {
+                    for (file_path, content, parsed, reused, signature_tokens) in parsed_chunk {
                         file_count += 1;
                         if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty()) {
                             symbol_files += 1;
@@ -1553,7 +1576,7 @@ impl CodeIntelEngine {
                         if let Some(parsed) = parsed {
                             let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
 
-                            for mut symbol in symbols {
+                            for (mut symbol, tokens) in symbols.into_iter().zip(signature_tokens) {
                                 symbol.file_path = relative_path.clone();
 
                                 // Index the symbol "card" (name + signature + doc) as
@@ -1581,13 +1604,13 @@ impl CodeIntelEngine {
                                 }
 
                                 // Index symbol into embedding engine for similarity search
-                                if let Some(ref sig) = symbol.signature {
+                                if let (Some(ref sig), Some(tokens)) = (&symbol.signature, tokens) {
                                     let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                                    self.embedding_engine.index_snippet_embed_only(
+                                    self.embedding_engine.index_tokens_embed_only(
                                         symbol_id.clone(),
                                         Arc::clone(&repo_tag),
                                         relative_path.clone(),
-                                        sig.clone(),
+                                        &tokens,
                                         symbol.start_line,
                                         symbol.end_line,
                                     );
