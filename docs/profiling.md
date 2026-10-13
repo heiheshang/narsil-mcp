@@ -37,11 +37,14 @@ release settings (LTO, `codegen-units = 1`, `panic = "abort"`) plus
 | `profile-check` | checks samply and `perf_event_paranoid` |
 | `profile-index` | profiles a full `--reindex --git --call-graph` of `REPOS` |
 | `profile-bench` | profiles criterion bench `BENCH`, optionally filtered by `BENCH_FILTER` |
-| `profile-attach` | profiles a running process `PID` until Ctrl+C |
+| `profile-attach` | profiles a running process `PID` for `PROFILE_SECONDS`, or until Ctrl+C |
 | `profile-open` | opens `PROFILE` (default: the newest) in the Firefox Profiler |
 
 Variables: `PROFILE_OUT` (default `target/profiles`), `SAMPLY_RATE` (default 1000 Hz),
-`REPOS`, `BENCH` (default `indexing`), `BENCH_FILTER`, `PID`, `PROFILE`.
+`REPOS`, `BENCH` (default `indexing`), `BENCH_FILTER`, `PID`, `PROFILE_SECONDS`, `PROFILE`.
+
+`profile-attach` needs `perf_event_paranoid = -1`: attaching maps a perf buffer per
+CPU and exceeds `perf_event_mlock_kb` otherwise (samply reports `mmap failed`).
 
 ```bash
 make profile-index REPOS=~/src/big-repo

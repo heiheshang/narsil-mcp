@@ -26,6 +26,7 @@ SAMPLY_RATE ?= 1000
 BENCH ?= indexing
 BENCH_FILTER ?=
 PID ?=
+PROFILE_SECONDS ?=
 PROFILE ?=
 PROFILE_STAMP := $(shell date +%Y%m%d-%H%M%S)
 PROFILE_BIN := target/profiling/narsil-mcp
@@ -175,12 +176,15 @@ profile-bench: profile-check ## Профиль бенча criterion BENCH (фи�
 	echo "открыть: make profile-open PROFILE=$$out" >&2
 
 .PHONY: profile-attach
-profile-attach: profile-check ## Профиль запущенного процесса PID, до Ctrl+C
+profile-attach: profile-check ## Профиль процесса PID: PROFILE_SECONDS секунд или до Ctrl+C
 	@[ -n "$(PID)" ] || { echo "нужен PID: make profile-attach PID=<pid>" >&2; exit 1; }
 	@mkdir -p $(PROFILE_OUT)
-	@out=$(PROFILE_OUT)/attach-$(PID)-$(PROFILE_STAMP).json.gz; \
-	echo "profile-attach: pid=$(PID) binary=$$(readlink /proc/$(PID)/exe) rate=$(SAMPLY_RATE) Hz output=$$out" >&2; \
-	samply record --save-only --rate $(SAMPLY_RATE) -o "$$out" -p $(PID); \
+	@trap '' INT; \
+	out=$(PROFILE_OUT)/attach-$(PID)-$(PROFILE_STAMP).json.gz; \
+	echo "profile-attach: pid=$(PID) binary=$$(readlink /proc/$(PID)/exe) rate=$(SAMPLY_RATE) Hz seconds=$(or $(PROFILE_SECONDS),до Ctrl+C) output=$$out" >&2; \
+	samply record --save-only --rate $(SAMPLY_RATE) $(if $(PROFILE_SECONDS),-d $(PROFILE_SECONDS)) -o "$$out" -p $(PID) || { \
+		echo "samply не подключился. «mmap failed» означает лимит perf_event_mlock_kb:" >&2; \
+		echo "  echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid" >&2; exit 1; }; \
 	echo "profile saved: $$out" >&2; \
 	echo "открыть: make profile-open PROFILE=$$out" >&2
 
