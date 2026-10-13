@@ -699,6 +699,12 @@ impl TantivyIndex {
 ///
 /// Used only by the normalized-document path, which tokenizes before it reaches
 /// the index. BM25 depends on counts, not order, so repetition is faithful.
+/// The `doc_len` [`add`](TantivyIndex::add) stores for a document given as
+/// term frequencies.
+pub fn term_freq_doc_len(tf: &HashMap<String, usize>) -> u64 {
+    tokenize_code(&expand_term_freq(tf)).len() as u64
+}
+
 fn expand_term_freq(tf: &HashMap<String, usize>) -> String {
     let mut out = String::new();
     for (term, &count) in tf {

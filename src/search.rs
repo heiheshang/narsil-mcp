@@ -157,6 +157,12 @@ impl SearchIndex {
         }
     }
 
+    /// [`add_document`](Self::add_document) with `doc_len` counted by the
+    /// caller, as [`index_file_counted`](Self::index_file_counted) does.
+    pub fn add_document_counted(&self, doc: SearchDocument, doc_len: u64) {
+        self.add_counted(doc, Some(doc_len));
+    }
+
     /// Add a document and keep its raw text, so `SearchResult::document.content`
     /// round-trips. Only for callers that read that field back.
     pub fn add_document_retaining_text(&self, doc: SearchDocument) {
@@ -648,6 +654,10 @@ impl ConcurrentSearchIndex {
     /// Used by WASM interface for incremental indexing.
     pub fn add_document(&self, doc: SearchDocument) {
         self.inner.add_document(doc);
+    }
+
+    pub fn add_document_counted(&self, doc: SearchDocument, doc_len: u64) {
+        self.inner.add_document_counted(doc, doc_len);
     }
 
     /// Add a document whose raw text must round-trip; see

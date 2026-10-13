@@ -1494,6 +1494,14 @@ impl CodeIntelEngine {
                                         crate::ingest::onec::platform_entry_points(
                                             &relative, &content,
                                         );
+                                    let into_search = !(search_warm && reused);
+                                    prepared.normalized =
+                                        collect_onec_normalized_documents(path, file_path)
+                                            .into_iter()
+                                            .map(|document| {
+                                                PreparedNormalized::new(document, into_search)
+                                            })
+                                            .collect();
                                 }
                                 Some((file_path.clone(), content, parsed, reused, prepared))
                             })
@@ -1658,14 +1666,10 @@ impl CodeIntelEngine {
                             );
                         }
 
-                        for document in collect_onec_normalized_documents(path, file_path.as_path())
-                        {
-                            self.index_normalized_document(
-                                Arc::clone(&repo_tag),
-                                &document,
-                                index_into_search,
+                        for document in prepared.normalized {
+                            normalized_docs_vec.push(
+                                self.index_normalized_document(Arc::clone(&repo_tag), document),
                             );
-                            normalized_docs_vec.push(document);
                         }
                     }
 
@@ -1825,45 +1829,51 @@ impl CodeIntelEngine {
         })
     }
 
-    /// `index_into_search` is false when the search index already holds this
-    /// document from a previous run. The TF-IDF embeddings below are not
-    /// persisted, so they are rebuilt either way.
+    /// Without `prepared.search` the search index already holds this document
+    /// from a previous run. The TF-IDF embeddings below are not persisted, so
+    /// they are rebuilt either way.
     fn index_normalized_document(
         &self,
         repo: Arc<str>,
-        document: &NormalizedDocument,
-        index_into_search: bool,
-    ) {
-        let file_path = normalized_document_primary_source(document);
-        let content = render_normalized_search_content(document);
+        prepared: PreparedNormalized,
+    ) -> NormalizedDocument {
+        let PreparedNormalized {
+            document,
+            file_path,
+            end_line,
+            tokens,
+            search,
+        } = prepared;
         let start_line = 1;
-        let end_line = content.lines().count();
-        let term_freq = crate::search::count_terms(&crate::search::tokenize_code(&content));
 
         // Raw text is NOT retained: display re-renders it from `normalized_docs`
         // on demand (see `normalized_doc_content_by_id`). Storing it here and in
         // the embedding engine doubled ~1 GB of redundant content on the 1C dump.
-        if index_into_search {
-            self.search_index.add_document(SearchDocument {
-                id: document.id.clone(),
-                repo: Arc::clone(&repo),
-                file_path: file_path.clone(),
-                content: String::new(),
-                doc_type: DocType::Other,
-                start_line,
-                end_line,
-                term_freq,
-            });
+        if let Some((term_freq, doc_len)) = search {
+            self.search_index.add_document_counted(
+                SearchDocument {
+                    id: document.id.clone(),
+                    repo: Arc::clone(&repo),
+                    file_path: file_path.clone(),
+                    content: String::new(),
+                    doc_type: DocType::Other,
+                    start_line,
+                    end_line,
+                    term_freq,
+                },
+                doc_len,
+            );
         }
 
-        self.embedding_engine.index_snippet_embed_only(
+        self.embedding_engine.index_tokens_embed_only(
             document.id.clone(),
-            Arc::clone(&repo),
+            repo,
             file_path,
-            content,
+            &tokens,
             start_line,
             end_line,
         );
+        document
     }
 
     pub async fn reindex_all(&self) -> Result<()> {
@@ -3646,8 +3656,7 @@ impl CodeIntelEngine {
                         for document in normalized_documents {
                             self.index_normalized_document(
                                 Arc::from(repo_name.as_str()),
-                                &document,
-                                true,
+                                PreparedNormalized::new(document, true),
                             );
                         }
 
@@ -10407,6 +10416,8 @@ struct PreparedDocuments {
     file_len: Option<u64>,
     /// Procedures a 1C metadata XML says the platform calls.
     platform_entries: Vec<crate::ingest::onec::PlatformEntryPoint>,
+    /// Normalized 1C metadata documents built from this XML.
+    normalized: Vec<PreparedNormalized>,
 }
 
 struct PreparedSymbol {
@@ -10424,6 +10435,7 @@ impl PreparedDocuments {
                 symbols: Vec::new(),
                 file_len: into_search.then(|| token_count(content)),
                 platform_entries: Vec::new(),
+                normalized: Vec::new(),
             };
         };
         let symbols = parsed
@@ -10447,6 +10459,37 @@ impl PreparedDocuments {
             symbols,
             file_len: None,
             platform_entries: Vec::new(),
+            normalized: Vec::new(),
+        }
+    }
+}
+
+/// A normalized document with its rendered text already tokenized, so the
+/// indexing thread only adds it.
+struct PreparedNormalized {
+    document: NormalizedDocument,
+    file_path: String,
+    end_line: usize,
+    tokens: Vec<String>,
+    /// Term frequencies and their BM25 length, when it goes into search.
+    search: Option<(HashMap<String, usize>, u64)>,
+}
+
+impl PreparedNormalized {
+    fn new(document: NormalizedDocument, into_search: bool) -> Self {
+        let content = render_normalized_search_content(&document);
+        let tokens = crate::search::tokenize_code(&content);
+        let search = into_search.then(|| {
+            let term_freq = crate::search::count_terms(&tokens);
+            let doc_len = crate::tantivy_index::term_freq_doc_len(&term_freq);
+            (term_freq, doc_len)
+        });
+        Self {
+            file_path: normalized_document_primary_source(&document),
+            end_line: content.lines().count(),
+            document,
+            tokens,
+            search,
         }
     }
 }
