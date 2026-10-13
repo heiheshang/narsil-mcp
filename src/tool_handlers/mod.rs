@@ -7,6 +7,7 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
+use tracing::Instrument;
 
 use crate::engine::CodeIntelEngine;
 
@@ -202,7 +203,13 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
         validate_tool_args(name, &args, ArgValidationMode::from_env())?;
-        handler.execute(engine, args).await
+        let span = tracing::info_span!("tool", name = name);
+        async {
+            tracing::debug!("Executing tool {}", name);
+            handler.execute(engine, args).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Check if a tool exists

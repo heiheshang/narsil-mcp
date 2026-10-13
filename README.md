@@ -99,6 +99,7 @@ Then run `claude` in the project: the assistant gets the code intelligence tools
 | [Security Rules](docs/security.md) | Built-in rule sets |
 | [Architecture](docs/architecture.md) | Layers and design patterns |
 | [Performance](docs/performance.md) | Benchmarks |
+| [Profiling](docs/profiling.md) | samply profiles and tracing spans |
 | [Development](docs/development.md) | Building and testing from source |
 | [Troubleshooting](docs/troubleshooting.md) | Common problems and fixes |
 | [Roadmap](docs/roadmap.md) | Completed work and release highlights |

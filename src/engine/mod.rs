@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{debug, info, warn};
+use tracing::{debug, debug_span, info, warn, Instrument};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
@@ -1130,6 +1130,7 @@ impl CodeIntelEngine {
         // Flush the search index once, after every repository has been walked.
         // Committing per document would fsync thousands of times; committing
         // here means a crash mid-walk costs the walk, not the corpus.
+        let commit_span = debug_span!("commit_search_index").entered();
         if let Err(e) = self.search_index.tantivy().commit() {
             warn!("Failed to commit search index: {}", e);
         }
@@ -1138,6 +1139,7 @@ impl CodeIntelEngine {
                 warn!("Failed to commit trigram index: {}", e);
             }
         }
+        drop(commit_span);
 
         // Initialize git repos if enabled
         if self.options.git_enabled {
@@ -1298,6 +1300,11 @@ impl CodeIntelEngine {
         self.index_repo_inner(path, Some(persisted)).await
     }
 
+    #[tracing::instrument(
+        name = "index_repo",
+        skip_all,
+        fields(repo = tracing::field::Empty, warm = reuse.is_some())
+    )]
     async fn index_repo_inner(
         &self,
         path: &Path,
@@ -1309,6 +1316,7 @@ impl CodeIntelEngine {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+        tracing::Span::current().record("repo", repo_name.as_str());
         // Interned once per repository: every search/neural document carries a
         // cheap clone of this tag so searches can be scoped to one repo.
         let repo_tag: Arc<str> = Arc::from(repo_name.as_str());
@@ -1352,6 +1360,8 @@ impl CodeIntelEngine {
             }
         }
 
+        let walk_span = debug_span!("walk").entered();
+        debug!("Walking {:?}", path);
         // Use ignore crate to respect .gitignore
         let walker = ignore::WalkBuilder::new(path)
             .hidden(true)
@@ -1388,6 +1398,7 @@ impl CodeIntelEngine {
             })
             .map(|e| e.path().to_path_buf())
             .collect();
+        drop(walk_span);
 
         if skipped_vendored > 0 || skipped_large > 0 {
             info!(
@@ -1414,7 +1425,20 @@ impl CodeIntelEngine {
                 None
             };
 
+            // One span per phase, entered once per chunk: the close event
+            // reports the phase's total across chunks, not 200 files' worth.
+            let parse_span = debug_span!("parse", files = files.len());
+            let documents_span = debug_span!("index_documents");
+            let functions_span = debug_span!("callgraph_functions");
+            debug!(
+                "Parsing {} files in chunks of {} (reusing cached symbols: {})",
+                files.len(),
+                CHUNK_SIZE,
+                reuse.is_some()
+            );
+
             for chunk in files.chunks(CHUNK_SIZE) {
+                let parse_guard = parse_span.enter();
                 let parsed_chunk: Vec<_> = chunk
                     .par_iter()
                     .filter_map(|file_path| {
@@ -1443,7 +1467,9 @@ impl CodeIntelEngine {
                         Some((file_path.clone(), content, parsed, reused))
                     })
                     .collect();
+                drop(parse_guard);
 
+                let documents_guard = documents_span.enter();
                 let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
                 for (file_path, content, parsed, reused) in parsed_chunk {
@@ -1597,8 +1623,11 @@ impl CodeIntelEngine {
                     }
                 }
 
+                drop(documents_guard);
+
                 // Call-graph pass 1: function definitions for this chunk.
                 if let Some(cg) = call_graph.as_ref() {
+                    let _functions_guard = functions_span.enter();
                     cg.collect_functions(&chunk_trees)?;
                 }
             }
@@ -1607,7 +1636,15 @@ impl CodeIntelEngine {
             // gathered in pass 1. Re-parse per chunk and drop trees as we go
             // (call graph is opt-in, so the double parse only happens for it).
             if let Some(cg) = call_graph.as_ref() {
+                let reparse_span = debug_span!("callgraph_reparse", files = files.len());
+                let calls_span = debug_span!("callgraph_calls");
+                debug!(
+                    "Resolving call sites across {} files, {} symbols",
+                    files.len(),
+                    symbols_vec.len()
+                );
                 for chunk in files.chunks(CHUNK_SIZE) {
+                    let reparse_guard = reparse_span.enter();
                     let parsed_chunk: Vec<_> = chunk
                         .par_iter()
                         .filter_map(|file_path| {
@@ -1630,7 +1667,9 @@ impl CodeIntelEngine {
                             }
                         }
                     }
+                    drop(reparse_guard);
 
+                    let _calls_guard = calls_span.enter();
                     cg.collect_calls(&chunk_trees)?;
                 }
                 info!(
@@ -1670,7 +1709,11 @@ impl CodeIntelEngine {
                 // the runtime after ~128 requests: the server answers, the client
                 // never picks the response up, and every later request times out.
                 let neural = Arc::clone(neural);
-                match tokio::task::spawn_blocking(move || neural.index_batch(&items)).await {
+                let neural_span = debug_span!("neural_embeddings", symbols = items.len());
+                match tokio::task::spawn_blocking(move || neural.index_batch(&items))
+                    .instrument(neural_span)
+                    .await
+                {
                     Ok(Ok(())) => info!("Neural embeddings indexed successfully"),
                     Ok(Err(e)) => warn!(
                         "Failed to batch index neural embeddings — semantic search falls back \
@@ -1697,6 +1740,11 @@ impl CodeIntelEngine {
         #[cfg(feature = "graph")]
         if let Some(ref graph) = self.knowledge_graph {
             use crate::persistence::{RepositoryTransformer, SymbolTransformer};
+            let _graph_span = debug_span!("knowledge_graph").entered();
+            debug!(
+                "Transforming {} symbols to RDF",
+                self.symbols.get(&repo_name).map_or(0, |s| s.len())
+            );
 
             // Get the symbols we just indexed
             if let Some(symbols) = self.symbols.get(&repo_name) {
@@ -3278,6 +3326,7 @@ impl CodeIntelEngine {
     }
 
     /// Save the current index to disk
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn save_index(&self) -> Result<String> {
         if !self.options.persist_enabled {
             return Ok(

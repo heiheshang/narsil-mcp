@@ -20,6 +20,16 @@ RUST_FEATURES ?= graph,neural
 # Что индексирует `make rs-run`.
 REPOS ?= ./test-fixtures
 
+# Профилирование: куда класть профили, частота семплов, какой бенч снимать.
+PROFILE_OUT ?= target/profiles
+SAMPLY_RATE ?= 1000
+BENCH ?= indexing
+BENCH_FILTER ?=
+PID ?=
+PROFILE ?=
+PROFILE_STAMP := $(shell date +%Y%m%d-%H%M%S)
+PROFILE_BIN := target/profiling/narsil-mcp
+
 # Выгрузка 1С для стенда поиска (проприетарная, в репозиторий не копируется).
 ONEC_REPO ?= $(HOME)/Downloads/ConfigFiles/CommonModules
 
@@ -125,6 +135,62 @@ rs-miri: ## Проверка unsafe-кода под Miri
 
 .PHONY: rs
 rs: rs-fmt rs-lint rs-test rs-doc rs-deny ## Полные ворота Rust
+
+# ------------------------------------------------------- Profiling ---------
+# samply, профиль profiling из Cargo.toml (release с символами). Скил narsil-profile.
+
+.PHONY: profile-build
+profile-build: ## Сборка с символами для профилирования (profile profiling)
+	cargo build --profile profiling --features $(RUST_FEATURES)
+
+.PHONY: profile-check
+profile-check: ## Проверить, что samply установлен и perf_event_paranoid <= 1
+	@command -v samply >/dev/null 2>&1 || { \
+		echo "samply не найден в PATH. Установка: cargo install --locked samply" >&2; exit 1; }
+	@paranoid=$$(cat /proc/sys/kernel/perf_event_paranoid); \
+	if [ "$$paranoid" -gt 1 ]; then \
+		echo "perf_event_paranoid = $$paranoid, samply нужно <= 1:" >&2; \
+		echo "  echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid" >&2; exit 1; fi
+	@echo "profile-check: $$(samply --version), perf_event_paranoid = $$(cat /proc/sys/kernel/perf_event_paranoid)" >&2
+
+.PHONY: profile-index
+profile-index: profile-check profile-build ## Профиль индексации REPOS с нуля (--reindex --git --call-graph)
+	@mkdir -p $(PROFILE_OUT)
+	scripts/profile-index.sh $(PROFILE_OUT)/index-$(PROFILE_STAMP).json.gz $(SAMPLY_RATE) \
+		$(PROFILE_BIN) --repos $(REPOS) --reindex --git --call-graph
+	@echo "profile saved: $(PROFILE_OUT)/index-$(PROFILE_STAMP).json.gz" >&2
+	@echo "открыть: make profile-open PROFILE=$(PROFILE_OUT)/index-$(PROFILE_STAMP).json.gz" >&2
+
+.PHONY: profile-bench
+profile-bench: profile-check ## Профиль бенча criterion BENCH (фильтр BENCH_FILTER)
+	@mkdir -p $(PROFILE_OUT)
+	@exe=$$(cargo bench --bench $(BENCH) --features $(RUST_FEATURES) --no-run --message-format=json \
+		| jq -r 'select(.reason == "compiler-artifact" and .executable != null and (.target.kind | index("bench"))) | .executable' \
+		| tail -1); \
+	[ -n "$$exe" ] || { echo "не нашёл исполняемый файл бенча $(BENCH)" >&2; exit 1; }; \
+	out=$(PROFILE_OUT)/bench-$(BENCH)-$(PROFILE_STAMP).json.gz; \
+	echo "profile-bench: binary=$$exe filter='$(BENCH_FILTER)' rate=$(SAMPLY_RATE) Hz output=$$out" >&2; \
+	samply record --save-only --rate $(SAMPLY_RATE) -o "$$out" -- "$$exe" --bench --profile-time 20 $(BENCH_FILTER); \
+	echo "profile saved: $$out" >&2; \
+	echo "открыть: make profile-open PROFILE=$$out" >&2
+
+.PHONY: profile-attach
+profile-attach: profile-check ## Профиль запущенного процесса PID, до Ctrl+C
+	@[ -n "$(PID)" ] || { echo "нужен PID: make profile-attach PID=<pid>" >&2; exit 1; }
+	@mkdir -p $(PROFILE_OUT)
+	@out=$(PROFILE_OUT)/attach-$(PID)-$(PROFILE_STAMP).json.gz; \
+	echo "profile-attach: pid=$(PID) binary=$$(readlink /proc/$(PID)/exe) rate=$(SAMPLY_RATE) Hz output=$$out" >&2; \
+	samply record --save-only --rate $(SAMPLY_RATE) -o "$$out" -p $(PID); \
+	echo "profile saved: $$out" >&2; \
+	echo "открыть: make profile-open PROFILE=$$out" >&2
+
+.PHONY: profile-open
+profile-open: ## Открыть профиль PROFILE (по умолчанию последний) в Firefox Profiler
+	@profile="$(PROFILE)"; \
+	[ -n "$$profile" ] || profile=$$(ls -t $(PROFILE_OUT)/*.json.gz 2>/dev/null | head -1); \
+	[ -n "$$profile" ] || { echo "в $(PROFILE_OUT) нет профилей" >&2; exit 1; }; \
+	echo "profile-open: $$profile" >&2; \
+	samply load "$$profile"
 
 # -------------------------------------------------------- Frontend ---------
 # Нигде в CI не собирается — эта цель единственный способ проверить его локально.

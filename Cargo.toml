@@ -179,6 +179,18 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# strip в release стирает символы, и samply показывает адреса вместо имён.
+# Код тот же, что в боевой сборке: LTO, codegen-units и panic наследуются.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
+# bench наследует release, без этого бинари criterion тоже без символов.
+[profile.bench]
+debug = "line-tables-only"
+strip = false
+
 [lib]
 name = "narsil_mcp"
 path = "src/lib.rs"

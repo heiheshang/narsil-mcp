@@ -5,8 +5,9 @@ use clap::{Parser as ClapParser, Subcommand};
 use narsil_mcp::{config, engine, http_server, lsp, mcp, neural, persist, repo, streaming};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 // mimalloc: glibc's default allocator retains freed arenas, inflating peak RSS
 // by ~2-4 GB on the 1C reindex (469k symbols, 5M edges). mimalloc returns
@@ -175,18 +176,30 @@ async fn main() -> Result<()> {
     let mut server_args = args.server;
 
     // Initialize logging to stderr (stdout is for MCP protocol)
-    let level = if server_args.verbose {
-        Level::DEBUG
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let (filter, rejected_rust_log) = log_filter(server_args.verbose, rust_log.as_deref());
+    let filter_shown = filter.to_string();
+    let trace_spans = trace_spans_enabled(std::env::var("NARSIL_TRACE_SPANS").ok().as_deref());
+    let span_events = if trace_spans {
+        FmtSpan::CLOSE
     } else {
-        Level::INFO
+        FmtSpan::NONE
     };
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
+        .with_env_filter(filter)
+        .with_span_events(span_events)
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting narsil-mcp v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(error) = rejected_rust_log {
+        warn!("Ignoring invalid RUST_LOG: {}", error);
+    }
+    info!(
+        "Log filter: {} (span close events: {})",
+        filter_shown, trace_spans
+    );
 
     apply_named_profile(&mut server_args)?;
 
@@ -315,8 +328,9 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if reindex_flag {
             info!("Re-indexing all repositories...");
-            if let Err(e) = init_engine.reindex_all().await {
-                warn!("Error during re-indexing: {}", e);
+            match init_engine.reindex_all().await {
+                Ok(()) => info!("Re-indexing complete"),
+                Err(e) => warn!("Error during re-indexing: {}", e),
             }
         } else {
             // Complete deferred initialization
@@ -535,6 +549,27 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// The log filter: `RUST_LOG` when it is set and parses, otherwise `debug`
+/// with `--verbose` and `info` without. The second value is the parse error
+/// of a rejected `RUST_LOG`, to be reported once logging is up.
+fn log_filter(verbose: bool, rust_log: Option<&str>) -> (EnvFilter, Option<String>) {
+    let fallback = || EnvFilter::new(if verbose { "debug" } else { "info" });
+    let Some(directives) = rust_log.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (fallback(), None);
+    };
+    match EnvFilter::try_new(directives) {
+        Ok(filter) => (filter, None),
+        Err(e) => (fallback(), Some(format!("{directives:?}: {e}"))),
+    }
+}
+
+fn trace_spans_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "on")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +774,34 @@ profiles:
         assert!(args.server.git);
         assert!(args.server.call_graph);
         assert_eq!(args.server.preset.as_deref(), Some("balanced"));
+    }
+
+    #[test]
+    fn log_filter_defaults_follow_verbose_flag() {
+        assert_eq!(log_filter(false, None).0.to_string(), "info");
+        assert_eq!(log_filter(true, None).0.to_string(), "debug");
+        assert_eq!(log_filter(true, Some("  ")).0.to_string(), "debug");
+    }
+
+    #[test]
+    fn log_filter_takes_rust_log_when_valid() {
+        let (filter, rejected) = log_filter(false, Some("narsil_mcp=trace"));
+        assert_eq!(filter.to_string(), "narsil_mcp=trace");
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn log_filter_falls_back_on_invalid_rust_log() {
+        let (filter, rejected) = log_filter(true, Some("narsil_mcp=loudest"));
+        assert_eq!(filter.to_string(), "debug");
+        assert!(rejected.unwrap().contains("narsil_mcp=loudest"));
+    }
+
+    #[test]
+    fn trace_spans_only_on_explicit_opt_in() {
+        assert!(trace_spans_enabled(Some("1")));
+        assert!(trace_spans_enabled(Some("true")));
+        assert!(!trace_spans_enabled(Some("0")));
+        assert!(!trace_spans_enabled(None));
     }
 }

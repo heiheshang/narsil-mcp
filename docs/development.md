@@ -1,4 +1,4 @@
-[← Performance](performance.md) · [Back to README](../README.md) · [Troubleshooting →](troubleshooting.md)
+[← Profiling](profiling.md) · [Back to README](../README.md) · [Troubleshooting →](troubleshooting.md)
 
 # Development
 

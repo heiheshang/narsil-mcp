@@ -1,4 +1,4 @@
-[← Architecture](architecture.md) · [Back to README](../README.md) · [Development →](development.md)
+[← Architecture](architecture.md) · [Back to README](../README.md) · [Profiling →](profiling.md)
 
 # Performance
 

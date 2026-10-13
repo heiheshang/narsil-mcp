@@ -405,6 +405,17 @@ This will:
 - Disable only the specified tools
 - Override tool settings from config files
 
+### RUST_LOG and NARSIL_TRACE_SPANS
+
+`RUST_LOG` sets the log filter (stderr). Without it the filter is `info`, or `debug`
+with `--verbose`; an unparsable value is ignored with a warning.
+`NARSIL_TRACE_SPANS=1` adds a `close` event with `time.busy` and `time.idle` for every
+span: indexing phases and tool calls. See [Profiling](profiling.md).
+
+```bash
+NARSIL_TRACE_SPANS=1 RUST_LOG=narsil_mcp=debug narsil-mcp --repos ~/project
+```
+
 ### Combining Environment Variables
 
 ```bash
