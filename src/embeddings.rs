@@ -95,19 +95,21 @@ impl TfIdfEmbedding {
             return;
         }
 
+        // Once the map is full this runs on almost every insert, usually to
+        // drop a single term, so the overflow is selected, not sorted.
         let mut ranked: Vec<(&str, usize)> = self
             .document_freq
             .iter()
             .map(|(term, &df)| (term.as_str(), df))
             .collect();
-        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-
-        let keep: std::collections::HashSet<String> = ranked
+        ranked.select_nth_unstable_by(limit, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let dropped: Vec<String> = ranked[limit..]
             .iter()
-            .take(limit)
             .map(|(term, _)| (*term).to_string())
             .collect();
-        self.document_freq.retain(|term, _| keep.contains(term));
+        for term in &dropped {
+            self.document_freq.remove(term);
+        }
     }
 
     /// Compute IDF for a term (with smoothing to avoid zero values)
@@ -637,6 +639,35 @@ mod tests {
         // Embedding dimension stays the configured size.
         let embedding = tfidf.embed("fn_42");
         assert_eq!(embedding.len(), tfidf.max_vocab_size);
+    }
+
+    #[test]
+    fn test_document_freq_pruning_keeps_the_top_ranked_terms() {
+        let mut tfidf = TfIdfEmbedding::new(8);
+        let mut reference: HashMap<String, usize> = HashMap::new();
+        let limit = tfidf.max_vocab_size * 2;
+
+        for i in 0..400 {
+            let text = format!("common_{} shared_{} rare_{i} rare_b{i}", i % 3, i % 7);
+            tfidf.add_document(&text);
+
+            let unique: std::collections::HashSet<_> = tokenize_code(&text).into_iter().collect();
+            for token in unique {
+                *reference.entry(token).or_insert(0) += 1;
+            }
+            if reference.len() > limit {
+                let mut ranked: Vec<(String, usize)> =
+                    reference.iter().map(|(t, &df)| (t.clone(), df)).collect();
+                ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(limit);
+                reference = ranked.into_iter().collect();
+            }
+
+            assert_eq!(
+                tfidf.document_freq, reference,
+                "diverged after document {i}"
+            );
+        }
     }
 
     #[test]
