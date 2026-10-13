@@ -3,6 +3,7 @@
 //! Provides intelligent code search that understands programming patterns.
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -414,23 +415,38 @@ pub struct IndexStats {
 
 /// Code-aware tokenization
 pub fn tokenize_code(text: &str) -> Vec<String> {
+    // A word's tokens depend on the word alone, and code repeats its words:
+    // on a 1C dump splitting, case-folding and stemming them again was most
+    // of tokenization.
+    thread_local! {
+        static WORD_TOKENS: RefCell<HashMap<String, Box<[String]>, ahash::RandomState>> =
+            RefCell::new(HashMap::default());
+    }
+    const WORD_CACHE_CAP: usize = 1 << 15;
+
     let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        if is_word_char(ch) {
-            current.push(ch);
-        } else if !current.is_empty() {
-            // Split camelCase and snake_case
-            tokens.extend(split_identifier(&current));
-            current.clear();
+    WORD_TOKENS.with_borrow_mut(|cache| {
+        for word in text.split(|ch: char| !is_word_char(ch)) {
+            if word.is_empty() {
+                continue;
+            }
+            if let Some(cached) = cache.get(word) {
+                tokens.extend(cached.iter().cloned());
+                continue;
+            }
+            let computed = word_tokens(word);
+            tokens.extend(computed.iter().cloned());
+            if cache.len() >= WORD_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(word.to_owned(), computed.into_boxed_slice());
         }
-    }
+    });
+    tokens
+}
 
-    if !current.is_empty() {
-        tokens.extend(split_identifier(&current));
-    }
-
+/// The tokens of one run of word characters.
+fn word_tokens(word: &str) -> Vec<String> {
     // Lowercase and filter short tokens. Most identifiers in an indexed
     // corpus are ASCII (keywords, common names); `to_ascii_lowercase` skips
     // the Unicode case-fold tables `to_lowercase` must consult for the
@@ -440,7 +456,7 @@ pub fn tokenize_code(text: &str) -> Vec<String> {
     // contributors. Falls back to full `to_lowercase` for non-ASCII tokens
     // (e.g. Cyrillic identifiers in BSL/1C source) so case-folding stays
     // correct for them.
-    tokens
+    split_identifier(word)
         .into_iter()
         .map(|t| {
             if t.is_ascii() {
