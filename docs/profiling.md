@@ -87,15 +87,16 @@ Spans:
 | `parse` | debug | tree-sitter parsing, summed over all chunks |
 | `index_documents` | debug | BM25 symbol cards, TF-IDF, trigram and 1C documents |
 | `callgraph_functions` | debug | call graph pass 1: function definitions |
-| `callgraph_reparse` | debug | call graph pass 2: re-parsing (trees are not kept) |
-| `callgraph_calls` | debug | call graph pass 2: call resolution |
+| `callgraph_calls{files}` | debug | call graph pass 2: re-parsing and call resolution, in parallel |
 | `neural_embeddings` | debug | neural embedding batch |
 | `knowledge_graph` | debug | RDF transformation (`--graph`) |
 | `commit_search_index` | debug | tantivy and trigram commit at startup |
 | `save_index` | debug | SQLite persistence (`--persist`) |
 
 Phases inside the per-chunk loop use one span that is entered once per chunk, so
-their `time.busy` is already the total across chunks.
+their `time.busy` is already the total across chunks. `parse` of the next chunk
+runs while `index_documents` handles the current one, so phase times add up to
+more than `index_repo`.
 
 ## Reading a profile
 

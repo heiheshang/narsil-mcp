@@ -1410,7 +1410,8 @@ impl CodeIntelEngine {
         // Process in chunks so the whole corpus's content + tree-sitter trees
         // are never resident at once. The pre-streaming `collect()` held every
         // file's parse tree simultaneously — the 20 GB OOM on the 1С config.
-        // Each chunk's trees are dropped before the next chunk is parsed.
+        // A chunk's trees are dropped once it is indexed, with at most three
+        // chunks in flight (see the parse pipeline below).
         const CHUNK_SIZE: usize = 200;
         let metrics = Arc::clone(&self.metrics);
 
@@ -1427,6 +1428,7 @@ impl CodeIntelEngine {
 
             // One span per phase, entered once per chunk: the close event
             // reports the phase's total across chunks, not 200 files' worth.
+            // `parse` runs alongside `index_documents`, so the two overlap.
             let parse_span = debug_span!("parse", files = files.len());
             let documents_span = debug_span!("index_documents");
             let functions_span = debug_span!("callgraph_functions");
@@ -1437,241 +1439,253 @@ impl CodeIntelEngine {
                 reuse.is_some()
             );
 
-            for chunk in files.chunks(CHUNK_SIZE) {
-                let parse_guard = parse_span.enter();
-                let parsed_chunk: Vec<_> = chunk
-                    .par_iter()
-                    .filter_map(|file_path| {
-                        let parse_start = std::time::Instant::now();
-                        let content = read_indexable_text_file(file_path)?;
-                        let (parsed, reused) = match reusable_symbols(reuse, file_path) {
-                            Some(symbols) => (
-                                Some(crate::parser::ParsedFile {
-                                    path: file_path.to_string_lossy().to_string(),
-                                    // Ask the parser for the label instead of
-                                    // deriving one from the extension: a warm
-                                    // start must report the same language names
-                                    // as a cold one, not `Rust` beside `rust`.
-                                    language: self
-                                        .parser
-                                        .language_name(file_path)
-                                        .unwrap_or_else(|| "unknown".to_string()),
-                                    symbols,
-                                    tree: None,
-                                }),
-                                true,
-                            ),
-                            None => (self.parser.parse_file(file_path, &content).ok(), false),
-                        };
-                        metrics.record_file_parse(parse_start.elapsed());
-                        Some((file_path.clone(), content, parsed, reused))
-                    })
-                    .collect();
-                drop(parse_guard);
-
-                let documents_guard = documents_span.enter();
-                let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
-
-                for (file_path, content, parsed, reused) in parsed_chunk {
-                    file_count += 1;
-                    if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty()) {
-                        symbol_files += 1;
-                        if reuse.is_some() && !reused {
-                            // Missing from the cache or changed on disk.
-                            reparsed_files += 1;
+            // Chunk N+1 is parsed on the rayon pool while this thread indexes
+            // chunk N; in lockstep each side idled while the other worked.
+            // The channel holds one chunk, so at most three are resident.
+            let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| -> Result<()> {
+                scope.spawn(|| {
+                    // Moved in, so the receiver sees the end once the last chunk is sent.
+                    let parsed_tx = parsed_tx;
+                    for chunk in files.chunks(CHUNK_SIZE) {
+                        let parse_guard = parse_span.enter();
+                        let parsed_chunk: Vec<_> = chunk
+                            .par_iter()
+                            .filter_map(|file_path| {
+                                let parse_start = std::time::Instant::now();
+                                let content = read_indexable_text_file(file_path)?;
+                                let (parsed, reused) = match reusable_symbols(reuse, file_path) {
+                                    Some(symbols) => (
+                                        Some(crate::parser::ParsedFile {
+                                            path: file_path.to_string_lossy().to_string(),
+                                            // Ask the parser for the label instead of
+                                            // deriving one from the extension: a warm
+                                            // start must report the same language names
+                                            // as a cold one, not `Rust` beside `rust`.
+                                            language: self
+                                                .parser
+                                                .language_name(file_path)
+                                                .unwrap_or_else(|| "unknown".to_string()),
+                                            symbols,
+                                            tree: None,
+                                        }),
+                                        true,
+                                    ),
+                                    None => {
+                                        (self.parser.parse_file(file_path, &content).ok(), false)
+                                    }
+                                };
+                                metrics.record_file_parse(parse_start.elapsed());
+                                Some((file_path.clone(), content, parsed, reused))
+                            })
+                            .collect();
+                        drop(parse_guard);
+                        // The receiver is gone only when indexing stopped on an error.
+                        if parsed_tx.send(parsed_chunk).is_err() {
+                            break;
                         }
                     }
-                    let lines = content.lines().count();
-                    total_lines += lines;
+                });
 
-                    // Track parseable languages separately from text-only files.
-                    let language_key = parsed
-                        .as_ref()
-                        .map(|parsed| parsed.language.clone())
-                        .unwrap_or_else(|| {
-                            file_path
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .map(ext_to_language)
-                                .filter(|lang| !lang.is_empty())
-                                .unwrap_or_else(|| "text".to_string())
-                        });
-                    let lang_stats = languages.entry(language_key).or_default();
-                    lang_stats.file_count += 1;
-                    lang_stats.line_count += lines;
-                    lang_stats.byte_count += content.len();
+                for parsed_chunk in parsed_rx {
+                    let documents_guard = documents_span.enter();
+                    let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-                    // Collect symbols with file path and index for embeddings
-                    let relative_path = file_path
-                        .strip_prefix(path)
-                        .unwrap_or(&file_path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Documents for an unchanged file are already in the
-                    // persisted index; re-adding them would duplicate every
-                    // hit. A changed file has its old documents dropped first,
-                    // because symbols it used to define may be gone.
-                    let index_into_search = !(search_warm && reused);
-                    if index_into_search {
-                        if search_warm {
-                            self.search_index
-                                .tantivy()
-                                .delete_file(&repo_tag, &relative_path);
-                            if let Some(tri) = self.substring_index.as_ref() {
-                                tri.delete_file(&repo_tag, &relative_path);
+                    for (file_path, content, parsed, reused) in parsed_chunk {
+                        file_count += 1;
+                        if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty()) {
+                            symbol_files += 1;
+                            if reuse.is_some() && !reused {
+                                // Missing from the cache or changed on disk.
+                                reparsed_files += 1;
                             }
                         }
-                        // Substring search indexes whole file text, including
-                        // the punctuation a token index throws away — that is
-                        // the point of it.
-                        if let Some(tri) = self.substring_index.as_ref() {
-                            tri.add_file(&repo_tag, &relative_path, &content);
-                        }
-                    }
+                        let lines = content.lines().count();
+                        total_lines += lines;
 
-                    let has_parser_support = parsed.is_some();
-                    if let Some(parsed) = parsed {
-                        let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
+                        // Track parseable languages separately from text-only files.
+                        let language_key = parsed
+                            .as_ref()
+                            .map(|parsed| parsed.language.clone())
+                            .unwrap_or_else(|| {
+                                file_path
+                                    .extension()
+                                    .and_then(|ext| ext.to_str())
+                                    .map(ext_to_language)
+                                    .filter(|lang| !lang.is_empty())
+                                    .unwrap_or_else(|| "text".to_string())
+                            });
+                        let lang_stats = languages.entry(language_key).or_default();
+                        lang_stats.file_count += 1;
+                        lang_stats.line_count += lines;
+                        lang_stats.byte_count += content.len();
 
-                        for mut symbol in symbols {
-                            symbol.file_path = relative_path.clone();
+                        // Collect symbols with file path and index for embeddings
+                        let relative_path = file_path
+                            .strip_prefix(path)
+                            .unwrap_or(&file_path)
+                            .to_string_lossy()
+                            .to_string();
 
-                            // Index the symbol "card" (name + signature + doc) as
-                            // the search document — search returns the procedure,
-                            // not the whole module (Phase 4: document = function).
-                            let mut card = symbol.name.clone();
-                            if let Some(ref sig) = symbol.signature {
-                                card.push(' ');
-                                card.push_str(sig);
-                            }
-                            if let Some(ref doc) = symbol.doc_comment {
-                                card.push('\n');
-                                card.push_str(doc);
-                            }
-                            if index_into_search {
-                                self.search_index.index_symbol(
-                                    Arc::clone(&repo_tag),
-                                    &relative_path,
-                                    &symbol.name,
-                                    &card,
-                                    symbol_kind_to_doc_type(&symbol.kind),
-                                    symbol.start_line,
-                                    symbol.end_line,
-                                );
-                            }
-
-                            // Index symbol into embedding engine for similarity search
-                            if let Some(ref sig) = symbol.signature {
-                                let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                                self.embedding_engine.index_snippet_embed_only(
-                                    symbol_id.clone(),
-                                    Arc::clone(&repo_tag),
-                                    relative_path.clone(),
-                                    sig.clone(),
-                                    symbol.start_line,
-                                    symbol.end_line,
-                                );
-
-                                // Collect for neural batch indexing if enabled
-                                if self.neural_engine.is_some() {
-                                    neural_docs.push(crate::neural::NeuralDocument {
-                                        id: symbol_id,
-                                        repo: Arc::clone(&repo_tag),
-                                        file_path: relative_path.clone(),
-                                        content: sig.clone(),
-                                        start_line: symbol.start_line,
-                                        end_line: symbol.end_line,
-                                        symbol_name: Some(symbol.name.clone()),
-                                    });
+                        // Documents for an unchanged file are already in the
+                        // persisted index; re-adding them would duplicate every
+                        // hit. A changed file has its old documents dropped first,
+                        // because symbols it used to define may be gone.
+                        let index_into_search = !(search_warm && reused);
+                        if index_into_search {
+                            if search_warm {
+                                self.search_index
+                                    .tantivy()
+                                    .delete_file(&repo_tag, &relative_path);
+                                if let Some(tri) = self.substring_index.as_ref() {
+                                    tri.delete_file(&repo_tag, &relative_path);
                                 }
                             }
-
-                            symbols_vec.push(symbol);
-                        }
-
-                        // Collect tree for call graph if enabled and tree exists
-                        if self.options.call_graph_enabled {
-                            if let Some(tree) = tree {
-                                chunk_trees.push((relative_path.clone(), content.clone(), tree));
+                            // Substring search indexes whole file text, including
+                            // the punctuation a token index throws away — that is
+                            // the point of it.
+                            if let Some(tri) = self.substring_index.as_ref() {
+                                tri.add_file(&repo_tag, &relative_path, &content);
                             }
                         }
+
+                        let has_parser_support = parsed.is_some();
+                        if let Some(parsed) = parsed {
+                            let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
+
+                            for mut symbol in symbols {
+                                symbol.file_path = relative_path.clone();
+
+                                // Index the symbol "card" (name + signature + doc) as
+                                // the search document — search returns the procedure,
+                                // not the whole module (Phase 4: document = function).
+                                let mut card = symbol.name.clone();
+                                if let Some(ref sig) = symbol.signature {
+                                    card.push(' ');
+                                    card.push_str(sig);
+                                }
+                                if let Some(ref doc) = symbol.doc_comment {
+                                    card.push('\n');
+                                    card.push_str(doc);
+                                }
+                                if index_into_search {
+                                    self.search_index.index_symbol(
+                                        Arc::clone(&repo_tag),
+                                        &relative_path,
+                                        &symbol.name,
+                                        &card,
+                                        symbol_kind_to_doc_type(&symbol.kind),
+                                        symbol.start_line,
+                                        symbol.end_line,
+                                    );
+                                }
+
+                                // Index symbol into embedding engine for similarity search
+                                if let Some(ref sig) = symbol.signature {
+                                    let symbol_id = format!("{}::{}", relative_path, symbol.name);
+                                    self.embedding_engine.index_snippet_embed_only(
+                                        symbol_id.clone(),
+                                        Arc::clone(&repo_tag),
+                                        relative_path.clone(),
+                                        sig.clone(),
+                                        symbol.start_line,
+                                        symbol.end_line,
+                                    );
+
+                                    // Collect for neural batch indexing if enabled
+                                    if self.neural_engine.is_some() {
+                                        neural_docs.push(crate::neural::NeuralDocument {
+                                            id: symbol_id,
+                                            repo: Arc::clone(&repo_tag),
+                                            file_path: relative_path.clone(),
+                                            content: sig.clone(),
+                                            start_line: symbol.start_line,
+                                            end_line: symbol.end_line,
+                                            symbol_name: Some(symbol.name.clone()),
+                                        });
+                                    }
+                                }
+
+                                symbols_vec.push(symbol);
+                            }
+
+                            // Collect tree for call graph if enabled and tree exists
+                            if self.options.call_graph_enabled {
+                                if let Some(tree) = tree {
+                                    chunk_trees.push((
+                                        relative_path.clone(),
+                                        content.clone(),
+                                        tree,
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Record the file as indexed (content is read from disk on
+                        // demand via `content_for`, not cached here).
+                        self.file_cache.insert(file_path.clone(), ());
+
+                        // Index the whole file into search only when the parser
+                        // extracted no symbols (text-only / unsupported languages).
+                        // Parsed files index per-symbol cards above instead.
+                        if !has_parser_support && index_into_search {
+                            self.search_index.index_file(
+                                Arc::clone(&repo_tag),
+                                &relative_path,
+                                &content,
+                            );
+                        }
+
+                        for document in collect_onec_normalized_documents(path, file_path.as_path())
+                        {
+                            self.index_normalized_document(
+                                Arc::clone(&repo_tag),
+                                &document,
+                                index_into_search,
+                            );
+                            normalized_docs_vec.push(document);
+                        }
                     }
 
-                    // Record the file as indexed (content is read from disk on
-                    // demand via `content_for`, not cached here).
-                    self.file_cache.insert(file_path.clone(), ());
+                    drop(documents_guard);
 
-                    // Index the whole file into search only when the parser
-                    // extracted no symbols (text-only / unsupported languages).
-                    // Parsed files index per-symbol cards above instead.
-                    if !has_parser_support && index_into_search {
-                        self.search_index.index_file(
-                            Arc::clone(&repo_tag),
-                            &relative_path,
-                            &content,
-                        );
-                    }
-
-                    for document in collect_onec_normalized_documents(path, file_path.as_path()) {
-                        self.index_normalized_document(
-                            Arc::clone(&repo_tag),
-                            &document,
-                            index_into_search,
-                        );
-                        normalized_docs_vec.push(document);
+                    // Call-graph pass 1: function definitions for this chunk.
+                    if let Some(cg) = call_graph.as_ref() {
+                        let _functions_guard = functions_span.enter();
+                        cg.collect_functions(&chunk_trees)?;
+                        // Freeing a tree walks every node; on this thread it was
+                        // a second of a BSL corpus's critical path.
+                        chunk_trees.into_par_iter().for_each(drop);
                     }
                 }
-
-                drop(documents_guard);
-
-                // Call-graph pass 1: function definitions for this chunk.
-                if let Some(cg) = call_graph.as_ref() {
-                    let _functions_guard = functions_span.enter();
-                    cg.collect_functions(&chunk_trees)?;
-                }
-            }
+                Ok(())
+            })?;
 
             // Call-graph pass 2: call sites, resolved against every function
-            // gathered in pass 1. Re-parse per chunk and drop trees as we go
-            // (call graph is opt-in, so the double parse only happens for it).
+            // gathered in pass 1. Each file is re-parsed, resolved and its tree
+            // dropped on the same worker (call graph is opt-in, so the double
+            // parse only happens for it).
             if let Some(cg) = call_graph.as_ref() {
-                let reparse_span = debug_span!("callgraph_reparse", files = files.len());
-                let calls_span = debug_span!("callgraph_calls");
+                let _calls_span = debug_span!("callgraph_calls", files = files.len()).entered();
                 debug!(
                     "Resolving call sites across {} files, {} symbols",
                     files.len(),
                     symbols_vec.len()
                 );
-                for chunk in files.chunks(CHUNK_SIZE) {
-                    let reparse_guard = reparse_span.enter();
-                    let parsed_chunk: Vec<_> = chunk
-                        .par_iter()
-                        .filter_map(|file_path| {
-                            let content = read_indexable_text_file(file_path)?;
-                            let parsed = self.parser.parse_file(file_path, &content).ok();
-                            Some((file_path.clone(), content, parsed))
-                        })
-                        .collect();
-
-                    let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
-                    for (file_path, content, parsed) in parsed_chunk {
-                        if let Some(parsed) = parsed {
-                            let relative_path = file_path
-                                .strip_prefix(path)
-                                .unwrap_or(&file_path)
-                                .to_string_lossy()
-                                .to_string();
-                            if let Some(tree) = parsed.tree {
-                                chunk_trees.push((relative_path, content, tree));
-                            }
-                        }
-                    }
-                    drop(reparse_guard);
-
-                    let _calls_guard = calls_span.enter();
-                    cg.collect_calls(&chunk_trees)?;
-                }
+                files.par_iter().try_for_each(|file_path| {
+                    let Some(content) = read_indexable_text_file(file_path) else {
+                        return Ok(());
+                    };
+                    // Only the tree: symbols were extracted in pass 1.
+                    let Ok(tree) = self.parser.parse_to_tree(file_path, &content) else {
+                        return Ok(());
+                    };
+                    let relative_path = file_path
+                        .strip_prefix(path)
+                        .unwrap_or(file_path)
+                        .to_string_lossy();
+                    cg.collect_file_calls(&relative_path, &content, &tree)
+                })?;
                 info!(
                     "Built call graph for {} with {} files",
                     repo_name, file_count

@@ -365,7 +365,7 @@ pub fn tokenize_code(text: &str) -> Vec<String> {
     let mut current = String::new();
 
     for ch in text.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
+        if is_word_char(ch) {
             current.push(ch);
         } else if !current.is_empty() {
             // Split camelCase and snake_case
@@ -393,7 +393,7 @@ pub fn tokenize_code(text: &str) -> Vec<String> {
             if t.is_ascii() {
                 t.to_ascii_lowercase()
             } else {
-                t.to_lowercase()
+                lowercase_non_ascii(&t)
             }
         })
         .filter(|t| t.len() >= 2)
@@ -429,7 +429,38 @@ fn stem_cyrillic(token: String) -> String {
 }
 
 fn is_cyrillic_letter(ch: char) -> bool {
-    matches!(ch, '\u{0400}'..='\u{04FF}') && ch.is_alphabetic()
+    is_russian_letter(ch) || matches!(ch, '\u{0400}'..='\u{04FF}') && ch.is_alphabetic()
+}
+
+/// The Russian alphabet, the bulk of non-ASCII text in an indexed corpus (1C).
+/// `char::is_alphanumeric` and `to_lowercase` answer it through the general
+/// Unicode tables, which showed up as the largest self time of TF-IDF
+/// tokenization on a BSL corpus.
+fn is_russian_letter(ch: char) -> bool {
+    matches!(ch, 'А'..='я' | 'Ё' | 'ё')
+}
+
+fn is_word_char(ch: char) -> bool {
+    if ch.is_ascii() {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    } else {
+        is_russian_letter(ch) || ch.is_alphanumeric()
+    }
+}
+
+/// `str::to_lowercase` with the Russian alphabet folded without the tables.
+fn lowercase_non_ascii(token: &str) -> String {
+    let mut lower = String::with_capacity(token.len());
+    for ch in token.chars() {
+        match ch {
+            'A'..='Z' => lower.push(ch.to_ascii_lowercase()),
+            'А'..='Я' => lower.push(char::from_u32(ch as u32 + 0x20).unwrap_or(ch)),
+            'Ё' => lower.push('ё'),
+            _ if ch.is_ascii() || matches!(ch, 'а'..='я' | 'ё') => lower.push(ch),
+            _ => return token.to_lowercase(),
+        }
+    }
+    lower
 }
 
 /// Split identifiers by camelCase, PascalCase, and snake_case
@@ -793,6 +824,33 @@ mod tests {
         assert!(tokens.contains(&"xml".to_string()));
         assert!(tokens.contains(&stem_cyrillic("данные".to_string())));
         assert!(tokens.contains(&"обработатьxmlданные".to_string()));
+    }
+
+    #[test]
+    fn test_russian_fast_paths_agree_with_unicode_tables() {
+        for ch in (0..=0x10FFFF).filter_map(char::from_u32) {
+            assert_eq!(
+                is_word_char(ch),
+                ch.is_alphanumeric() || ch == '_',
+                "{ch:?}"
+            );
+            assert_eq!(
+                is_cyrillic_letter(ch),
+                matches!(ch, '\u{0400}'..='\u{04FF}') && ch.is_alphabetic(),
+                "{ch:?}"
+            );
+        }
+        for token in [
+            "ОбработкаЁЖЯ",
+            "АаЯяЁё",
+            "УТ11ОбменXML",
+            "ЄґЇ",
+            "ΣΑΣ",
+            "İstanbul",
+            "Mixed_Ключ",
+        ] {
+            assert_eq!(lowercase_non_ascii(token), token.to_lowercase(), "{token}");
+        }
     }
 
     #[test]

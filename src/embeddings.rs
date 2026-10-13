@@ -56,11 +56,21 @@ impl TfIdfEmbedding {
 
     /// Add a document to update the IDF statistics
     pub fn add_document(&mut self, text: &str) {
-        let tokens = tokenize_code(text);
-        let unique_tokens: std::collections::HashSet<_> = tokens.into_iter().collect();
+        self.add_document_tokens(&tokenize_code(text));
+    }
+
+    /// [`add_document`](Self::add_document) for text already run through
+    /// [`tokenize_code`].
+    fn add_document_tokens(&mut self, tokens: &[String]) {
+        let unique_tokens: std::collections::HashSet<&String> = tokens.iter().collect();
 
         for token in unique_tokens {
-            *self.document_freq.entry(token).or_insert(0) += 1;
+            match self.document_freq.get_mut(token) {
+                Some(df) => *df += 1,
+                None => {
+                    self.document_freq.insert(token.clone(), 1);
+                }
+            }
         }
 
         self.total_docs += 1;
@@ -148,13 +158,24 @@ impl TfIdfEmbedding {
 
 impl EmbeddingProvider for TfIdfEmbedding {
     fn embed(&self, text: &str) -> Vec<f32> {
-        let tokens = tokenize_code(text);
+        self.embed_tokens(&tokenize_code(text))
+    }
+
+    fn dimension(&self) -> usize {
+        self.max_vocab_size
+    }
+}
+
+impl TfIdfEmbedding {
+    /// [`embed`](EmbeddingProvider::embed) for text already run through
+    /// [`tokenize_code`].
+    fn embed_tokens(&self, tokens: &[String]) -> Vec<f32> {
         let total_terms = tokens.len();
 
         // Count term frequencies
-        let mut term_freq: HashMap<String, usize> = HashMap::new();
-        for token in &tokens {
-            *term_freq.entry(token.clone()).or_insert(0) += 1;
+        let mut term_freq: HashMap<&str, usize> = HashMap::new();
+        for token in tokens {
+            *term_freq.entry(token.as_str()).or_insert(0) += 1;
         }
 
         // Build TF-IDF vector
@@ -175,10 +196,6 @@ impl EmbeddingProvider for TfIdfEmbedding {
         normalize_vector(&mut vector);
 
         vector
-    }
-
-    fn dimension(&self) -> usize {
-        self.max_vocab_size
     }
 }
 
@@ -510,11 +527,14 @@ impl EmbeddingEngine {
         end_line: usize,
         keep_text: bool,
     ) {
-        // Update IDF statistics
-        self.provider.write().add_document(&content);
-
-        // Generate embedding (dense), then pack it sparse before storing.
-        let embedding = to_sparse(&self.provider.read().embed(&content));
+        // Tokenized once: the IDF update and the embedding read the same tokens.
+        let tokens = tokenize_code(&content);
+        let embedding = {
+            let mut provider = self.provider.write();
+            provider.add_document_tokens(&tokens);
+            // Generate embedding (dense), then pack it sparse before storing.
+            to_sparse(&provider.embed_tokens(&tokens))
+        };
 
         let stored_text = if keep_text { content } else { String::new() };
 

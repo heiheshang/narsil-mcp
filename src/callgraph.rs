@@ -7,6 +7,7 @@ pub mod types;
 use crate::FastMap;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -431,8 +432,20 @@ impl CallGraph {
     /// can stream files in chunks and drop each batch's parse trees, instead of
     /// holding every tree in memory at once.
     pub fn collect_functions(&self, files: &[(String, String, Tree)]) -> Result<()> {
-        for (path, content, tree) in files {
-            self.extract_functions(path, content, tree)?;
+        // The walk reads nothing but the file's own tree, so it runs in
+        // parallel. Insertion stays sequential and in file order: the order of
+        // `name_index` candidates and of type declarations is what resolution
+        // sees.
+        let walked: Vec<Vec<CallNode>> = files
+            .par_iter()
+            .map(|(path, content, tree)| {
+                let mut functions = Vec::new();
+                self.walk_for_functions(&mut tree.walk(), content.as_bytes(), path, &mut functions);
+                functions
+            })
+            .collect();
+        for ((path, content, tree), functions) in files.iter().zip(walked) {
+            self.insert_functions(path, content, tree, functions);
         }
         // A "package not in the index" answer cached before this batch may be
         // wrong now, and a directory answer may have become ambiguous.
@@ -447,10 +460,20 @@ impl CallGraph {
     /// gathered by [`collect_functions`](Self::collect_functions) across all
     /// prior batches.
     pub fn collect_calls(&self, files: &[(String, String, Tree)]) -> Result<()> {
-        for (path, content, tree) in files {
-            self.extract_calls(path, content, tree)?;
-        }
-        Ok(())
+        files
+            .par_iter()
+            .try_for_each(|(path, content, tree)| self.collect_file_calls(path, content, tree))
+    }
+
+    /// [`collect_calls`](Self::collect_calls) for one file, for a caller that
+    /// parses files in parallel and drops each tree right after.
+    ///
+    /// Safe to run for many files at once: a file only appends edges to its
+    /// own functions, every other write is a memo of a value that does not
+    /// change once pass 1 is complete, and no map lock is held while another
+    /// is taken for writing.
+    pub fn collect_file_calls(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
+        self.extract_calls(path, content, tree)
     }
 
     /// Remove all functions defined in a file from the call graph.
@@ -521,18 +544,14 @@ impl CallGraph {
         }
     }
 
-    fn extract_functions(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
-        let source = content.as_bytes();
-        let mut cursor = tree.walk();
-        let mut functions = Vec::new();
-
+    /// Record a file's declared types and the functions
+    /// [`walk_for_functions`](Self::walk_for_functions) found in it.
+    fn insert_functions(&self, path: &str, content: &str, tree: &Tree, functions: Vec<CallNode>) {
         // Declarations first: a re-indexed file must not leave the old ones
-        // behind, and the walk below is where the file's own types stop being
-        // whatever a previous version of it said.
+        // behind.
         self.types.remove_file(path);
-        self.types.ingest_file(path, tree.root_node(), source);
-
-        self.walk_for_functions(&mut cursor, source, path, &mut functions);
+        self.types
+            .ingest_file(path, tree.root_node(), content.as_bytes());
 
         for func in &functions {
             let key = Self::definition_key(path, func.receiver.as_deref(), &func.name);
@@ -544,8 +563,6 @@ impl CallGraph {
             .map(|f| Self::definition_key(path, f.receiver.as_deref(), &f.name))
             .collect();
         self.file_functions.insert(path.to_string(), names);
-
-        Ok(())
     }
 
     fn walk_for_functions(
