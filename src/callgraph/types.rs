@@ -21,12 +21,13 @@
 
 use crate::FastMap;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tree_sitter::Node;
 
 /// What a declaration declares. `Alias` is kept because `type Uuid = string`
 /// makes two names for one type, and a method may sit on either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeKind {
     Struct,
     Interface,
@@ -35,7 +36,7 @@ pub enum TypeKind {
 
 /// One field of a struct. `embedded` marks Go's anonymous field — the type is
 /// written without a name, and its methods are promoted onto the outer type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Field {
     pub name: String,
     pub type_name: String,
@@ -46,14 +47,14 @@ pub struct Field {
 /// chain through an interface value (`self.C.Logger().SendError(err)`) gets a
 /// type for its second hop: the interface declares `Logger() *Logger`, and no
 /// implementation has to be found to know that.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceMethod {
     pub name: String,
     pub result: Option<String>,
 }
 
 /// A declared type, stripped to what resolution can act on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeDecl {
     pub name: String,
     pub file_path: String,
@@ -75,6 +76,13 @@ impl TypeDecl {
     }
 }
 
+/// [`TypeIndex`] as plain data, for the call graph snapshot.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct TypeSnapshot {
+    by_name: Vec<(String, Vec<TypeDecl>)>,
+    by_file: Vec<(String, Vec<String>)>,
+}
+
 /// Declared types by name, plus the per-file listing needed to drop a file's
 /// declarations when it is re-indexed.
 #[derive(Default)]
@@ -93,6 +101,41 @@ impl TypeIndex {
 
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
+    }
+
+    /// The index as plain data, keys sorted so equal indexes serialize alike.
+    pub fn to_snapshot(&self) -> TypeSnapshot {
+        let mut by_name: Vec<(String, Vec<TypeDecl>)> = self
+            .by_name
+            .iter()
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().iter().map(|d| (**d).clone()).collect(),
+                )
+            })
+            .collect();
+        by_name.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut by_file: Vec<(String, Vec<String>)> = self
+            .by_file
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        by_file.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        TypeSnapshot { by_name, by_file }
+    }
+
+    /// Replace the index with `snapshot`, keeping the order of every list.
+    pub fn load_snapshot(&self, snapshot: TypeSnapshot) {
+        self.by_name.clear();
+        self.by_file.clear();
+        for (name, decls) in snapshot.by_name {
+            self.by_name
+                .insert(name, decls.into_iter().map(Arc::new).collect());
+        }
+        for (file, names) in snapshot.by_file {
+            self.by_file.insert(file, names);
+        }
     }
 
     /// Number of distinct type names held, for memory reporting.

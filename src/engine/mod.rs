@@ -1204,9 +1204,9 @@ impl CodeIntelEngine {
                         continue;
                     }
                     match store.load_call_graph(repo_path) {
-                        Ok(Some(json)) => {
+                        Ok(Some(snapshot)) => {
                             if let Some(cg) = self.call_graphs.get(&repo_name) {
-                                if let Err(e) = cg.from_json(&json) {
+                                if let Err(e) = cg.from_snapshot(&snapshot, None) {
                                     warn!(
                                         "Failed to load persisted call-graph for {}: {}",
                                         repo_name, e
@@ -1454,6 +1454,27 @@ impl CodeIntelEngine {
             }
         }
 
+        // Same build and not a file added, changed or removed since the last
+        // save: the call graph this walk would build is the persisted one, and
+        // the symbols in SQLite are those the parser would extract. Both are
+        // loaded and nothing is parsed. Files the last save did not record
+        // were unreadable or binary then, and must still be.
+        let graph_loaded = self.options.call_graph_enabled
+            && search_warm
+            && removed_files == 0
+            && same_build.is_some_and(|persisted| {
+                let _span = debug_span!("check_unchanged").entered();
+                files.par_iter().all(|file_path| {
+                    unchanged_since(persisted, file_path)
+                        || (!persisted.files.contains_key(file_path)
+                            && read_indexable_text_file(file_path).is_none())
+                }) && self.load_call_graph_snapshot(path, &repo_name, persisted)
+            });
+        if graph_loaded {
+            info!("{repo_name}: no file changed; call graph loaded from its snapshot");
+        }
+        let reuse = if graph_loaded { same_build } else { reuse };
+
         // Process in chunks so the whole corpus's content + tree-sitter trees
         // are never resident at once. The pre-streaming `collect()` held every
         // file's parse tree simultaneously — the 20 GB OOM on the 1С config.
@@ -1509,25 +1530,43 @@ impl CodeIntelEngine {
                                     && same_build.is_some_and(|persisted| {
                                         unchanged_since(persisted, file_path)
                                     });
-                                let (parsed, reused) = match reusable_symbols(reuse, file_path) {
-                                    Some(symbols) => (
+                                let (parsed, reused) = if graph_loaded {
+                                    // Every file is unchanged and recorded, those
+                                    // without symbols included.
+                                    let symbols = reuse
+                                        .and_then(|persisted| persisted.files.get(file_path))
+                                        .map(|metadata| metadata.symbols.clone());
+                                    let parsed = symbols.and_then(|symbols| {
                                         Some(crate::parser::ParsedFile {
                                             path: file_path.to_string_lossy().to_string(),
-                                            // Ask the parser for the label instead of
-                                            // deriving one from the extension: a warm
-                                            // start must report the same language names
-                                            // as a cold one, not `Rust` beside `rust`.
-                                            language: self
-                                                .parser
-                                                .language_name(file_path)
-                                                .unwrap_or_else(|| "unknown".to_string()),
+                                            language: self.parser.language_name(file_path)?,
                                             symbols,
                                             tree: None,
-                                        }),
-                                        true,
-                                    ),
-                                    None => {
-                                        (self.parser.parse_file(file_path, &content).ok(), false)
+                                        })
+                                    });
+                                    (parsed, true)
+                                } else {
+                                    match reusable_symbols(reuse, file_path) {
+                                        Some(symbols) => (
+                                            Some(crate::parser::ParsedFile {
+                                                path: file_path.to_string_lossy().to_string(),
+                                                // Ask the parser for the label instead of
+                                                // deriving one from the extension: a warm
+                                                // start must report the same language names
+                                                // as a cold one, not `Rust` beside `rust`.
+                                                language: self
+                                                    .parser
+                                                    .language_name(file_path)
+                                                    .unwrap_or_else(|| "unknown".to_string()),
+                                                symbols,
+                                                tree: None,
+                                            }),
+                                            true,
+                                        ),
+                                        None => (
+                                            self.parser.parse_file(file_path, &content).ok(),
+                                            false,
+                                        ),
                                     }
                                 };
                                 metrics.record_file_parse(parse_start.elapsed());
@@ -1765,7 +1804,7 @@ impl CodeIntelEngine {
             // only resolved; any other is re-parsed, resolved and its tree
             // dropped on the same worker (call graph is opt-in, so the double
             // parse only happens for it).
-            if let Some(cg) = call_graph.as_ref() {
+            if let Some(cg) = call_graph.as_ref().filter(|_| !graph_loaded) {
                 let _calls_span = debug_span!("callgraph_calls", files = files.len()).entered();
                 debug!(
                     "Resolving call sites across {} files, {} symbols",
@@ -1946,6 +1985,38 @@ impl CodeIntelEngine {
             };
 
         graph.bulk_load(symbol_quads.chain(repo_quads))
+    }
+
+    /// Load the call-graph snapshot saved with `persisted` into this
+    /// repository's graph. False when there is none, it is from another save,
+    /// or it cannot be read; the graph is then left as it was.
+    fn load_call_graph_snapshot(
+        &self,
+        path: &Path,
+        repo_name: &str,
+        persisted: &PersistedIndex,
+    ) -> bool {
+        let _span = debug_span!("load_call_graph").entered();
+        if persisted.call_graph_stamp.is_empty() {
+            return false;
+        }
+        let (Some(store), Some(cg)) = (self.index_store.as_ref(), self.call_graphs.get(repo_name))
+        else {
+            return false;
+        };
+        let snapshot = match store.load_call_graph(path) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!("Failed to read call-graph snapshot for {repo_name}: {e}");
+                return false;
+            }
+        };
+        cg.from_snapshot(&snapshot, Some(&persisted.call_graph_stamp))
+            .unwrap_or_else(|e| {
+                warn!("Failed to load call-graph snapshot for {repo_name}: {e}");
+                false
+            })
     }
 
     /// Without `prepared.search` the search index already holds this document
@@ -3513,15 +3584,26 @@ impl CodeIntelEngine {
                 .unwrap_or("unknown")
                 .to_string();
 
+            // Unique per save, so a warm start can tell this snapshot and this
+            // SQLite index apart from either one of an earlier save.
+            let call_graph_stamp = if self.options.call_graph_enabled {
+                let nanos = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}/{nanos}", crate::persist::current_build_id())
+            } else {
+                String::new()
+            };
+
             // The call graph goes to its own file, so it is written while the
             // SQLite index below is.
             let persisted = std::thread::scope(|scope| {
                 if self.options.call_graph_enabled {
                     scope.spawn(|| {
                         if let Some(cg) = self.call_graphs.get(&repo_name) {
-                            match cg.to_json() {
-                                Ok(json) => {
-                                    if let Err(e) = store.save_call_graph(repo_path, &json) {
+                            match cg.to_snapshot(&call_graph_stamp) {
+                                Ok(snapshot) => {
+                                    if let Err(e) = store.save_call_graph(repo_path, &snapshot) {
                                         warn!("Failed to save call-graph for {}: {}", repo_name, e);
                                     }
                                 }
@@ -3534,6 +3616,7 @@ impl CodeIntelEngine {
                 // Create a persisted index from current state
                 let mut persisted = PersistedIndex::new(repo_path.clone());
                 persisted.build_id = crate::persist::current_build_id();
+                persisted.call_graph_stamp = call_graph_stamp.clone();
 
                 // Group symbols by file path
                 let mut by_file: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
@@ -8989,6 +9072,18 @@ impl CodeIntelEngine {
     // ========================================================================
     // Graph Visualization Helper Methods
     // ========================================================================
+
+    /// The repository's call graph as snapshot bytes, for comparing graphs.
+    #[doc(hidden)]
+    pub fn call_graph_snapshot(&self, repo: &str) -> Option<Vec<u8>> {
+        self.call_graphs.get(repo)?.to_snapshot("").ok()
+    }
+
+    /// All symbols of the repository, in index order, for comparing runs.
+    #[doc(hidden)]
+    pub fn repo_symbols(&self, repo: &str) -> Option<Vec<Symbol>> {
+        self.symbols.get(repo).map(|symbols| symbols.clone())
+    }
 
     /// Get call graph data for visualization
     /// Returns a reference to the call graph for the given repository

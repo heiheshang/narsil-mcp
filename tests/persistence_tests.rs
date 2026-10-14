@@ -3,7 +3,7 @@ use narsil_mcp::engine::FindSymbolsQuery;
 use narsil_mcp::lsp::LspConfig;
 use narsil_mcp::neural::NeuralConfig;
 use narsil_mcp::streaming::StreamingConfig;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Test helper to create a temporary test repository
@@ -897,6 +897,112 @@ async fn test_warm_call_graph_start_keeps_search_documents() -> Result<()> {
     );
     assert!(warm.contains("notes.txt"), "warm:\n{warm}");
     assert!(warm.contains("calculate_invoice_total"), "warm:\n{warm}");
+
+    Ok(())
+}
+
+/// With `--call-graph`, a warm start in which no file changed loads the call
+/// graph from its snapshot instead of parsing: the graph and the symbols must
+/// be exactly those of a cold start. A changed file, or a snapshot from
+/// another save, must send it back to parsing.
+#[tokio::test]
+async fn test_warm_start_loads_unchanged_call_graph() -> Result<()> {
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "svc/service.go",
+        "package svc\n\ntype Repo struct{}\n\nfunc (r *Repo) Find(id int) int { return id }\n\n\
+         type Service struct {\n\trepo *Repo\n}\n\n\
+         func (s *Service) Run(id int) int { return s.repo.Find(id) }\n\n\
+         func NewService() *Service { return &Service{repo: &Repo{}} }\n",
+    )?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        "pub fn total(items: &[i32]) -> i32 { helper(items) }\nfn helper(items: &[i32]) -> i32 { items.iter().sum() }\n",
+    )?;
+    repo.add_rust_file(
+        "CommonModules/Общий/Ext/Module.bsl",
+        "Процедура Выполнить() Экспорт\n\tПосчитать();\nКонецПроцедуры\n\n\
+         Процедура Посчитать()\nКонецПроцедуры\n",
+    )?;
+    std::fs::write(repo.path().join("notes.txt"), "plain text\n")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: true,
+        persist_enabled: true,
+        watch_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+    let repo_name = repo
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+    let start = || async {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            options.clone(),
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        anyhow::Ok((
+            engine.call_graph_snapshot(&repo_name).unwrap(),
+            format!("{:?}", engine.repo_symbols(&repo_name).unwrap()),
+        ))
+    };
+    let snapshot_file = || -> Result<PathBuf> {
+        Ok(std::fs::read_dir(index_dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.to_string_lossy().ends_with(".callgraph.bin"))
+            .expect("call-graph snapshot saved"))
+    };
+
+    let cold = start().await?;
+    assert!(!cold.0.is_empty());
+    let saved = std::fs::read(snapshot_file()?)?;
+
+    let warm = start().await?;
+    assert!(
+        warm.0 == cold.0,
+        "warm call graph differs from the cold one"
+    );
+    assert_eq!(warm.1, cold.1);
+    assert_eq!(
+        std::fs::read(snapshot_file()?)?,
+        saved,
+        "nothing changed, so nothing is saved"
+    );
+
+    // A snapshot of another save (here: one with its stamp altered) is not
+    // trusted; the graph is rebuilt from source and still the cold one.
+    let mut foreign = saved.clone();
+    let stamp_byte = foreign.iter().position(|b| *b == b'/').expect("stamp");
+    foreign[stamp_byte + 1] ^= 1;
+    std::fs::write(snapshot_file()?, &foreign)?;
+    let rebuilt = start().await?;
+    assert!(rebuilt.0 == cold.0, "graph rebuilt from source differs");
+    assert_eq!(rebuilt.1, cold.1);
+
+    // A changed file is parsed again: its new call shows up.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.add_rust_file(
+        "src/lib.rs",
+        "pub fn total(items: &[i32]) -> i32 { helper(items) + extra() }\nfn helper(items: &[i32]) -> i32 { items.iter().sum() }\nfn extra() -> i32 { 1 }\n",
+    )?;
+    let changed = start().await?;
+    assert!(
+        changed.0 != cold.0,
+        "changed file did not reach the call graph"
+    );
+    assert!(changed.1.contains("extra"));
 
     Ok(())
 }

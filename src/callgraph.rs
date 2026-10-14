@@ -44,7 +44,7 @@ pub struct CallNode {
     /// platform runs this procedure when `Имя` of the extended module is
     /// called, so nothing in the source calls it by its own name;
     /// [`CallGraph::link_extensions`] turns this into edges.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub intercepts: Option<String>,
 }
 
@@ -187,6 +187,16 @@ pub struct FunctionMetrics {
     pub returns: usize,
     /// Cognitive complexity
     pub cognitive: usize,
+}
+
+/// What [`CallGraph::to_snapshot`] writes.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    stamp: String,
+    nodes: Vec<(String, CallNode)>,
+    name_index: Vec<(String, Vec<String>)>,
+    file_functions: Vec<(String, Vec<String>)>,
+    types: types::TypeSnapshot,
 }
 
 /// BSL module name (lowercased path segment) -> files under it.
@@ -4145,47 +4155,68 @@ impl CallGraph {
         (self.nodes.len(), edges, bytes)
     }
 
-    /// Serialize call graph to JSON
-    pub fn to_json(&self) -> Result<String> {
-        let nodes: Vec<(String, CallNode)> = self
-            .nodes
-            .iter()
-            .map(|ref_multi| (ref_multi.key().clone(), ref_multi.value().clone()))
-            .collect();
-        serde_json::to_string(&nodes).map_err(|e| anyhow!("Failed to serialize call-graph: {}", e))
+    /// The graph as postcard bytes, carrying `stamp` to tie it to the index
+    /// saved with it. Keys are sorted so that equal graphs give equal bytes;
+    /// every list keeps its order, `name_index` included, which decides
+    /// between namesakes.
+    pub fn to_snapshot(&self, stamp: &str) -> Result<Vec<u8>> {
+        fn sorted<V: Clone>(map: &FastMap<String, V>) -> Vec<(String, V)> {
+            let mut entries: Vec<(String, V)> = map
+                .iter()
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            entries
+        }
+        let snapshot = Snapshot {
+            stamp: stamp.to_string(),
+            nodes: sorted(&self.nodes),
+            name_index: sorted(&self.name_index),
+            file_functions: sorted(&self.file_functions),
+            types: self.types.to_snapshot(),
+        };
+        postcard::to_stdvec(&snapshot).map_err(|e| anyhow!("Failed to serialize call-graph: {e}"))
     }
 
-    /// Replace this graph's contents with the serialized one.
+    /// Replace this graph's contents with the snapshot, provided it carries
+    /// `stamp` (any snapshot when `None`). Returns whether it was loaded; a
+    /// snapshot with another stamp leaves the graph untouched.
     ///
     /// Replacement, not a merge. Merging into a graph that was just built from
     /// source can only contribute staleness: a function deleted from the code
-    /// comes back from the snapshot, outlives `find_symbols`, and `to_json`
-    /// writes it out again on the next save, so the phantom is self-sustaining.
+    /// comes back from the snapshot, outlives `find_symbols`, and the next
+    /// save writes it out again, so the phantom is self-sustaining.
     ///
-    /// `file_functions` is rebuilt from the loaded nodes as well. Without it
-    /// the incremental re-index cannot evict anything that arrived this way —
+    /// `file_functions` comes back as well. Without it the incremental
+    /// re-index cannot evict anything that arrived this way —
     /// `remove_functions_for_file` looks the file up there and finds nothing.
-    pub fn from_json(&self, json: &str) -> Result<()> {
-        let nodes: Vec<(String, CallNode)> = serde_json::from_str(json)
-            .map_err(|e| anyhow!("Failed to deserialize call-graph: {}", e))?;
+    pub fn from_snapshot(&self, bytes: &[u8], stamp: Option<&str>) -> Result<bool> {
+        let snapshot: Snapshot = postcard::from_bytes(bytes)
+            .map_err(|e| anyhow!("Failed to deserialize call-graph: {e}"))?;
+        if stamp.is_some_and(|wanted| wanted != snapshot.stamp) {
+            return Ok(false);
+        }
 
         self.nodes.clear();
         self.name_index.clear();
         self.file_functions.clear();
+        self.file_path_lower_cache.clear();
+        self.import_dir_cache.clear();
+        self.implements_cache.clear();
+        self.interface_methods_cache.clear();
         self.drop_bsl_module_files();
 
-        let mut per_file: HashMap<String, Vec<String>> = HashMap::new();
-        for (key, node) in nodes {
-            per_file
-                .entry(node.file_path.clone())
-                .or_default()
-                .push(key.clone());
-            self.insert_node(key, node);
+        for (key, node) in snapshot.nodes {
+            self.nodes.insert(key, node);
         }
-        for (path, keys) in per_file {
+        for (name, keys) in snapshot.name_index {
+            self.name_index.insert(name, keys);
+        }
+        for (path, keys) in snapshot.file_functions {
             self.file_functions.insert(path, keys);
         }
-        Ok(())
+        self.types.load_snapshot(snapshot.types);
+        Ok(true)
     }
 
     /// Get all nodes (for iteration)
@@ -5745,9 +5776,9 @@ mod tests {
             node("new", "src/cache.rs", Some("Cache")),
         );
 
-        let snapshot = graph.to_json().unwrap();
-        graph.from_json(&snapshot).unwrap();
-        graph.from_json(&snapshot).unwrap();
+        let snapshot = graph.to_snapshot("").unwrap();
+        graph.from_snapshot(&snapshot, None).unwrap();
+        graph.from_snapshot(&snapshot, None).unwrap();
 
         assert_eq!(
             graph.name_index.get("new").map(|c| c.len()),
@@ -5762,9 +5793,9 @@ mod tests {
     /// The snapshot replaces the graph instead of being merged into it. A
     /// function deleted from the source used to come back from disk on every
     /// warm start, outlive `find_symbols`, and be written out again by the
-    /// next `to_json` — a phantom that sustained itself.
+    /// next save — a phantom that sustained itself.
     #[test]
-    fn test_from_json_replaces_rather_than_merges() {
+    fn test_from_snapshot_replaces_rather_than_merges() {
         let stale = CallGraph::new();
         stale.insert_node(
             CallGraph::qualified_key("src/lib.rs", "deleted_fn"),
@@ -5774,7 +5805,15 @@ mod tests {
             CallGraph::qualified_key("src/lib.rs", "kept_fn"),
             node("kept_fn", "src/lib.rs", None),
         );
-        let snapshot = stale.to_json().unwrap();
+        // As a walk registers them.
+        stale.file_functions.insert(
+            "src/lib.rs".to_string(),
+            vec![
+                CallGraph::qualified_key("src/lib.rs", "deleted_fn"),
+                CallGraph::qualified_key("src/lib.rs", "kept_fn"),
+            ],
+        );
+        let snapshot = stale.to_snapshot("").unwrap();
 
         // The graph as rebuilt from source after `deleted_fn` was removed.
         let fresh = CallGraph::new();
@@ -5782,14 +5821,14 @@ mod tests {
             CallGraph::qualified_key("src/lib.rs", "kept_fn"),
             node("kept_fn", "src/lib.rs", None),
         );
-        fresh.from_json(&snapshot).unwrap();
+        fresh.from_snapshot(&snapshot, None).unwrap();
 
         // Loading a snapshot means adopting it wholesale...
         assert_eq!(fresh.node_count(), 2);
 
         // ...and what it brings must be evictable, which needs `file_functions`
-        // populated — `remove_functions_for_file` is the only thing standing
-        // between an incremental re-index and a permanent phantom.
+        // to come with it — `remove_functions_for_file` is the only thing
+        // standing between an incremental re-index and a permanent phantom.
         fresh.remove_functions_for_file("src/lib.rs").unwrap();
         assert_eq!(
             fresh.node_count(),
@@ -5861,11 +5900,17 @@ mod tests {
             CallGraph::qualified_key("src/lib.rs", "gone"),
             node("gone", "src/lib.rs", None),
         );
+        source.file_functions.insert(
+            "src/lib.rs".to_string(),
+            vec![CallGraph::qualified_key("src/lib.rs", "gone")],
+        );
 
-        // Round-trip so `file_functions` knows the file, as it does after a
-        // real walk; then re-index the file to nothing.
+        // Round-trip so the graph knows the file as it does after a real
+        // walk; then re-index the file to nothing.
         let graph = CallGraph::new();
-        graph.from_json(&source.to_json().unwrap()).unwrap();
+        graph
+            .from_snapshot(&source.to_snapshot("").unwrap(), None)
+            .unwrap();
         graph.remove_functions_for_file("src/lib.rs").unwrap();
         assert_eq!(graph.node_count(), 0);
 
