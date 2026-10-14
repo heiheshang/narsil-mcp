@@ -263,6 +263,16 @@ struct FileScope<'a> {
     imports: &'a HashMap<String, String>,
 }
 
+/// A call site of a file whose calls are resolved after its tree is gone;
+/// see [`CallGraph::pending_file_calls`].
+pub struct PendingCall {
+    caller: String,
+    edge: CallEdge,
+    scope_inferred: bool,
+    /// An `ОписаниеОповещения` handler rather than a call.
+    callback: bool,
+}
+
 /// What a name in the enclosing function stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalKind {
@@ -489,6 +499,52 @@ impl CallGraph {
     /// is taken for writing.
     pub fn collect_file_calls(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
         self.extract_calls(path, content, tree)
+    }
+
+    /// Whether a file's call sites can be read in pass 1 and resolved in
+    /// pass 2 without its tree: BSL, where neither imports nor the declared
+    /// types of locals take part in resolution.
+    pub fn defers_calls(path: &str) -> bool {
+        path.ends_with(".bsl") || path.ends_with(".os")
+    }
+
+    /// The call sites of a [`defers_calls`](Self::defers_calls) file, read
+    /// while its tree is at hand, for
+    /// [`resolve_pending_calls`](Self::resolve_pending_calls) once every
+    /// function is known. Spares pass 2 parsing the file again.
+    pub fn pending_file_calls(&self, path: &str, content: &str, tree: &Tree) -> Vec<PendingCall> {
+        let file = FileScope {
+            path,
+            imports: &HashMap::new(),
+        };
+        let mut pending = Some(Vec::new());
+        self.walk_for_calls(
+            &mut tree.walk(),
+            content.as_bytes(),
+            &file,
+            &mut FnScope::default(),
+            &mut HashMap::new(),
+            "",
+            &mut pending,
+        );
+        pending.unwrap_or_default()
+    }
+
+    /// Pass 2 for the call sites [`pending_file_calls`](Self::pending_file_calls)
+    /// read from `path`.
+    pub fn resolve_pending_calls(&self, path: &str, calls: Vec<PendingCall>) {
+        let file = FileScope {
+            path,
+            imports: &HashMap::new(),
+        };
+        for call in calls {
+            let (callee_key, resolution) = if call.callback {
+                self.resolve_bsl_callback(&call.edge, path)
+            } else {
+                self.resolve_call_site(&file, &call.edge, call.scope_inferred, None)
+            };
+            self.push_call(&call.caller, call.edge, callee_key, resolution);
+        }
     }
 
     /// Edges for BSL extension procedures, which no source line calls by
@@ -1258,6 +1314,7 @@ impl CallGraph {
             &mut scope,
             &mut package_locals,
             "",
+            &mut None,
         );
 
         Ok(())
@@ -1267,6 +1324,9 @@ impl CallGraph {
     /// its receiver type for `self` call sites and the declared types of its
     /// parameters and locals (see [`scope_hint_from`](Self::scope_hint_from)
     /// and [`collect_local_types`](Self::collect_local_types)).
+    ///
+    /// With `pending` the call sites are collected there instead of resolved.
+    #[allow(clippy::too_many_arguments)]
     fn walk_for_calls(
         &self,
         cursor: &mut tree_sitter::TreeCursor,
@@ -1275,6 +1335,7 @@ impl CallGraph {
         scope: &mut FnScope,
         package_locals: &mut HashMap<String, LocalKind>,
         parent_kind: &str,
+        pending: &mut Option<Vec<PendingCall>>,
     ) {
         loop {
             let node = cursor.node();
@@ -1358,75 +1419,44 @@ impl CallGraph {
                 if let Some(ref caller_key) = scope.function {
                     if let Some((edge, scope_inferred)) = self.extract_call_edge(node, source, ctx)
                     {
-                        // A qualifier naming a local variable or parameter
-                        // carries its declared type a few lines up. Taken only
-                        // when a namesake really is defined on that type — the
-                        // reading of the declaration is shallow (see
-                        // `collect_local_types`), so a miss must cost nothing.
-                        let hint = edge.scope_hint.as_deref();
-                        let by_local = hint
-                            .and_then(|hint| ctx.local_type(hint))
-                            .map(|declared| {
-                                self.resolve_scoped_callee(
-                                    &edge.target,
-                                    ctx.file,
-                                    Some(declared),
-                                    false,
-                                )
-                            })
-                            .filter(|(_, resolution)| *resolution == CallResolution::Receiver)
-                            // A name declared as something outside this
-                            // repository answers the question by itself: the
-                            // call leaves the graph.
-                            .or_else(|| {
-                                hint.filter(|hint| ctx.is_foreign_local(hint))
-                                    .map(|_| (edge.target.clone(), CallResolution::ExternalPackage))
-                            });
-
-                        // A qualifier that is not a shadowing local names an
-                        // imported package: `config.Get()` is a call into this
-                        // repository's `internal/config`, and `assert.Len(...)`
-                        // is a call into testify — which the graph must report
-                        // as absent rather than as some `Len` of this
-                        // repository. This runs *before* the general
-                        // resolution, not as a fallback for its weak answers:
-                        // a package-qualified name with a single namesake in
-                        // the index would otherwise be answered `Unique`,
-                        // which is the same wrong target stated as a fact.
-                        let by_package = by_local.is_none().then_some(()).and_then(|_| {
-                            let import_path = edge
-                                .scope_hint
-                                .as_deref()
-                                .and_then(|hint| file.imports.get(hint))?;
-                            self.resolve_package_qualified(&edge.target, import_path)
-                        });
-
-                        let by_module = (by_local.is_none() && by_package.is_none())
-                            .then(|| {
-                                self.resolve_bsl_module_variable(&edge, file.path)
-                                    .or_else(|| self.resolve_bsl_module_qualified(&edge, file.path))
-                            })
-                            .flatten();
-
-                        // Resolve callee with scope hint for disambiguation
-                        let (callee_key, resolution) = match by_local.or(by_package).or(by_module) {
-                            Some(resolved) => resolved,
-                            None => self.refine_by_call_syntax(
-                                file.path,
-                                &edge.target,
-                                edge.call_type,
-                                edge.scope_hint.as_deref(),
+                        if let Some(pending) = pending.as_mut() {
+                            pending.push(PendingCall {
+                                caller: caller_key.clone(),
+                                edge,
                                 scope_inferred,
-                                self.resolve_scoped_callee(
-                                    &edge.target,
-                                    file.path,
-                                    edge.scope_hint.as_deref(),
-                                    scope_inferred,
-                                ),
-                            ),
-                        };
+                                callback: false,
+                            });
+                        } else {
+                            // A qualifier naming a local variable or parameter
+                            // carries its declared type a few lines up. Taken only
+                            // when a namesake really is defined on that type — the
+                            // reading of the declaration is shallow (see
+                            // `collect_local_types`), so a miss must cost nothing.
+                            let hint = edge.scope_hint.as_deref();
+                            let by_local = hint
+                                .and_then(|hint| ctx.local_type(hint))
+                                .map(|declared| {
+                                    self.resolve_scoped_callee(
+                                        &edge.target,
+                                        ctx.file,
+                                        Some(declared),
+                                        false,
+                                    )
+                                })
+                                .filter(|(_, resolution)| *resolution == CallResolution::Receiver)
+                                // A name declared as something outside this
+                                // repository answers the question by itself: the
+                                // call leaves the graph.
+                                .or_else(|| {
+                                    hint.filter(|hint| ctx.is_foreign_local(hint)).map(|_| {
+                                        (edge.target.clone(), CallResolution::ExternalPackage)
+                                    })
+                                });
 
-                        self.push_call(caller_key, edge, callee_key, resolution);
+                            let (callee_key, resolution) =
+                                self.resolve_call_site(file, &edge, scope_inferred, by_local);
+                            self.push_call(caller_key, edge, callee_key, resolution);
+                        }
                     }
                 }
             }
@@ -1436,6 +1466,15 @@ impl CallGraph {
             {
                 if let Some(ref caller_key) = scope.function {
                     for edge in Self::bsl_notify_description_edges(node, source, ctx) {
+                        if let Some(pending) = pending.as_mut() {
+                            pending.push(PendingCall {
+                                caller: caller_key.clone(),
+                                edge,
+                                scope_inferred: false,
+                                callback: true,
+                            });
+                            continue;
+                        }
                         let (callee_key, resolution) = self.resolve_bsl_callback(&edge, file.path);
                         self.push_call(caller_key, edge, callee_key, resolution);
                     }
@@ -1444,7 +1483,8 @@ impl CallGraph {
 
             // Handle macro invocations (opaque token trees in tree-sitter)
             // Extract call patterns from macro body text
-            if kind == "macro_invocation" {
+            // Rust only, so never in a file whose calls are pending.
+            if kind == "macro_invocation" && pending.is_none() {
                 if let Some(ref caller_key) = scope.function {
                     if let Ok(macro_text) = node.utf8_text(source) {
                         let macro_line = node.start_position().row + 1;
@@ -1457,13 +1497,74 @@ impl CallGraph {
 
             // Recurse
             if cursor.goto_first_child() {
-                self.walk_for_calls(cursor, source, file, scope, package_locals, node.kind());
+                self.walk_for_calls(
+                    cursor,
+                    source,
+                    file,
+                    scope,
+                    package_locals,
+                    node.kind(),
+                    pending,
+                );
                 cursor.goto_parent();
             }
 
             if !cursor.goto_next_sibling() {
                 break;
             }
+        }
+    }
+
+    /// Resolve a call site after the local-variable step (`by_local`), which
+    /// needs the scope of the walk.
+    fn resolve_call_site(
+        &self,
+        file: &FileScope,
+        edge: &CallEdge,
+        scope_inferred: bool,
+        by_local: Option<(String, CallResolution)>,
+    ) -> (String, CallResolution) {
+        // A qualifier that is not a shadowing local names an
+        // imported package: `config.Get()` is a call into this
+        // repository's `internal/config`, and `assert.Len(...)`
+        // is a call into testify — which the graph must report
+        // as absent rather than as some `Len` of this
+        // repository. This runs *before* the general
+        // resolution, not as a fallback for its weak answers:
+        // a package-qualified name with a single namesake in
+        // the index would otherwise be answered `Unique`,
+        // which is the same wrong target stated as a fact.
+        let by_package = by_local.is_none().then_some(()).and_then(|_| {
+            let import_path = edge
+                .scope_hint
+                .as_deref()
+                .and_then(|hint| file.imports.get(hint))?;
+            self.resolve_package_qualified(&edge.target, import_path)
+        });
+
+        let by_module = (by_local.is_none() && by_package.is_none())
+            .then(|| {
+                self.resolve_bsl_module_variable(edge, file.path)
+                    .or_else(|| self.resolve_bsl_module_qualified(edge, file.path))
+            })
+            .flatten();
+
+        // Resolve callee with scope hint for disambiguation
+        match by_local.or(by_package).or(by_module) {
+            Some(resolved) => resolved,
+            None => self.refine_by_call_syntax(
+                file.path,
+                &edge.target,
+                edge.call_type,
+                edge.scope_hint.as_deref(),
+                scope_inferred,
+                self.resolve_scoped_callee(
+                    &edge.target,
+                    file.path,
+                    edge.scope_hint.as_deref(),
+                    scope_inferred,
+                ),
+            ),
         }
     }
 

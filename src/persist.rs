@@ -207,6 +207,24 @@ impl IndexStore {
         Ok(PersistedIndex::new(repo_root.to_path_buf()))
     }
 
+    /// Content hash, mtime and size of every file recorded for `repo_root`,
+    /// without its symbols.
+    pub fn file_hashes(&self, repo_root: &Path) -> Result<HashMap<PathBuf, (String, u64, u64)>> {
+        let db_path = self.db_path(repo_root);
+        let mut hashes = HashMap::new();
+        if !db_path.exists() {
+            return Ok(hashes);
+        }
+        let store = SqliteStore::open(&db_path)?;
+        store.for_each_file(&Self::repo_key(repo_root), |f| {
+            hashes.insert(
+                PathBuf::from(f.path),
+                (f.content_hash, f.modified_time, f.size),
+            );
+        })?;
+        Ok(hashes)
+    }
+
     /// Rebuild an in-memory `PersistedIndex` from the SQLite store.
     ///
     /// File metadata rows are read first (keyed by absolute path), then symbols

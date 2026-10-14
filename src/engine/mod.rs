@@ -1339,6 +1339,9 @@ impl CodeIntelEngine {
         let mut symbols_vec: Vec<Symbol> = Vec::new();
         let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
         let mut normalized_docs_vec: Vec<NormalizedDocument> = Vec::new();
+        let mut pending_calls: Vec<(String, Vec<crate::callgraph::PendingCall>)> = Vec::new();
+        let mut deferred_files: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
         let mut file_count = 0;
         let mut total_lines = 0;
         let mut reparsed_files = 0usize;
@@ -1548,6 +1551,19 @@ impl CodeIntelEngine {
                                             })
                                             .collect();
                                 }
+                                if let (Some(cg), Some(tree)) = (
+                                    call_graph.as_ref(),
+                                    parsed.as_ref().and_then(|parsed| parsed.tree.as_ref()),
+                                ) {
+                                    let relative = file_path
+                                        .strip_prefix(path)
+                                        .unwrap_or(file_path)
+                                        .to_string_lossy();
+                                    if CallGraph::defers_calls(&relative) {
+                                        prepared.pending_calls =
+                                            Some(cg.pending_file_calls(&relative, &content, tree));
+                                    }
+                                }
                                 Some((
                                     file_path.clone(),
                                     content,
@@ -1700,6 +1716,10 @@ impl CodeIntelEngine {
                         // Index the whole file into search only when the parser
                         // extracted no symbols (text-only / unsupported languages).
                         // Parsed files index per-symbol cards above instead.
+                        if let Some(calls) = prepared.pending_calls {
+                            pending_calls.push((relative_path.clone(), calls));
+                            deferred_files.insert(file_path.clone());
+                        }
                         if let Some(cg) = call_graph.as_ref() {
                             for entry in prepared.platform_entries {
                                 cg.add_platform_entry(
@@ -1741,7 +1761,8 @@ impl CodeIntelEngine {
             })?;
 
             // Call-graph pass 2: call sites, resolved against every function
-            // gathered in pass 1. Each file is re-parsed, resolved and its tree
+            // gathered in pass 1. Files whose sites pass 1 already read are
+            // only resolved; any other is re-parsed, resolved and its tree
             // dropped on the same worker (call graph is opt-in, so the double
             // parse only happens for it).
             if let Some(cg) = call_graph.as_ref() {
@@ -1751,7 +1772,15 @@ impl CodeIntelEngine {
                     files.len(),
                     symbols_vec.len()
                 );
+                pending_calls
+                    .into_par_iter()
+                    .for_each(|(relative_path, calls)| {
+                        cg.resolve_pending_calls(&relative_path, calls)
+                    });
                 files.par_iter().try_for_each(|file_path| {
+                    if deferred_files.contains(file_path) {
+                        return Ok(());
+                    }
                     let Some(content) = read_indexable_text_file(file_path) else {
                         return Ok(());
                     };
@@ -3484,6 +3513,14 @@ impl CodeIntelEngine {
                 }
             }
 
+            // A file whose size and mtime match the last save keeps its hash, as
+            // `needs_reindex` trusts them: hashing all of a 1C dump again took
+            // a minute on every restart after a deploy.
+            let previous = store.file_hashes(repo_path).unwrap_or_else(|e| {
+                warn!("Failed to read file hashes for {}: {}", repo_name, e);
+                HashMap::new()
+            });
+
             // Create file metadata for each file
             persisted.files = by_file
                 .into_par_iter()
@@ -3496,7 +3533,16 @@ impl CodeIntelEngine {
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
 
-                    let content_hash = if let Ok(content) = std::fs::read(&full_path) {
+                    let size = metadata.len();
+                    let known = previous
+                        .get(&full_path)
+                        .filter(|(_, prev_modified, prev_size)| {
+                            *prev_modified == modified && *prev_size == size
+                        })
+                        .map(|(hash, _, _)| hash.clone());
+                    let content_hash = if let Some(hash) = known {
+                        hash
+                    } else if let Ok(content) = std::fs::read(&full_path) {
                         use sha2::{Digest, Sha256};
                         let mut hasher = Sha256::new();
                         hasher.update(&content);
@@ -3511,7 +3557,7 @@ impl CodeIntelEngine {
                             path: full_path,
                             content_hash,
                             modified_time: modified,
-                            size: metadata.len(),
+                            size,
                             symbols: file_symbols,
                         },
                     ))
@@ -10494,6 +10540,9 @@ struct PreparedDocuments {
     platform_entries: Vec<crate::ingest::onec::PlatformEntryPoint>,
     /// Normalized 1C metadata documents built from this XML.
     normalized: Vec<PreparedNormalized>,
+    /// Call sites read off the tree, when pass 2 resolves them without
+    /// parsing the file again (see [`CallGraph::defers_calls`]).
+    pending_calls: Option<Vec<crate::callgraph::PendingCall>>,
 }
 
 struct PreparedSymbol {
@@ -10512,6 +10561,7 @@ impl PreparedDocuments {
                 file_len: into_search.then(|| token_count(content)),
                 platform_entries: Vec::new(),
                 normalized: Vec::new(),
+                pending_calls: None,
             };
         };
         let symbols = parsed
@@ -10536,6 +10586,7 @@ impl PreparedDocuments {
             file_len: None,
             platform_entries: Vec::new(),
             normalized: Vec::new(),
+            pending_calls: None,
         }
     }
 }
