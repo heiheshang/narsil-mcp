@@ -189,14 +189,65 @@ pub struct FunctionMetrics {
     pub cognitive: usize,
 }
 
-/// What [`CallGraph::to_snapshot`] writes.
+/// What [`CallGraph::to_snapshot`] writes after the stamp. The names, paths
+/// and targets that every edge repeats are stored once, in `strings`, and
+/// referred to by index.
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
-    stamp: String,
-    nodes: Vec<(String, CallNode)>,
-    name_index: Vec<(String, Vec<String>)>,
-    file_functions: Vec<(String, Vec<String>)>,
+    strings: Vec<String>,
+    nodes: Vec<SnapshotNode>,
+    name_index: Vec<(u32, Vec<u32>)>,
+    file_functions: Vec<(u32, Vec<u32>)>,
     types: types::TypeSnapshot,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotNode {
+    key: u32,
+    name: u32,
+    file_path: u32,
+    line: usize,
+    calls: Vec<SnapshotEdge>,
+    metrics: FunctionMetrics,
+    receiver: Option<String>,
+    result_type: Option<String>,
+    intercepts: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotEdge {
+    target: u32,
+    /// `None` when the call is in the file of the function making it.
+    file_path: Option<u32>,
+    line: usize,
+    column: usize,
+    call_type: CallType,
+    scope_hint: Option<u32>,
+    resolved: bool,
+    resolution: CallResolution,
+}
+
+/// Index of each distinct string, in first-seen order.
+#[derive(Default)]
+struct StringTable {
+    strings: Vec<String>,
+    index: ahash::AHashMap<String, u32>,
+}
+
+impl StringTable {
+    fn id(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.index.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.index.insert(s.to_string(), id);
+        id
+    }
+
+    fn ids(&mut self, list: &[String]) -> Vec<u32> {
+        list.iter().map(|s| self.id(s)).collect()
+    }
 }
 
 /// BSL module name (lowercased path segment) -> files under it.
@@ -4160,22 +4211,90 @@ impl CallGraph {
     /// every list keeps its order, `name_index` included, which decides
     /// between namesakes.
     pub fn to_snapshot(&self, stamp: &str) -> Result<Vec<u8>> {
-        fn sorted<V: Clone>(map: &FastMap<String, V>) -> Vec<(String, V)> {
-            let mut entries: Vec<(String, V)> = map
-                .iter()
-                .map(|e| (e.key().clone(), e.value().clone()))
-                .collect();
-            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            entries
+        fn sorted_keys<V>(map: &FastMap<String, V>) -> Vec<String> {
+            let mut keys: Vec<String> = map.iter().map(|e| e.key().clone()).collect();
+            keys.sort_unstable();
+            keys
         }
+        let mut table = StringTable::default();
+
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for key in sorted_keys(&self.nodes) {
+            let Some(node) = self.nodes.get(&key) else {
+                continue;
+            };
+            let CallNode {
+                name,
+                file_path,
+                line,
+                calls,
+                metrics,
+                receiver,
+                result_type,
+                intercepts,
+            } = &*node;
+            let calls = calls
+                .iter()
+                .map(|edge| {
+                    let CallEdge {
+                        target,
+                        file_path: edge_file,
+                        line,
+                        column,
+                        call_type,
+                        scope_hint,
+                        resolved,
+                        resolution,
+                    } = edge;
+                    SnapshotEdge {
+                        target: table.id(target),
+                        file_path: (edge_file != file_path).then(|| table.id(edge_file)),
+                        line: *line,
+                        column: *column,
+                        call_type: *call_type,
+                        scope_hint: scope_hint.as_deref().map(|hint| table.id(hint)),
+                        resolved: *resolved,
+                        resolution: *resolution,
+                    }
+                })
+                .collect();
+            nodes.push(SnapshotNode {
+                key: table.id(&key),
+                name: table.id(name),
+                file_path: table.id(file_path),
+                line: *line,
+                calls,
+                metrics: metrics.clone(),
+                receiver: receiver.clone(),
+                result_type: result_type.clone(),
+                intercepts: intercepts.clone(),
+            });
+        }
+        let mut lists = |map: &FastMap<String, Vec<String>>| -> Vec<(u32, Vec<u32>)> {
+            sorted_keys(map)
+                .into_iter()
+                .filter_map(|key| {
+                    let list = map.get(&key)?;
+                    Some((table.id(&key), table.ids(&list)))
+                })
+                .collect()
+        };
+        let name_index = lists(&self.name_index);
+        let file_functions = lists(&self.file_functions);
+
         let snapshot = Snapshot {
-            stamp: stamp.to_string(),
-            nodes: sorted(&self.nodes),
-            name_index: sorted(&self.name_index),
-            file_functions: sorted(&self.file_functions),
+            strings: table.strings,
+            nodes,
+            name_index,
+            file_functions,
             types: self.types.to_snapshot(),
         };
-        postcard::to_stdvec(&snapshot).map_err(|e| anyhow!("Failed to serialize call-graph: {e}"))
+        // The stamp first, so a snapshot of another save is rejected without
+        // decoding the rest.
+        let bytes = postcard::to_stdvec(stamp)
+            .map_err(|e| anyhow!("Failed to serialize call-graph: {e}"))?;
+        postcard::to_extend(&snapshot, bytes)
+            .map_err(|e| anyhow!("Failed to serialize call-graph: {e}"))
     }
 
     /// Replace this graph's contents with the snapshot, provided it carries
@@ -4191,11 +4310,71 @@ impl CallGraph {
     /// re-index cannot evict anything that arrived this way —
     /// `remove_functions_for_file` looks the file up there and finds nothing.
     pub fn from_snapshot(&self, bytes: &[u8], stamp: Option<&str>) -> Result<bool> {
-        let snapshot: Snapshot = postcard::from_bytes(bytes)
+        let (saved_stamp, rest) = postcard::take_from_bytes::<String>(bytes)
             .map_err(|e| anyhow!("Failed to deserialize call-graph: {e}"))?;
-        if stamp.is_some_and(|wanted| wanted != snapshot.stamp) {
+        if stamp.is_some_and(|wanted| wanted != saved_stamp) {
             return Ok(false);
         }
+        let snapshot: Snapshot = postcard::from_bytes(rest)
+            .map_err(|e| anyhow!("Failed to deserialize call-graph: {e}"))?;
+        let strings = &snapshot.strings;
+        let text = |id: u32| -> Result<String> {
+            strings.get(id as usize).cloned().ok_or_else(|| {
+                anyhow!(
+                    "Call-graph snapshot refers to string {id} of {}",
+                    strings.len()
+                )
+            })
+        };
+        let texts =
+            |ids: &[u32]| -> Result<Vec<String>> { ids.iter().map(|&id| text(id)).collect() };
+
+        // Decoded in full before anything is replaced: a bad snapshot leaves
+        // the graph as it was.
+        let mut nodes = Vec::with_capacity(snapshot.nodes.len());
+        for node in &snapshot.nodes {
+            let file_path = text(node.file_path)?;
+            let calls = node
+                .calls
+                .iter()
+                .map(|edge| {
+                    Ok(CallEdge {
+                        target: text(edge.target)?,
+                        file_path: match edge.file_path {
+                            Some(id) => text(id)?,
+                            None => file_path.clone(),
+                        },
+                        line: edge.line,
+                        column: edge.column,
+                        call_type: edge.call_type,
+                        scope_hint: edge.scope_hint.map(text).transpose()?,
+                        resolved: edge.resolved,
+                        resolution: edge.resolution,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            nodes.push((
+                text(node.key)?,
+                CallNode {
+                    name: text(node.name)?,
+                    file_path,
+                    line: node.line,
+                    calls,
+                    metrics: node.metrics.clone(),
+                    receiver: node.receiver.clone(),
+                    result_type: node.result_type.clone(),
+                    intercepts: node.intercepts.clone(),
+                },
+            ));
+        }
+        let lists = |lists: &[(u32, Vec<u32>)]| -> Result<Vec<(String, Vec<String>)>> {
+            lists
+                .iter()
+                .map(|(key, list)| Ok((text(*key)?, texts(list)?)))
+                .collect()
+        };
+        let name_index = lists(&snapshot.name_index)?;
+        let file_functions = lists(&snapshot.file_functions)?;
 
         self.nodes.clear();
         self.name_index.clear();
@@ -4206,13 +4385,13 @@ impl CallGraph {
         self.interface_methods_cache.clear();
         self.drop_bsl_module_files();
 
-        for (key, node) in snapshot.nodes {
+        for (key, node) in nodes {
             self.nodes.insert(key, node);
         }
-        for (name, keys) in snapshot.name_index {
+        for (name, keys) in name_index {
             self.name_index.insert(name, keys);
         }
-        for (path, keys) in snapshot.file_functions {
+        for (path, keys) in file_functions {
             self.file_functions.insert(path, keys);
         }
         self.types.load_snapshot(snapshot.types);
@@ -5788,6 +5967,55 @@ mod tests {
         let (target, resolution) = graph.resolve_callee("new", "src/main.rs", Some("Store"));
         assert_eq!(target, "src/store.rs::Store::new");
         assert_eq!(resolution, CallResolution::Receiver);
+    }
+
+    /// The string table must give back every edge as it was, including one
+    /// recorded in another file than its function's and one without a hint.
+    #[test]
+    fn test_snapshot_round_trip_keeps_every_edge() {
+        let graph = CallGraph::new();
+        let mut caller = node("caller", "src/a.rs", None);
+        caller.calls = vec![
+            CallEdge {
+                target: CallGraph::qualified_key("src/b.rs", "callee"),
+                file_path: "src/a.rs".to_string(),
+                line: 3,
+                column: 7,
+                call_type: CallType::Direct,
+                scope_hint: Some("B".to_string()),
+                resolved: true,
+                resolution: CallResolution::SameFile,
+            },
+            CallEdge {
+                target: "unknown_fn".to_string(),
+                file_path: "src/macro_site.rs".to_string(),
+                line: 9,
+                column: 1,
+                call_type: CallType::Direct,
+                scope_hint: None,
+                resolved: false,
+                resolution: CallResolution::Unresolved,
+            },
+        ];
+        let caller_key = CallGraph::qualified_key("src/a.rs", "caller");
+        graph.insert_node(caller_key.clone(), caller);
+        graph.insert_node(
+            CallGraph::qualified_key("src/b.rs", "callee"),
+            node("callee", "src/b.rs", None),
+        );
+        graph
+            .file_functions
+            .insert("src/a.rs".to_string(), vec![caller_key.clone()]);
+
+        let bytes = graph.to_snapshot("s").unwrap();
+        let loaded = CallGraph::new();
+        assert!(loaded.from_snapshot(&bytes, Some("s")).unwrap());
+        assert_eq!(loaded.to_snapshot("s").unwrap(), bytes);
+        assert_eq!(
+            format!("{:?}", loaded.nodes.get(&caller_key).unwrap().calls),
+            format!("{:?}", graph.nodes.get(&caller_key).unwrap().calls)
+        );
+        assert!(!loaded.from_snapshot(&bytes, Some("other")).unwrap());
     }
 
     /// The snapshot replaces the graph instead of being merged into it. A
