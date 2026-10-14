@@ -301,19 +301,7 @@ impl KnowledgeGraph {
     /// ).unwrap();
     /// ```
     pub fn add_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<()> {
-        let subject =
-            NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
-        let predicate = NamedNode::new(predicate)
-            .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
-        let object =
-            NamedNode::new(object).map_err(|e| anyhow!("Invalid object IRI '{object}': {e}"))?;
-
-        let quad = Quad::new(subject, predicate, object, GraphName::DefaultGraph);
-        self.store
-            .insert(&quad)
-            .map_err(|e| anyhow!("Failed to insert quad: {e}"))?;
-
-        Ok(())
+        self.add(&iri_quad(subject, predicate, object)?)
     }
 
     /// Whether the default graph holds this IRI triple.
@@ -359,18 +347,7 @@ impl KnowledgeGraph {
     ///
     /// Returns an error if any IRI is invalid or insertion fails.
     pub fn add_triple_literal(&self, subject: &str, predicate: &str, value: &str) -> Result<()> {
-        let subject =
-            NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
-        let predicate = NamedNode::new(predicate)
-            .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
-        let literal = Literal::new_simple_literal(value);
-
-        let quad = Quad::new(subject, predicate, literal, GraphName::DefaultGraph);
-        self.store
-            .insert(&quad)
-            .map_err(|e| anyhow!("Failed to insert quad: {e}"))?;
-
-        Ok(())
+        self.add(&literal_quad(subject, predicate, value)?)
     }
 
     /// Adds a triple with an integer literal object value.
@@ -385,18 +362,30 @@ impl KnowledgeGraph {
     ///
     /// Returns an error if any IRI is invalid or insertion fails.
     pub fn add_triple_int(&self, subject: &str, predicate: &str, value: i64) -> Result<()> {
-        let subject =
-            NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
-        let predicate = NamedNode::new(predicate)
-            .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
-        let literal = Literal::new_typed_literal(value.to_string(), vocab::xsd::INTEGER);
+        self.add(&int_quad(subject, predicate, value)?)
+    }
 
-        let quad = Quad::new(subject, predicate, literal, GraphName::DefaultGraph);
+    /// Inserts one quad in its own transaction.
+    pub fn add(&self, quad: &Quad) -> Result<()> {
         self.store
-            .insert(&quad)
+            .insert(quad)
             .map_err(|e| anyhow!("Failed to insert quad: {e}"))?;
-
         Ok(())
+    }
+
+    /// Writes `quads` with the bulk loader: one commit instead of one
+    /// transaction per quad. The first error stops the load and nothing is
+    /// committed.
+    pub fn bulk_load(&self, quads: impl IntoIterator<Item = Result<Quad>>) -> Result<()> {
+        let mut loader = self
+            .store
+            .bulk_loader()
+            .with_num_threads(BULK_LOAD_THREADS)
+            .with_max_memory_size_in_megabytes(BULK_LOAD_MEMORY_MB);
+        loader.load_ok_quads::<anyhow::Error, anyhow::Error>(quads)?;
+        loader
+            .commit()
+            .map_err(|e| anyhow!("Failed to commit bulk load: {e}"))
     }
 
     /// Adds a quad (triple in a named graph).
@@ -602,6 +591,46 @@ impl KnowledgeGraph {
 
         Ok(())
     }
+}
+
+/// Threads and memory target of [`KnowledgeGraph::bulk_load`]. The oxigraph
+/// defaults, a thread per core and 2 GB each, do not fit the memory budget of
+/// a server that also holds the index.
+const BULK_LOAD_THREADS: usize = 4;
+const BULK_LOAD_MEMORY_MB: usize = 1024;
+
+/// The quad `subject predicate object` in the default graph.
+pub fn iri_quad(subject: &str, predicate: &str, object: &str) -> Result<Quad> {
+    let object =
+        NamedNode::new(object).map_err(|e| anyhow!("Invalid object IRI '{object}': {e}"))?;
+    default_graph_quad(subject, predicate, object)
+}
+
+/// The quad `subject predicate "value"` in the default graph.
+pub fn literal_quad(subject: &str, predicate: &str, value: &str) -> Result<Quad> {
+    default_graph_quad(subject, predicate, Literal::new_simple_literal(value))
+}
+
+/// The quad `subject predicate value^^xsd:integer` in the default graph.
+pub fn int_quad(subject: &str, predicate: &str, value: i64) -> Result<Quad> {
+    default_graph_quad(
+        subject,
+        predicate,
+        Literal::new_typed_literal(value.to_string(), vocab::xsd::INTEGER),
+    )
+}
+
+fn default_graph_quad(subject: &str, predicate: &str, object: impl Into<Term>) -> Result<Quad> {
+    let subject =
+        NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
+    let predicate = NamedNode::new(predicate)
+        .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
+    Ok(Quad::new(
+        subject,
+        predicate,
+        object,
+        GraphName::DefaultGraph,
+    ))
 }
 
 #[cfg(test)]

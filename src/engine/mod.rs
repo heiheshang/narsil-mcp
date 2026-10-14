@@ -1862,7 +1862,7 @@ impl CodeIntelEngine {
         // Transform symbols to RDF knowledge graph if enabled
         #[cfg(feature = "graph")]
         if let Some(ref graph) = self.knowledge_graph {
-            use crate::persistence::{RepositoryTransformer, SymbolTransformer};
+            use crate::persistence::RepositoryTransformer;
             let _graph_span = debug_span!("knowledge_graph").entered();
             // Same build and no file changed: the symbols, and so the graph,
             // are what the last run wrote.
@@ -1878,39 +1878,17 @@ impl CodeIntelEngine {
                     self.symbols.get(&repo_name).map_or(0, |s| s.len())
                 );
 
-                // Get the symbols we just indexed
                 if let Some(symbols) = self.symbols.get(&repo_name) {
-                    let symbol_count = symbols.len();
-                    if let Err(e) =
-                        SymbolTransformer::transform_many(graph, &repo_name, symbols.iter())
-                    {
-                        warn!(
+                    match Self::load_symbols_into_graph(graph, &repo_name, &symbols) {
+                        Ok(()) => info!(
+                            "Transformed {} symbols to RDF knowledge graph for {}",
+                            symbols.len(),
+                            repo_name
+                        ),
+                        Err(e) => warn!(
                             "Failed to transform symbols to RDF for {}: {}",
                             repo_name, e
-                        );
-                    } else {
-                        // Also add repository metadata
-                        let file_paths: Vec<String> = symbols
-                            .iter()
-                            .map(|s| s.file_path.clone())
-                            .collect::<std::collections::HashSet<_>>()
-                            .into_iter()
-                            .collect();
-                        if let Err(e) = RepositoryTransformer::transform(
-                            graph,
-                            &repo_name,
-                            file_paths.iter().map(|s| s.as_str()),
-                        ) {
-                            warn!(
-                                "Failed to transform repository metadata to RDF for {}: {}",
-                                repo_name, e
-                            );
-                        } else {
-                            info!(
-                                "Transformed {} symbols to RDF knowledge graph for {}",
-                                symbol_count, repo_name
-                            );
-                        }
+                        ),
                     }
                 }
                 if let Err(e) = graph.flush() {
@@ -1924,6 +1902,50 @@ impl CodeIntelEngine {
             indexed_files: file_count,
             stale_files,
         })
+    }
+
+    /// Writes the triples of `symbols`, then those of the repository, in one
+    /// bulk load. The repository type triple that
+    /// [`RepositoryTransformer::is_transformed`] looks for lands in the same
+    /// commit, so it never marks a half-written graph.
+    #[cfg(feature = "graph")]
+    fn load_symbols_into_graph(
+        graph: &crate::persistence::KnowledgeGraph,
+        repo_name: &str,
+        symbols: &[Symbol],
+    ) -> Result<()> {
+        use crate::persistence::{RepositoryTransformer, SymbolTransformer};
+        // Chunks keep the triples built ahead of the loader bounded.
+        const CHUNK: usize = 16 * 1024;
+
+        let symbol_quads = symbols.chunks(CHUNK).flat_map(|chunk| {
+            let built: Vec<Result<Vec<_>>> = chunk
+                .par_iter()
+                .map(|symbol| {
+                    let mut quads = Vec::with_capacity(10);
+                    SymbolTransformer::quads(repo_name, symbol, &mut quads).map(|_| quads)
+                })
+                .collect();
+            built.into_iter().flat_map(|quads| match quads {
+                Ok(quads) => quads.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(e) => vec![Err(e)],
+            })
+        });
+
+        let file_paths: Vec<&str> = symbols
+            .iter()
+            .map(|s| s.file_path.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut quads = Vec::new();
+        let repo_quads: Vec<Result<_>> =
+            match RepositoryTransformer::quads(repo_name, file_paths.into_iter(), &mut quads) {
+                Ok(_) => quads.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(e)],
+            };
+
+        graph.bulk_load(symbol_quads.chain(repo_quads))
     }
 
     /// Without `prepared.search` the search index already holds this document
@@ -3491,95 +3513,101 @@ impl CodeIntelEngine {
                 .unwrap_or("unknown")
                 .to_string();
 
-            // Create a persisted index from current state
-            let mut persisted = PersistedIndex::new(repo_path.clone());
-            persisted.build_id = crate::persist::current_build_id();
-
-            // Group symbols by file path
-            let mut by_file: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-            if let Some(symbols) = self.symbols.get(&repo_name) {
-                for sym in symbols.iter() {
-                    by_file
-                        .entry(repo_path.join(&sym.file_path))
-                        .or_default()
-                        .push(sym.clone());
-                }
-            }
-            // Files without symbols are recorded too: a warm start keeps the
-            // search documents of every file that did not change.
-            for entry in self.file_cache.iter() {
-                if entry.key().starts_with(repo_path) {
-                    by_file.entry(entry.key().clone()).or_default();
-                }
-            }
-
-            // A file whose size and mtime match the last save keeps its hash, as
-            // `needs_reindex` trusts them: hashing all of a 1C dump again took
-            // a minute on every restart after a deploy.
-            let previous = store.file_hashes(repo_path).unwrap_or_else(|e| {
-                warn!("Failed to read file hashes for {}: {}", repo_name, e);
-                HashMap::new()
-            });
-
-            // Create file metadata for each file
-            persisted.files = by_file
-                .into_par_iter()
-                .filter_map(|(full_path, file_symbols)| {
-                    let metadata = std::fs::metadata(&full_path).ok()?;
-                    let modified = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-
-                    let size = metadata.len();
-                    let known = previous
-                        .get(&full_path)
-                        .filter(|(_, prev_modified, prev_size)| {
-                            *prev_modified == modified && *prev_size == size
-                        })
-                        .map(|(hash, _, _)| hash.clone());
-                    let content_hash = if let Some(hash) = known {
-                        hash
-                    } else if let Ok(content) = std::fs::read(&full_path) {
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(&content);
-                        format!("{:x}", hasher.finalize())
-                    } else {
-                        String::new()
-                    };
-
-                    Some((
-                        full_path.clone(),
-                        crate::persist::FileMetadata {
-                            path: full_path,
-                            content_hash,
-                            modified_time: modified,
-                            size,
-                            symbols: file_symbols,
-                        },
-                    ))
-                })
-                .collect();
-
-            // Save the index
-            store.save(&persisted)?;
-
-            // Save call-graph if enabled
-            if self.options.call_graph_enabled {
-                if let Some(cg) = self.call_graphs.get(&repo_name) {
-                    match cg.to_json() {
-                        Ok(json) => {
-                            if let Err(e) = store.save_call_graph(repo_path, &json) {
-                                warn!("Failed to save call-graph for {}: {}", repo_name, e);
+            // The call graph goes to its own file, so it is written while the
+            // SQLite index below is.
+            let persisted = std::thread::scope(|scope| {
+                if self.options.call_graph_enabled {
+                    scope.spawn(|| {
+                        if let Some(cg) = self.call_graphs.get(&repo_name) {
+                            match cg.to_json() {
+                                Ok(json) => {
+                                    if let Err(e) = store.save_call_graph(repo_path, &json) {
+                                        warn!("Failed to save call-graph for {}: {}", repo_name, e);
+                                    }
+                                }
+                                Err(e) => warn!("Failed to serialize call-graph: {}", e),
                             }
                         }
-                        Err(e) => warn!("Failed to serialize call-graph: {}", e),
+                    });
+                }
+
+                // Create a persisted index from current state
+                let mut persisted = PersistedIndex::new(repo_path.clone());
+                persisted.build_id = crate::persist::current_build_id();
+
+                // Group symbols by file path
+                let mut by_file: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+                if let Some(symbols) = self.symbols.get(&repo_name) {
+                    for sym in symbols.iter() {
+                        by_file
+                            .entry(repo_path.join(&sym.file_path))
+                            .or_default()
+                            .push(sym.clone());
                     }
                 }
-            }
+                // Files without symbols are recorded too: a warm start keeps the
+                // search documents of every file that did not change.
+                for entry in self.file_cache.iter() {
+                    if entry.key().starts_with(repo_path) {
+                        by_file.entry(entry.key().clone()).or_default();
+                    }
+                }
+
+                // A file whose size and mtime match the last save keeps its hash, as
+                // `needs_reindex` trusts them: hashing all of a 1C dump again took
+                // a minute on every restart after a deploy.
+                let previous = store.file_hashes(repo_path).unwrap_or_else(|e| {
+                    warn!("Failed to read file hashes for {}: {}", repo_name, e);
+                    HashMap::new()
+                });
+
+                // Create file metadata for each file
+                persisted.files = by_file
+                    .into_par_iter()
+                    .filter_map(|(full_path, file_symbols)| {
+                        let metadata = std::fs::metadata(&full_path).ok()?;
+                        let modified = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+
+                        let size = metadata.len();
+                        let known = previous
+                            .get(&full_path)
+                            .filter(|(_, prev_modified, prev_size)| {
+                                *prev_modified == modified && *prev_size == size
+                            })
+                            .map(|(hash, _, _)| hash.clone());
+                        let content_hash = if let Some(hash) = known {
+                            hash
+                        } else if let Ok(content) = std::fs::read(&full_path) {
+                            use sha2::{Digest, Sha256};
+                            let mut hasher = Sha256::new();
+                            hasher.update(&content);
+                            format!("{:x}", hasher.finalize())
+                        } else {
+                            String::new()
+                        };
+
+                        Some((
+                            full_path.clone(),
+                            crate::persist::FileMetadata {
+                                path: full_path,
+                                content_hash,
+                                modified_time: modified,
+                                size,
+                                symbols: file_symbols,
+                            },
+                        ))
+                    })
+                    .collect();
+
+                // Save the index
+                store.save(&persisted)?;
+                anyhow::Ok(persisted)
+            })?;
 
             saved_count += 1;
             info!(
