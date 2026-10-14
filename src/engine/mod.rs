@@ -9994,8 +9994,8 @@ impl CodeIntelEngine {
                             .map(|edge| CallEdgeInfo {
                                 caller: node.name.clone(),
                                 caller_file: node.file_path.clone(),
-                                callee: edge.target.clone(),
-                                callee_file: edge.file_path.clone(),
+                                callee: edge.target.to_string(),
+                                callee_file: edge.file_path.to_string(),
                                 line: edge.line,
                             })
                             .collect::<Vec<_>>()

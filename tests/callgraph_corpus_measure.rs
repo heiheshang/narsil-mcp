@@ -79,7 +79,7 @@ fn measure() {
         for node in cg.iter_nodes() {
             for e in &node.calls {
                 let line = sources
-                    .get(&e.file_path)
+                    .get(&*e.file_path)
                     .and_then(|lines| lines.get(e.line.saturating_sub(1)))
                     .map(|l| l.trim().replace('\t', " "))
                     .unwrap_or_default();
@@ -112,7 +112,7 @@ fn measure() {
                 continue;
             }
             let line = sources
-                .get(&e.file_path)
+                .get(&*e.file_path)
                 .and_then(|lines| lines.get(e.line.saturating_sub(1)))
                 .map(|l| l.trim().to_string())
                 .unwrap_or_default();

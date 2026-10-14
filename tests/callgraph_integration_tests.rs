@@ -330,7 +330,7 @@ pub fn run() {
     let run_call = main_callees.iter().find(|e| e.target.ends_with("::run"));
     assert!(run_call.is_some(), "main should call some ::run function");
     assert_eq!(
-        run_call.unwrap().target,
+        &*run_call.unwrap().target,
         "src/app/mod.rs::run",
         "App::run() should resolve to src/app/mod.rs::run via scope hint"
     );
@@ -367,7 +367,7 @@ fn helper() {
     // Find the edge targeting helper
     let helper_edge = caller_callees
         .iter()
-        .find(|e| e.target.ends_with("::helper") || e.target == "helper");
+        .find(|e| e.target.ends_with("::helper") || &*e.target == "helper");
     assert!(
         helper_edge.is_some(),
         "caller should call helper, got: {:?}",
@@ -376,8 +376,8 @@ fn helper() {
 
     let edge = helper_edge.unwrap();
     assert_eq!(
-        edge.scope_hint,
-        Some("utils".to_string()),
+        edge.scope_hint.as_deref(),
+        Some("utils"),
         "scope_hint should capture 'utils' from utils::helper()"
     );
 }
@@ -521,7 +521,7 @@ fn caller_names(call_graph: &CallGraph, function: &str) -> Vec<String> {
     call_graph
         .get_callers(function)
         .iter()
-        .map(|edge| edge.target.clone())
+        .map(|edge| edge.target.to_string())
         .collect()
 }
 
@@ -681,7 +681,10 @@ fn test_method_call_carries_receiver_as_scope_hint() {
 
     let callers = call_graph.get_callers("internal/store/store.go::Get");
     assert_eq!(
-        callers.iter().map(|e| e.target.clone()).collect::<Vec<_>>(),
+        callers
+            .iter()
+            .map(|e| e.target.to_string())
+            .collect::<Vec<_>>(),
         vec!["internal/api/api.go::Handle"],
         "store.Get() should resolve to the store package, not to other"
     );
@@ -853,7 +856,7 @@ fn test_static_call_resolves_by_receiver_across_files() {
     let callees: Vec<String> = call_graph
         .get_callees("main.rs::main")
         .iter()
-        .map(|edge| edge.target.clone())
+        .map(|edge| edge.target.to_string())
         .collect();
     assert_eq!(callees, vec!["z_store.rs::Store::new"]);
 }
@@ -898,7 +901,7 @@ fn helper() {}
     let by_target: Vec<(String, CallResolution)> = call_graph
         .get_callees("main.rs::main")
         .iter()
-        .map(|edge| (edge.target.clone(), edge.resolution))
+        .map(|edge| (edge.target.to_string(), edge.resolution))
         .collect();
 
     let resolution_of = |name: &str| {
@@ -1355,7 +1358,7 @@ func Pay() {
         .find(|edge| edge.target.ends_with("::Get"))
         .expect("config.Get() should produce an edge");
     assert_eq!(
-        edge.target, "internal/config/config.go::Get",
+        &*edge.target, "internal/config/config.go::Get",
         "the import names the package, so the namesake next door loses"
     );
     assert_eq!(edge.resolution, CallResolution::Scope);
@@ -1624,7 +1627,7 @@ func (self *CustomerRepo) FindByUuid(uuid string) error {
         .find(|edge| edge.target.ends_with("::HandleError"))
         .expect("self.HandleError() should produce an edge");
     assert_eq!(
-        edge.target, "internal/model/base/base.go::SimpleQuery::HandleError",
+        &*edge.target, "internal/model/base/base.go::SimpleQuery::HandleError",
         "the method is promoted from the embedded type"
     );
     assert_eq!(
@@ -2084,7 +2087,7 @@ fn test_bsl_call_shapes_resolve_like_the_platform() {
     let chain: Vec<_> = callees
         .iter()
         .filter(|e| e.line == 9)
-        .map(|e| (e.target.as_str(), e.resolution))
+        .map(|e| (&*e.target, e.resolution))
         .collect();
     assert!(
         chain.contains(&("ПолучитьЭлементы", CallResolution::Unresolved)),
@@ -2157,7 +2160,7 @@ fn test_bsl_notify_description_is_a_call_of_its_handler() {
     let callbacks: Vec<_> = callees
         .iter()
         .filter(|e| e.call_type == CallType::Callback)
-        .map(|e| (e.line, e.target.as_str(), e.resolution))
+        .map(|e| (e.line, &*e.target, e.resolution))
         .collect();
     let in_form = |name: &str| format!("{form_path}::{name}");
     assert_eq!(
@@ -2229,7 +2232,7 @@ fn test_bsl_extension_annotations_link_the_extended_method() {
             .get_callees(key)
             .iter()
             .filter(|e| e.call_type == CallType::Extension)
-            .map(|e| (e.target.clone(), e.resolution))
+            .map(|e| (e.target.to_string(), e.resolution))
             .collect()
     };
     let in_base = |name: &str| format!("{base_path}::{name}");
@@ -2256,7 +2259,7 @@ fn test_bsl_extension_annotations_link_the_extended_method() {
 
     let callers = call_graph.get_callers(&in_ext("Расш_ПередЗаписью"));
     assert!(
-        callers.iter().any(|c| c.target == in_base("ПередЗаписью")),
+        callers.iter().any(|c| *c.target == in_base("ПередЗаписью")),
         "{callers:?}"
     );
     assert!(call_graph.get_callers(&in_ext("Расш_НетТакого")).is_empty());

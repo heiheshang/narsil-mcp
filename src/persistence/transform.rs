@@ -923,8 +923,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "callee".to_string(),
-                file_path: "src/lib.rs".to_string(),
+                target: "callee".into(),
+                file_path: "src/lib.rs".into(),
                 line: 15,
                 column: 5,
                 call_type: CallType::Direct,
@@ -960,8 +960,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "src/lib.rs".to_string(),
+                target: "b".into(),
+                file_path: "src/lib.rs".into(),
                 line: 10,
                 column: 5,
                 call_type: CallType::Direct,
@@ -980,8 +980,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "src/lib.rs".to_string(),
+                target: "c".into(),
+                file_path: "src/lib.rs".into(),
                 line: 20,
                 column: 5,
                 call_type: CallType::Direct,

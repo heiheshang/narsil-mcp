@@ -52,9 +52,9 @@ pub struct CallNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEdge {
     /// Target function name
-    pub target: String,
+    pub target: Arc<str>,
     /// File containing the call
-    pub file_path: String,
+    pub file_path: Arc<str>,
     /// Line of the call site
     pub line: usize,
     /// Column of the call site
@@ -63,7 +63,7 @@ pub struct CallEdge {
     pub call_type: CallType,
     /// Scope qualifier from the call site (e.g. "App" from `App::run()`)
     #[serde(default)]
-    pub scope_hint: Option<String>,
+    pub scope_hint: Option<Arc<str>>,
     /// Whether the target was resolved to a known function in the graph.
     /// False when the callee name had no matching node — `get_callers` must
     /// surface this instead of silently pretending the edge is complete.
@@ -307,6 +307,11 @@ pub struct CallGraph {
     /// it, from metadata XML: form handlers, event subscriptions, scheduled
     /// jobs, services. See [`platform_entry_reason`](Self::platform_entry_reason).
     platform_entries: DashMap<String, String>,
+    /// One copy of each target, path and hint the edges hold. Millions of
+    /// edges name a few hundred thousand distinct strings; each edge used to
+    /// carry its own copy. Not shrunk when functions are removed: the strings
+    /// of an incrementally re-indexed file stay until the graph is rebuilt.
+    strings: dashmap::DashSet<Arc<str>, ahash::RandomState>,
 }
 
 impl Default for CallGraph {
@@ -501,6 +506,7 @@ impl CallGraph {
             interface_methods_cache: DashMap::default(),
             bsl_module_files: std::sync::RwLock::new(None),
             platform_entries: DashMap::default(),
+            strings: dashmap::DashSet::default(),
         }
     }
 
@@ -699,8 +705,8 @@ impl CallGraph {
             };
             for target in targets {
                 let edge = |to: &str| CallEdge {
-                    target: to.to_string(),
-                    file_path: hook_file.clone(),
+                    target: self.intern(to),
+                    file_path: self.intern(&hook_file),
                     line: hook_line,
                     column: 0,
                     call_type: CallType::Extension,
@@ -718,6 +724,22 @@ impl CallGraph {
                 }
             }
         }
+    }
+
+    /// The shared copy of `s`.
+    pub fn intern(&self, s: &str) -> Arc<str> {
+        if let Some(held) = self.strings.get(s) {
+            return Arc::clone(&held);
+        }
+        let held: Arc<str> = Arc::from(s);
+        // Another thread may have interned it meanwhile; either copy is fine,
+        // but keep the set holding one.
+        if !self.strings.insert(Arc::clone(&held)) {
+            if let Some(winner) = self.strings.get(s) {
+                return Arc::clone(&winner);
+            }
+        }
+        held
     }
 
     /// Record that the 1C platform calls `procedure` of the module at
@@ -1510,7 +1532,7 @@ impl CallGraph {
                                 // call leaves the graph.
                                 .or_else(|| {
                                     hint.filter(|hint| ctx.is_foreign_local(hint)).map(|_| {
-                                        (edge.target.clone(), CallResolution::ExternalPackage)
+                                        (edge.target.to_string(), CallResolution::ExternalPackage)
                                     })
                                 });
 
@@ -1641,8 +1663,11 @@ impl CallGraph {
         // self-call (caller == callee) would otherwise deadlock
         // (read-under-write on one shard).
         let resolved = self.nodes.contains_key(&callee_key);
+        // Edges built without the graph at hand hold their own strings.
+        edge.target = self.intern(&callee_key);
+        edge.file_path = self.intern(&edge.file_path);
+        edge.scope_hint = edge.scope_hint.as_deref().map(|hint| self.intern(hint));
         if let Some(mut caller_node) = self.nodes.get_mut(caller_key) {
-            edge.target = callee_key;
             edge.resolved = resolved;
             edge.resolution = resolution;
             caller_node.calls.push(edge);
@@ -1687,12 +1712,12 @@ impl CallGraph {
             .filter_map(|(name_at, module_at)| {
                 let name_arg = args.get(name_at)?;
                 Some(CallEdge {
-                    target: procedure_name(name_arg)?,
-                    file_path: ctx.file.to_string(),
+                    target: procedure_name(name_arg)?.into(),
+                    file_path: ctx.file.into(),
                     line: name_arg.start_position().row + 1,
                     column: name_arg.start_position().column + 1,
                     call_type: CallType::Callback,
-                    scope_hint: args.get(module_at).and_then(module_name),
+                    scope_hint: args.get(module_at).and_then(module_name).map(Into::into),
                     resolved: false,
                     resolution: CallResolution::Unknown,
                 })
@@ -1717,7 +1742,7 @@ impl CallGraph {
             return if self.nodes.contains_key(&key) {
                 (key, CallResolution::Scope)
             } else {
-                (edge.target.clone(), CallResolution::Unresolved)
+                (edge.target.to_string(), CallResolution::Unresolved)
             };
         }
         if let Some(found) = self
@@ -1811,16 +1836,19 @@ impl CallGraph {
                 // (see walk_for_calls — read-under-write on one shard deadlocks
                 // when caller and callee hash to the same shard).
                 let resolved = self.nodes.contains_key(&callee_key);
+                let target = self.intern(&callee_key);
+                let file_path = self.intern(caller_file);
+                let scope_hint = scope.map(|hint| self.intern(hint));
                 if let Some(mut caller_node) = self.nodes.get_mut(caller_key) {
                     // Avoid duplicate edges
-                    if !caller_node.calls.iter().any(|c| c.target == callee_key) {
+                    if !caller_node.calls.iter().any(|c| c.target == target) {
                         caller_node.calls.push(CallEdge {
-                            target: callee_key.clone(),
-                            file_path: caller_file.to_string(),
+                            target,
+                            file_path,
                             line,
                             column: 0,
                             call_type,
-                            scope_hint: scope.map(str::to_string),
+                            scope_hint,
                             resolved,
                             resolution,
                         });
@@ -2220,7 +2248,7 @@ impl CallGraph {
         let module = receiver
             .strip_prefix("модуль")
             .filter(|module| !module.is_empty())?;
-        let candidates = self.name_index.get(&edge.target)?;
+        let candidates = self.name_index.get(&*edge.target)?;
         let mut in_module = candidates.iter().filter(|key| {
             self.key_file_path_lower(key).is_some_and(|path| {
                 path.contains("commonmodules/") && path.split('/').any(|segment| segment == module)
@@ -3111,12 +3139,12 @@ impl CallGraph {
 
         Some((
             CallEdge {
-                target,
-                file_path: ctx.file.to_string(),
+                target: target.into(),
+                file_path: ctx.file.into(),
                 line: node.start_position().row + 1,
                 column: node.start_position().column + 1,
                 call_type,
-                scope_hint,
+                scope_hint: scope_hint.map(Into::into),
                 resolved: false,
                 resolution: CallResolution::Unknown,
             },
@@ -3194,12 +3222,12 @@ impl CallGraph {
         target.map(|name| {
             (
                 CallEdge {
-                    target: name,
-                    file_path: ctx.file.to_string(),
+                    target: name.into(),
+                    file_path: ctx.file.into(),
                     line: node.start_position().row + 1,
                     column: node.start_position().column + 1,
                     call_type,
-                    scope_hint,
+                    scope_hint: scope_hint.map(Into::into),
                     resolved: false,
                     resolution: CallResolution::Unknown,
                 },
@@ -3243,12 +3271,12 @@ impl CallGraph {
         };
         Some((
             CallEdge {
-                target,
-                file_path: ctx.file.to_string(),
+                target: target.into(),
+                file_path: ctx.file.into(),
                 line: node.start_position().row + 1,
                 column: node.start_position().column + 1,
                 call_type,
-                scope_hint,
+                scope_hint: scope_hint.map(Into::into),
                 resolved: false,
                 resolution: CallResolution::Unknown,
             },
@@ -3634,10 +3662,10 @@ impl CallGraph {
     /// Build the reverse adjacency (callee key -> caller edges) on demand.
     /// `called_by` is no longer stored (halves edge memory); reverse queries
     /// scan the forward `calls` once. O(E), transient.
-    pub fn reverse_edges(&self) -> HashMap<String, Vec<CallEdge>> {
-        let mut rev: HashMap<String, Vec<CallEdge>> = HashMap::new();
+    pub fn reverse_edges(&self) -> HashMap<Arc<str>, Vec<CallEdge>> {
+        let mut rev: HashMap<Arc<str>, Vec<CallEdge>> = HashMap::new();
         for entry in self.nodes.iter() {
-            let caller = entry.key();
+            let caller: Arc<str> = Arc::from(entry.key().as_str());
             for e in &entry.value().calls {
                 rev.entry(e.target.clone()).or_default().push(CallEdge {
                     target: caller.clone(),
@@ -3657,8 +3685,8 @@ impl CallGraph {
     }
 
     /// Build incoming call counts (callee key -> number of callers) on demand.
-    fn incoming_counts(&self) -> HashMap<String, usize> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+    fn incoming_counts(&self) -> HashMap<Arc<str>, usize> {
+        let mut counts: HashMap<Arc<str>, usize> = HashMap::new();
         for entry in self.nodes.iter() {
             for e in &entry.value().calls {
                 *counts.entry(e.target.clone()).or_default() += 1;
@@ -3701,8 +3729,8 @@ impl CallGraph {
     fn connection_counts(
         &self,
         include_caller: impl Fn(&CallNode) -> bool,
-    ) -> HashMap<String, usize> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+    ) -> HashMap<Arc<str>, usize> {
+        let mut counts: HashMap<Arc<str>, usize> = HashMap::new();
         for entry in self.nodes.iter() {
             if !include_caller(entry.value()) {
                 continue;
@@ -3730,7 +3758,7 @@ impl CallGraph {
     /// reverse adjacency.
     ///
     /// [`reverse_edges`](Self::reverse_edges) allocates a `CallEdge` with two
-    /// cloned `String`s for every edge in the graph — 24k of them on narsil's
+    /// cloned strings for every edge in the graph — 24k of them on narsil's
     /// own `src/`, 14.66 ms — and then discards all but one bucket. The scan
     /// is still O(E), but only the edges actually returned are cloned.
     fn callers_of(&self, callee: &str) -> Vec<CallEdge> {
@@ -3738,11 +3766,11 @@ impl CallGraph {
         for entry in self.nodes.iter() {
             let caller = entry.key();
             for e in &entry.value().calls {
-                if e.target != callee {
+                if &*e.target != callee {
                     continue;
                 }
                 callers.push(CallEdge {
-                    target: caller.clone(),
+                    target: Arc::from(caller.as_str()),
                     file_path: e.file_path.clone(),
                     line: e.line,
                     column: e.column,
@@ -3789,11 +3817,11 @@ impl CallGraph {
             }
 
             if depth < max_depth {
-                if let Some(callers) = rev.get(&func) {
+                if let Some(callers) = rev.get(func.as_str()) {
                     for caller in callers {
-                        if !visited.contains(&caller.target) {
-                            visited.insert(caller.target.clone());
-                            queue.push_back((caller.target.clone(), depth + 1));
+                        if !visited.contains(&*caller.target) {
+                            visited.insert(caller.target.to_string());
+                            queue.push_back((caller.target.to_string(), depth + 1));
                         }
                     }
                 }
@@ -3823,9 +3851,9 @@ impl CallGraph {
             if depth < max_depth {
                 if let Some(node) = self.nodes.get(&func) {
                     for callee in &node.calls {
-                        if !visited.contains(&callee.target) {
-                            visited.insert(callee.target.clone());
-                            queue.push_back((callee.target.clone(), depth + 1));
+                        if !visited.contains(&*callee.target) {
+                            visited.insert(callee.target.to_string());
+                            queue.push_back((callee.target.to_string(), depth + 1));
                         }
                     }
                 }
@@ -3862,10 +3890,10 @@ impl CallGraph {
 
             if let Some(node) = self.nodes.get(&current) {
                 for callee in &node.calls {
-                    if !visited.contains(&callee.target) {
-                        visited.insert(callee.target.clone());
-                        predecessors.insert(callee.target.clone(), current.clone());
-                        queue.push_back(callee.target.clone());
+                    if !visited.contains(&*callee.target) {
+                        visited.insert(callee.target.to_string());
+                        predecessors.insert(callee.target.to_string(), current.clone());
+                        queue.push_back(callee.target.to_string());
                     }
                 }
             }
@@ -3937,7 +3965,7 @@ impl CallGraph {
                 continue;
             }
 
-            let incoming = counts.get(key).copied().unwrap_or(0);
+            let incoming = counts.get(key.as_str()).copied().unwrap_or(0);
             let outgoing = entry
                 .calls
                 .iter()
@@ -4069,7 +4097,10 @@ impl CallGraph {
                 let mut by_callers: Vec<_> = self
                     .nodes
                     .iter()
-                    .map(|e| (e.key().clone(), counts.get(e.key()).copied().unwrap_or(0)))
+                    .map(|e| {
+                        let count = counts.get(e.key().as_str()).copied().unwrap_or(0);
+                        (e.key().clone(), count)
+                    })
                     .collect();
                 by_callers.sort_by_key(|caller| std::cmp::Reverse(caller.1));
 
@@ -4111,7 +4142,7 @@ impl CallGraph {
 
         let counts = self.incoming_counts();
         for entry in self.nodes.iter() {
-            if counts.get(entry.key()).copied().unwrap_or(0) == 0 {
+            if counts.get(entry.key().as_str()).copied().unwrap_or(0) == 0 {
                 entry_points.push(entry.key().clone());
             } else {
                 others.push(entry.key().clone());
@@ -4189,14 +4220,15 @@ impl CallGraph {
         let mut bytes = 0usize;
         for node in self.nodes.iter() {
             bytes += node.name.len() + node.file_path.len();
-            for e in node.calls.iter() {
-                edges += 1;
-                bytes += e.target.len()
-                    + e.file_path.len()
-                    + e.scope_hint.as_deref().map_or(0, str::len)
-                    + 24;
-            }
+            edges += node.calls.len();
+            bytes += node.calls.capacity() * std::mem::size_of::<CallEdge>();
         }
+        // The strings of the edges, each counted once with its `Arc` header.
+        bytes += self
+            .strings
+            .iter()
+            .map(|held| held.len() + 2 * std::mem::size_of::<usize>())
+            .sum::<usize>();
         for e in self.name_index.iter() {
             bytes += e.key().len() + e.value().iter().map(|s| s.len() + 24).sum::<usize>();
         }
@@ -4248,7 +4280,7 @@ impl CallGraph {
                     } = edge;
                     SnapshotEdge {
                         target: table.id(target),
-                        file_path: (edge_file != file_path).then(|| table.id(edge_file)),
+                        file_path: (**edge_file != **file_path).then(|| table.id(edge_file)),
                         line: *line,
                         column: *column,
                         call_type: *call_type,
@@ -4318,41 +4350,44 @@ impl CallGraph {
         let snapshot: Snapshot = postcard::from_bytes(rest)
             .map_err(|e| anyhow!("Failed to deserialize call-graph: {e}"))?;
         let strings = &snapshot.strings;
+        let missing = |id: u32| {
+            anyhow!(
+                "Call-graph snapshot refers to string {id} of {}",
+                strings.len()
+            )
+        };
         let text = |id: u32| -> Result<String> {
-            strings.get(id as usize).cloned().ok_or_else(|| {
-                anyhow!(
-                    "Call-graph snapshot refers to string {id} of {}",
-                    strings.len()
-                )
-            })
+            strings.get(id as usize).cloned().ok_or_else(|| missing(id))
         };
         let texts =
             |ids: &[u32]| -> Result<Vec<String>> { ids.iter().map(|&id| text(id)).collect() };
+        // Edges share one copy of each string, made on first use.
+        let mut shared: Vec<Option<Arc<str>>> = vec![None; strings.len()];
+        let mut share = |id: u32| -> Result<Arc<str>> {
+            let slot = shared.get_mut(id as usize).ok_or_else(|| missing(id))?;
+            Ok(Arc::clone(slot.get_or_insert_with(|| {
+                Arc::from(strings[id as usize].as_str())
+            })))
+        };
 
         // Decoded in full before anything is replaced: a bad snapshot leaves
         // the graph as it was.
         let mut nodes = Vec::with_capacity(snapshot.nodes.len());
         for node in &snapshot.nodes {
             let file_path = text(node.file_path)?;
-            let calls = node
-                .calls
-                .iter()
-                .map(|edge| {
-                    Ok(CallEdge {
-                        target: text(edge.target)?,
-                        file_path: match edge.file_path {
-                            Some(id) => text(id)?,
-                            None => file_path.clone(),
-                        },
-                        line: edge.line,
-                        column: edge.column,
-                        call_type: edge.call_type,
-                        scope_hint: edge.scope_hint.map(text).transpose()?,
-                        resolved: edge.resolved,
-                        resolution: edge.resolution,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut calls = Vec::with_capacity(node.calls.len());
+            for edge in &node.calls {
+                calls.push(CallEdge {
+                    target: share(edge.target)?,
+                    file_path: share(edge.file_path.unwrap_or(node.file_path))?,
+                    line: edge.line,
+                    column: edge.column,
+                    call_type: edge.call_type,
+                    scope_hint: edge.scope_hint.map(&mut share).transpose()?,
+                    resolved: edge.resolved,
+                    resolution: edge.resolution,
+                });
+            }
             nodes.push((
                 text(node.key)?,
                 CallNode {
@@ -4379,6 +4414,10 @@ impl CallGraph {
         self.nodes.clear();
         self.name_index.clear();
         self.file_functions.clear();
+        self.strings.clear();
+        for held in shared.into_iter().flatten() {
+            self.strings.insert(held);
+        }
         self.file_path_lower_cache.clear();
         self.import_dir_cache.clear();
         self.implements_cache.clear();
@@ -4643,8 +4682,8 @@ mod tests {
 
         // Add call edge
         let edge = CallEdge {
-            target: "callee".to_string(),
-            file_path: "/path/to/file.rs".to_string(),
+            target: "callee".into(),
+            file_path: "/path/to/file.rs".into(),
             line: 12,
             column: 5,
             call_type: CallType::Direct,
@@ -4663,12 +4702,12 @@ mod tests {
         // Verify the edge was added
         let caller_node = graph.nodes.get("caller").unwrap();
         assert_eq!(caller_node.calls.len(), 1);
-        assert_eq!(caller_node.calls[0].target, "callee");
+        assert_eq!(&*caller_node.calls[0].target, "callee");
 
         // Reverse edges are computed on demand from `calls`.
         let callers = graph.get_callers("callee");
         assert_eq!(callers.len(), 1);
-        assert_eq!(callers[0].target, "caller");
+        assert_eq!(&*callers[0].target, "caller");
     }
 
     #[test]
@@ -4687,8 +4726,8 @@ mod tests {
                     file_path: "/path/to/file.rs".to_string(),
                     line,
                     calls: vec![CallEdge {
-                        target: "target".to_string(),
-                        file_path: "/path/to/file.rs".to_string(),
+                        target: "target".into(),
+                        file_path: "/path/to/file.rs".into(),
                         line,
                         column: 5,
                         call_type,
@@ -4719,9 +4758,9 @@ mod tests {
 
         let callers = graph.get_callers("target");
         assert_eq!(callers.len(), 2);
-        let mut names: Vec<_> = callers.iter().map(|c| c.target.clone()).collect();
+        let mut names: Vec<&str> = callers.iter().map(|c| &*c.target).collect();
         names.sort();
-        assert_eq!(names, vec!["caller1".to_string(), "caller2".to_string()]);
+        assert_eq!(names, vec!["caller1", "caller2"]);
     }
 
     #[test]
@@ -4764,8 +4803,8 @@ mod tests {
             line: 10,
             calls: vec![
                 CallEdge {
-                    target: "callee1".to_string(),
-                    file_path: "/path/to/file.rs".to_string(),
+                    target: "callee1".into(),
+                    file_path: "/path/to/file.rs".into(),
                     line: 12,
                     column: 5,
                     call_type: CallType::Direct,
@@ -4774,8 +4813,8 @@ mod tests {
                     resolution: CallResolution::Unknown,
                 },
                 CallEdge {
-                    target: "callee2".to_string(),
-                    file_path: "/path/to/file.rs".to_string(),
+                    target: "callee2".into(),
+                    file_path: "/path/to/file.rs".into(),
                     line: 15,
                     column: 10,
                     call_type: CallType::StaticMethod,
@@ -4794,8 +4833,8 @@ mod tests {
 
         let callees = graph.get_callees("caller");
         assert_eq!(callees.len(), 2);
-        assert_eq!(callees[0].target, "callee1");
-        assert_eq!(callees[1].target, "callee2");
+        assert_eq!(&*callees[0].target, "callee1");
+        assert_eq!(&*callees[1].target, "callee2");
         assert_eq!(callees[0].call_type, CallType::Direct);
         assert_eq!(callees[1].call_type, CallType::StaticMethod);
     }
@@ -4884,8 +4923,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "b".into(),
+                file_path: "/file.rs".into(),
                 line: 2,
                 column: 1,
                 call_type: CallType::Direct,
@@ -4904,8 +4943,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -4924,8 +4963,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 20,
             calls: vec![CallEdge {
-                target: "d".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "d".into(),
+                file_path: "/file.rs".into(),
                 line: 22,
                 column: 1,
                 call_type: CallType::Direct,
@@ -4980,8 +5019,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5028,8 +5067,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "b".into(),
+                file_path: "/file.rs".into(),
                 line: 2,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5048,8 +5087,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5068,8 +5107,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 20,
             calls: vec![CallEdge {
-                target: "d".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "d".into(),
+                file_path: "/file.rs".into(),
                 line: 22,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5124,8 +5163,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "b".into(),
+                file_path: "/file.rs".into(),
                 line: 2,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5144,8 +5183,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5225,8 +5264,8 @@ mod tests {
             line: 10,
             calls: vec![
                 CallEdge {
-                    target: "f1".to_string(),
-                    file_path: "/file.rs".to_string(),
+                    target: "f1".into(),
+                    file_path: "/file.rs".into(),
                     line: 11,
                     column: 1,
                     call_type: CallType::Direct,
@@ -5235,8 +5274,8 @@ mod tests {
                     resolution: CallResolution::Unknown,
                 },
                 CallEdge {
-                    target: "f2".to_string(),
-                    file_path: "/file.rs".to_string(),
+                    target: "f2".into(),
+                    file_path: "/file.rs".into(),
                     line: 12,
                     column: 1,
                     call_type: CallType::Direct,
@@ -5257,8 +5296,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 50,
             calls: vec![CallEdge {
-                target: "f3".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "f3".into(),
+                file_path: "/file.rs".into(),
                 line: 51,
                 column: 1,
                 call_type: CallType::Direct,
@@ -5281,8 +5320,8 @@ mod tests {
                     file_path: "/file.rs".to_string(),
                     line: 20,
                     calls: vec![CallEdge {
-                        target: "hotspot".to_string(),
-                        file_path: "/file.rs".to_string(),
+                        target: "hotspot".into(),
+                        file_path: "/file.rs".into(),
                         line: 20,
                         column: 1,
                         call_type: CallType::Direct,
@@ -5318,8 +5357,8 @@ mod tests {
             calls: calls
                 .iter()
                 .map(|(target, resolution)| CallEdge {
-                    target: target.to_string(),
-                    file_path: file.to_string(),
+                    target: (*target).into(),
+                    file_path: file.into(),
                     line: 2,
                     column: 1,
                     call_type: CallType::Method,
@@ -5518,8 +5557,8 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 42,
             calls: vec![CallEdge {
-                target: "helper".to_string(),
-                file_path: "/path/to/file.rs".to_string(),
+                target: "helper".into(),
+                file_path: "/path/to/file.rs".into(),
                 line: 45,
                 column: 5,
                 call_type: CallType::Direct,
@@ -5549,8 +5588,8 @@ mod tests {
                 file_path: "/path/to/main.rs".to_string(),
                 line: 10,
                 calls: vec![CallEdge {
-                    target: "test_func".to_string(),
-                    file_path: "/path/to/main.rs".to_string(),
+                    target: "test_func".into(),
+                    file_path: "/path/to/main.rs".into(),
                     line: 10,
                     column: 3,
                     call_type: CallType::Direct,
@@ -5625,8 +5664,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "helper".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "helper".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 5,
                 call_type: CallType::Direct,
@@ -5661,8 +5700,8 @@ mod tests {
     #[test]
     fn test_call_edge_properties() {
         let edge = CallEdge {
-            target: "target_func".to_string(),
-            file_path: "/path/to/file.rs".to_string(),
+            target: "target_func".into(),
+            file_path: "/path/to/file.rs".into(),
             line: 42,
             column: 10,
             call_type: CallType::Method,
@@ -5671,8 +5710,8 @@ mod tests {
             resolution: CallResolution::Unknown,
         };
 
-        assert_eq!(edge.target, "target_func");
-        assert_eq!(edge.file_path, "/path/to/file.rs");
+        assert_eq!(&*edge.target, "target_func");
+        assert_eq!(&*edge.file_path, "/path/to/file.rs");
         assert_eq!(edge.line, 42);
         assert_eq!(edge.column, 10);
         assert_eq!(edge.call_type, CallType::Method);
@@ -5977,18 +6016,18 @@ mod tests {
         let mut caller = node("caller", "src/a.rs", None);
         caller.calls = vec![
             CallEdge {
-                target: CallGraph::qualified_key("src/b.rs", "callee"),
-                file_path: "src/a.rs".to_string(),
+                target: CallGraph::qualified_key("src/b.rs", "callee").into(),
+                file_path: "src/a.rs".into(),
                 line: 3,
                 column: 7,
                 call_type: CallType::Direct,
-                scope_hint: Some("B".to_string()),
+                scope_hint: Some("B".into()),
                 resolved: true,
                 resolution: CallResolution::SameFile,
             },
             CallEdge {
-                target: "unknown_fn".to_string(),
-                file_path: "src/macro_site.rs".to_string(),
+                target: "unknown_fn".into(),
+                file_path: "src/macro_site.rs".into(),
                 line: 9,
                 column: 1,
                 call_type: CallType::Direct,
@@ -6083,8 +6122,8 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, target)| CallEdge {
-                    target: (*target).to_string(),
-                    file_path: file.to_string(),
+                    target: (*target).into(),
+                    file_path: file.into(),
                     line: i + 1,
                     column: 0,
                     call_type: CallType::Direct,

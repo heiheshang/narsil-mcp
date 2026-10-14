@@ -329,7 +329,10 @@ impl GetCodeGraphHandler {
                             cyclomatic: node.metrics.cyclomatic,
                             cognitive: node.metrics.cognitive,
                             call_count: node.calls.len(),
-                            caller_count: reverse.get(&func_name).map(Vec::len).unwrap_or(0),
+                            caller_count: reverse
+                                .get(func_name.as_str())
+                                .map(Vec::len)
+                                .unwrap_or(0),
                         })
                     } else {
                         None
@@ -352,7 +355,7 @@ impl GetCodeGraphHandler {
                         edges.push(GraphEdge {
                             id: format!("e{}", edge_id),
                             source: func_name.clone(),
-                            target: call.target.clone(),
+                            target: call.target.to_string(),
                             edge_type: "call".to_string(),
                             label: None,
                             call_type: Some(call_type_string(&call.call_type)),
@@ -362,16 +365,20 @@ impl GetCodeGraphHandler {
                         edge_id += 1;
 
                         if current_depth < options.depth {
-                            queue.push((call.target.clone(), current_depth + 1));
+                            queue.push((call.target.to_string(), current_depth + 1));
                         }
                     }
                 }
 
                 if matches!(options.direction, "both" | "callers") {
-                    for caller in reverse.get(&func_name).map(Vec::as_slice).unwrap_or(&[]) {
+                    for caller in reverse
+                        .get(func_name.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                    {
                         edges.push(GraphEdge {
                             id: format!("e{}", edge_id),
-                            source: caller.target.clone(),
+                            source: caller.target.to_string(),
                             target: func_name.clone(),
                             edge_type: "call".to_string(),
                             label: None,
@@ -382,7 +389,7 @@ impl GetCodeGraphHandler {
                         edge_id += 1;
 
                         if current_depth < options.depth {
-                            queue.push((caller.target.clone(), current_depth + 1));
+                            queue.push((caller.target.to_string(), current_depth + 1));
                         }
                     }
                 }
