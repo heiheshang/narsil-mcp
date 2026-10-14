@@ -36,6 +36,32 @@ pub struct PersistedIndex {
     pub updated_at: u64,
     pub repo_root: PathBuf,
     pub files: HashMap<PathBuf, FileMetadata>,
+    /// [`current_build_id`] of the binary that saved it.
+    #[serde(default)]
+    pub build_id: String,
+}
+
+/// Identifies the running executable: a redeployed binary (new inode, size or
+/// mtime) gets another id. Search documents and the knowledge graph are only
+/// reused from a run of the same build, since another build may parse or
+/// render them differently.
+pub fn current_build_id() -> String {
+    let Some(metadata) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::metadata(exe).ok())
+    else {
+        return String::new();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+    #[cfg(not(unix))]
+    let inode = 0u64;
+    format!("{}-{}-{}", metadata.len(), modified, inode)
 }
 
 impl PersistedIndex {
@@ -53,6 +79,7 @@ impl PersistedIndex {
             updated_at: now,
             repo_root,
             files: HashMap::new(),
+            build_id: String::new(),
         }
     }
 
@@ -196,6 +223,7 @@ impl IndexStore {
             .get_meta("updated_at")?
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
+        let build_id = store.get_meta("build_id")?.unwrap_or_default();
 
         let mut files: HashMap<PathBuf, FileMetadata> = HashMap::new();
         store.for_each_file(&repo, |f| {
@@ -233,6 +261,7 @@ impl IndexStore {
             updated_at,
             repo_root: repo_root.to_path_buf(),
             files,
+            build_id,
         })
     }
 
@@ -258,6 +287,7 @@ impl IndexStore {
         store.set_meta("repo_root", &repo)?;
         store.set_meta("created_at", &index.created_at.to_string())?;
         store.set_meta("updated_at", &index.updated_at.to_string())?;
+        store.set_meta("build_id", &index.build_id)?;
         info!("Saved index to {:?}", db_path);
         Ok(())
     }

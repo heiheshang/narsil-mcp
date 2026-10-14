@@ -520,6 +520,20 @@ impl ImportTransformer {
 pub struct RepositoryTransformer;
 
 impl RepositoryTransformer {
+    /// Whether [`transform`](Self::transform) has run for `repo`, which is the
+    /// last step of transforming a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the graph cannot be read.
+    pub fn is_transformed(graph: &KnowledgeGraph, repo: &str) -> Result<bool> {
+        graph.has_triple(
+            &format!("{CODE_BASE_IRI}{repo}"),
+            vocab::rdf::TYPE.as_str(),
+            &format!("{NARSIL_BASE_IRI}Repository"),
+        )
+    }
+
     /// Transforms repository metadata into RDF triples.
     ///
     /// # Arguments

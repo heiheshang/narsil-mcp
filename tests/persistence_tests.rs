@@ -816,6 +816,91 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
     Ok(())
 }
 
+/// With `--call-graph` every file is parsed again on a warm start, but the
+/// search documents of unchanged files are kept rather than rebuilt: the
+/// results must be the cold ones, without duplicates, and a file removed
+/// in between must disappear from them.
+#[tokio::test]
+async fn test_warm_call_graph_start_keeps_search_documents() -> Result<()> {
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        "pub fn calculate_invoice_total(items: &[i32]) -> i32 { items.iter().sum() }\n",
+    )?;
+    repo.add_rust_file(
+        "src/gone.rs",
+        "pub fn removed_invoice_helper() -> i32 { 1 }\n",
+    )?;
+    std::fs::write(
+        repo.path().join("notes.txt"),
+        "The invoice total is computed by calculate_invoice_total.\n",
+    )?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: true,
+        persist_enabled: true,
+        watch_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+    let repo_name = repo
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+
+    let start = || {
+        CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            options.clone(),
+        )
+    };
+
+    let cold = {
+        let engine = start().await?;
+        engine.complete_initialization().await?;
+        let hits = engine
+            .semantic_search(Some(&repo_name), "invoice total", 10, None, None)
+            .await?;
+        assert!(hits.contains("notes.txt"), "cold:\n{hits}");
+        assert!(hits.contains("removed_invoice_helper"), "cold:\n{hits}");
+        hits
+    };
+
+    // Unchanged: the same documents, not a second copy of each.
+    {
+        let engine = start().await?;
+        engine.complete_initialization().await?;
+        let warm = engine
+            .semantic_search(Some(&repo_name), "invoice total", 10, None, None)
+            .await?;
+        assert_eq!(warm, cold);
+    }
+
+    std::fs::remove_file(repo.path().join("src/gone.rs"))?;
+    let engine = start().await?;
+    engine.complete_initialization().await?;
+    let warm = engine
+        .semantic_search(Some(&repo_name), "invoice total", 10, None, None)
+        .await?;
+    assert!(
+        !warm.contains("removed_invoice_helper"),
+        "removed file still searchable:\n{warm}"
+    );
+    assert!(warm.contains("notes.txt"), "warm:\n{warm}");
+    assert!(warm.contains("calculate_invoice_total"), "warm:\n{warm}");
+
+    Ok(())
+}
+
 /// A warm start must describe the repository the same way a cold one does.
 ///
 /// Files whose symbols come from the persisted index are never parsed, so their

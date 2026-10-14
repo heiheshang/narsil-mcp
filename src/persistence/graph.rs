@@ -316,6 +316,37 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// Whether the default graph holds this IRI triple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any IRI is invalid or the store cannot be read.
+    pub fn has_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
+        let subject =
+            NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
+        let predicate = NamedNode::new(predicate)
+            .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
+        let object =
+            NamedNode::new(object).map_err(|e| anyhow!("Invalid object IRI '{object}': {e}"))?;
+
+        let quad = Quad::new(subject, predicate, object, GraphName::DefaultGraph);
+        self.store
+            .contains(&quad)
+            .map_err(|e| anyhow!("Failed to read quad: {e}"))
+    }
+
+    /// Writes buffered changes to disk. Without it the next open replays the
+    /// write-ahead log, which took 13 s for a 185k-symbol repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be flushed.
+    pub fn flush(&self) -> Result<()> {
+        self.store
+            .flush()
+            .map_err(|e| anyhow!("Failed to flush store: {e}"))
+    }
+
     /// Adds a triple with a literal object value to the default graph.
     ///
     /// # Arguments

@@ -494,11 +494,14 @@ pub struct CodeIntelEngine {
 /// from one that actually found new or changed code.
 #[derive(Debug, Clone, Copy, Default)]
 struct WalkOutcome {
-    /// Files that contributed at least one symbol (what the persisted index holds).
-    symbol_files: usize,
     /// Files that had to be parsed because the persisted index had no usable
     /// entry for them — missing, or stale against the file on disk.
     reparsed_files: usize,
+    /// Files walked and indexed.
+    indexed_files: usize,
+    /// Files whose search documents were (re)built: all of them unless the
+    /// persisted index was saved by this build.
+    stale_files: usize,
 }
 
 /// Symbols for `file_path` from a persisted index, if that entry can still be
@@ -636,10 +639,16 @@ fn line_matches(line: &str, needle: &str) -> bool {
 fn reusable_symbols(persisted: Option<&PersistedIndex>, file_path: &Path) -> Option<Vec<Symbol>> {
     let persisted = persisted?;
     let metadata = persisted.files.get(file_path)?;
-    if persisted.needs_reindex(file_path).unwrap_or(true) {
+    // Files without symbols are recorded only to tell whether they changed.
+    if metadata.symbols.is_empty() || persisted.needs_reindex(file_path).unwrap_or(true) {
         return None;
     }
     Some(metadata.symbols.clone())
+}
+
+/// Whether `file_path` is on disk as `persisted` recorded it.
+fn unchanged_since(persisted: &PersistedIndex, file_path: &Path) -> bool {
+    persisted.files.contains_key(file_path) && !persisted.needs_reindex(file_path).unwrap_or(true)
 }
 
 /// Parameters for [`CodeIntelEngine::find_symbols`]. A struct instead of
@@ -1114,7 +1123,8 @@ impl CodeIntelEngine {
                         None => true,
                         Some(persisted) => {
                             outcome.reparsed_files > 0
-                                || outcome.symbol_files != persisted.files.len()
+                                || outcome.stale_files > 0
+                                || outcome.indexed_files != persisted.files.len()
                         }
                     };
                     if changed {
@@ -1174,25 +1184,29 @@ impl CodeIntelEngine {
                         .unwrap_or("unknown")
                         .to_string();
 
+                    // A graph that was just built from source is
+                    // authoritative and the snapshot is not: `--call-graph`
+                    // forces a full re-walk (symbol reuse is disabled because
+                    // the call graph needs the parse trees), so loading on top
+                    // could only resurrect functions the code no longer
+                    // defines. The snapshot is still worth having when nothing
+                    // was built this run — an unreadable or unwalked repository.
+                    if self
+                        .call_graphs
+                        .get(&repo_name)
+                        .is_some_and(|cg| cg.node_count() > 0)
+                    {
+                        debug!(
+                            "Call-graph for {} was rebuilt from source; \
+                             ignoring the persisted snapshot",
+                            repo_name
+                        );
+                        continue;
+                    }
                     match store.load_call_graph(repo_path) {
                         Ok(Some(json)) => {
                             if let Some(cg) = self.call_graphs.get(&repo_name) {
-                                // A graph that was just built from source is
-                                // authoritative and the snapshot is not:
-                                // `--call-graph` forces a full re-walk (symbol
-                                // reuse is disabled because the call graph
-                                // needs the parse trees), so loading on top
-                                // could only resurrect functions the code no
-                                // longer defines. The snapshot is still worth
-                                // having when nothing was built this run — an
-                                // unreadable or unwalked repository.
-                                if cg.node_count() > 0 {
-                                    debug!(
-                                        "Call-graph for {} was rebuilt from source; \
-                                         ignoring the persisted snapshot",
-                                        repo_name
-                                    );
-                                } else if let Err(e) = cg.from_json(&json) {
+                                if let Err(e) = cg.from_json(&json) {
                                     warn!(
                                         "Failed to load persisted call-graph for {}: {}",
                                         repo_name, e
@@ -1327,9 +1341,14 @@ impl CodeIntelEngine {
         let mut normalized_docs_vec: Vec<NormalizedDocument> = Vec::new();
         let mut file_count = 0;
         let mut total_lines = 0;
-        let mut symbol_files = 0usize;
         let mut reparsed_files = 0usize;
+        let mut stale_files = 0usize;
 
+        // Documents and the knowledge graph of an unchanged file are reused
+        // only from a run of this same build; another build may produce them
+        // differently.
+        let same_build =
+            reuse.filter(|persisted| persisted.build_id == crate::persist::current_build_id());
         // Symbols are only reusable when the walk does not also need parse
         // trees: the call graph is built from them, and they are not persisted.
         let reuse = reuse.filter(|_| !self.options.call_graph_enabled);
@@ -1342,7 +1361,7 @@ impl CodeIntelEngine {
         // Both indexes must hold the repository, not just one: they are
         // separate directories and a partial cache must not be mistaken for a
         // complete one.
-        let search_warm = reuse.is_some()
+        let search_warm = same_build.is_some()
             && self.search_index.tantivy().repo_doc_count(&repo_name) > 0
             && self
                 .substring_index
@@ -1407,6 +1426,31 @@ impl CodeIntelEngine {
             );
         }
 
+        // Unchanged files keep their documents, so those of files gone since
+        // the last run must go explicitly.
+        let mut removed_files = 0usize;
+        if let (true, Some(persisted)) = (search_warm, same_build) {
+            let walked: std::collections::HashSet<&Path> =
+                files.iter().map(PathBuf::as_path).collect();
+            for gone in persisted
+                .files
+                .keys()
+                .filter(|f| !walked.contains(f.as_path()))
+            {
+                let relative_path = gone.strip_prefix(path).unwrap_or(gone).to_string_lossy();
+                self.search_index
+                    .tantivy()
+                    .delete_file(&repo_tag, &relative_path);
+                if let Some(tri) = self.substring_index.as_ref() {
+                    tri.delete_file(&repo_tag, &relative_path);
+                }
+                removed_files += 1;
+            }
+            if removed_files > 0 {
+                debug!("{repo_name}: dropped documents of {removed_files} removed file(s)");
+            }
+        }
+
         // Process in chunks so the whole corpus's content + tree-sitter trees
         // are never resident at once. The pre-streaming `collect()` held every
         // file's parse tree simultaneously — the 20 GB OOM on the 1С config.
@@ -1458,6 +1502,10 @@ impl CodeIntelEngine {
                             .filter_map(|file_path| {
                                 let parse_start = std::time::Instant::now();
                                 let content = read_indexable_text_file(file_path)?;
+                                let unchanged = search_warm
+                                    && same_build.is_some_and(|persisted| {
+                                        unchanged_since(persisted, file_path)
+                                    });
                                 let (parsed, reused) = match reusable_symbols(reuse, file_path) {
                                     Some(symbols) => (
                                         Some(crate::parser::ParsedFile {
@@ -1480,11 +1528,8 @@ impl CodeIntelEngine {
                                     }
                                 };
                                 metrics.record_file_parse(parse_start.elapsed());
-                                let mut prepared = PreparedDocuments::new(
-                                    parsed.as_ref(),
-                                    &content,
-                                    !(search_warm && reused),
-                                );
+                                let mut prepared =
+                                    PreparedDocuments::new(parsed.as_ref(), &content, !unchanged);
                                 if file_path.extension().is_some_and(|ext| ext == "xml") {
                                     let relative = file_path
                                         .strip_prefix(path)
@@ -1494,7 +1539,7 @@ impl CodeIntelEngine {
                                         crate::ingest::onec::platform_entry_points(
                                             &relative, &content,
                                         );
-                                    let into_search = !(search_warm && reused);
+                                    let into_search = !unchanged;
                                     prepared.normalized =
                                         collect_onec_normalized_documents(path, file_path)
                                             .into_iter()
@@ -1503,7 +1548,14 @@ impl CodeIntelEngine {
                                             })
                                             .collect();
                                 }
-                                Some((file_path.clone(), content, parsed, reused, prepared))
+                                Some((
+                                    file_path.clone(),
+                                    content,
+                                    parsed,
+                                    reused,
+                                    unchanged,
+                                    prepared,
+                                ))
                             })
                             .collect();
                         drop(parse_guard);
@@ -1519,14 +1571,14 @@ impl CodeIntelEngine {
                     let documents_guard = documents_span.enter();
                     let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-                    for (file_path, content, parsed, reused, prepared) in parsed_chunk {
+                    for (file_path, content, parsed, reused, unchanged, prepared) in parsed_chunk {
                         file_count += 1;
-                        if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty()) {
-                            symbol_files += 1;
-                            if reuse.is_some() && !reused {
-                                // Missing from the cache or changed on disk.
-                                reparsed_files += 1;
-                            }
+                        if parsed.as_ref().is_some_and(|p| !p.symbols.is_empty())
+                            && reuse.is_some()
+                            && !reused
+                        {
+                            // Missing from the cache or changed on disk.
+                            reparsed_files += 1;
                         }
                         let lines = content.lines().count();
                         total_lines += lines;
@@ -1559,8 +1611,9 @@ impl CodeIntelEngine {
                         // persisted index; re-adding them would duplicate every
                         // hit. A changed file has its old documents dropped first,
                         // because symbols it used to define may be gone.
-                        let index_into_search = !(search_warm && reused);
+                        let index_into_search = !unchanged;
                         if index_into_search {
+                            stale_files += 1;
                             if search_warm {
                                 self.search_index
                                     .tantivy()
@@ -1782,50 +1835,65 @@ impl CodeIntelEngine {
         if let Some(ref graph) = self.knowledge_graph {
             use crate::persistence::{RepositoryTransformer, SymbolTransformer};
             let _graph_span = debug_span!("knowledge_graph").entered();
-            debug!(
-                "Transforming {} symbols to RDF",
-                self.symbols.get(&repo_name).map_or(0, |s| s.len())
-            );
+            // Same build and no file changed: the symbols, and so the graph,
+            // are what the last run wrote.
+            let graph_current = search_warm
+                && stale_files == 0
+                && removed_files == 0
+                && RepositoryTransformer::is_transformed(graph, &repo_name).unwrap_or(false);
+            if graph_current {
+                debug!("Knowledge graph for {repo_name} is up to date");
+            } else {
+                debug!(
+                    "Transforming {} symbols to RDF",
+                    self.symbols.get(&repo_name).map_or(0, |s| s.len())
+                );
 
-            // Get the symbols we just indexed
-            if let Some(symbols) = self.symbols.get(&repo_name) {
-                let symbol_count = symbols.len();
-                if let Err(e) = SymbolTransformer::transform_many(graph, &repo_name, symbols.iter())
-                {
-                    warn!(
-                        "Failed to transform symbols to RDF for {}: {}",
-                        repo_name, e
-                    );
-                } else {
-                    // Also add repository metadata
-                    let file_paths: Vec<String> = symbols
-                        .iter()
-                        .map(|s| s.file_path.clone())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    if let Err(e) = RepositoryTransformer::transform(
-                        graph,
-                        &repo_name,
-                        file_paths.iter().map(|s| s.as_str()),
-                    ) {
+                // Get the symbols we just indexed
+                if let Some(symbols) = self.symbols.get(&repo_name) {
+                    let symbol_count = symbols.len();
+                    if let Err(e) =
+                        SymbolTransformer::transform_many(graph, &repo_name, symbols.iter())
+                    {
                         warn!(
-                            "Failed to transform repository metadata to RDF for {}: {}",
+                            "Failed to transform symbols to RDF for {}: {}",
                             repo_name, e
                         );
                     } else {
-                        info!(
-                            "Transformed {} symbols to RDF knowledge graph for {}",
-                            symbol_count, repo_name
-                        );
+                        // Also add repository metadata
+                        let file_paths: Vec<String> = symbols
+                            .iter()
+                            .map(|s| s.file_path.clone())
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        if let Err(e) = RepositoryTransformer::transform(
+                            graph,
+                            &repo_name,
+                            file_paths.iter().map(|s| s.as_str()),
+                        ) {
+                            warn!(
+                                "Failed to transform repository metadata to RDF for {}: {}",
+                                repo_name, e
+                            );
+                        } else {
+                            info!(
+                                "Transformed {} symbols to RDF knowledge graph for {}",
+                                symbol_count, repo_name
+                            );
+                        }
                     }
+                }
+                if let Err(e) = graph.flush() {
+                    warn!("Failed to flush knowledge graph: {e}");
                 }
             }
         }
 
         Ok(WalkOutcome {
-            symbol_files,
             reparsed_files,
+            indexed_files: file_count,
+            stale_files,
         })
     }
 
@@ -3396,51 +3464,59 @@ impl CodeIntelEngine {
 
             // Create a persisted index from current state
             let mut persisted = PersistedIndex::new(repo_path.clone());
+            persisted.build_id = crate::persist::current_build_id();
 
-            // Populate with current symbols
+            // Group symbols by file path
+            let mut by_file: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
             if let Some(symbols) = self.symbols.get(&repo_name) {
-                // Group symbols by file path
-                let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
                 for sym in symbols.iter() {
                     by_file
-                        .entry(sym.file_path.clone())
+                        .entry(repo_path.join(&sym.file_path))
                         .or_default()
                         .push(sym.clone());
                 }
-
-                // Create file metadata for each file
-                for (file_path, file_symbols) in by_file {
-                    let full_path = repo_path.join(&file_path);
-                    if let Ok(metadata) = std::fs::metadata(&full_path) {
-                        let modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-
-                        let content_hash = if let Ok(content) = std::fs::read(&full_path) {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(&content);
-                            format!("{:x}", hasher.finalize())
-                        } else {
-                            String::new()
-                        };
-
-                        persisted.files.insert(
-                            full_path.clone(),
-                            crate::persist::FileMetadata {
-                                path: full_path,
-                                content_hash,
-                                modified_time: modified,
-                                size: metadata.len(),
-                                symbols: file_symbols,
-                            },
-                        );
-                    }
+            }
+            // Files without symbols are recorded too: a warm start keeps the
+            // search documents of every file that did not change.
+            for entry in self.file_cache.iter() {
+                if entry.key().starts_with(repo_path) {
+                    by_file.entry(entry.key().clone()).or_default();
                 }
             }
+
+            // Create file metadata for each file
+            persisted.files = by_file
+                .into_par_iter()
+                .filter_map(|(full_path, file_symbols)| {
+                    let metadata = std::fs::metadata(&full_path).ok()?;
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    let content_hash = if let Ok(content) = std::fs::read(&full_path) {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&content);
+                        format!("{:x}", hasher.finalize())
+                    } else {
+                        String::new()
+                    };
+
+                    Some((
+                        full_path.clone(),
+                        crate::persist::FileMetadata {
+                            path: full_path,
+                            content_hash,
+                            modified_time: modified,
+                            size: metadata.len(),
+                            symbols: file_symbols,
+                        },
+                    ))
+                })
+                .collect();
 
             // Save the index
             store.save(&persisted)?;
