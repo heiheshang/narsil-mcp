@@ -1,0 +1,141 @@
+{
+  "dataset_name": "narsil_test_fixtures",
+  "dataset_version": "1.0",
+  "pipeline_name": "narsil_search_chunks",
+  "total_queries": 3,
+  "completed_queries": 0,
+  "failed_queries": 3,
+  "judged_queries": 0,
+  "judge_failures": 0,
+  "retrieval": {
+    "mean_precision_at_k": 0.0,
+    "mean_recall_at_k": 0.0,
+    "mrr": 0.0,
+    "k": 5
+  },
+  "semantic": null,
+  "latency": {
+    "count": 0,
+    "mean_ms": 0.0,
+    "p50_ms": 0.0,
+    "p95_ms": 0.0,
+    "p99_ms": 0.0,
+    "min_ms": 0.0,
+    "max_ms": 0.0
+  },
+  "diagnosis_counts": {
+    "PASS": 0,
+    "WRONG_CHUNK_RETRIEVED": 0,
+    "WRONG_CHUNK_RANK": 0,
+    "INSUFFICIENT_CONTEXT": 0,
+    "RETRIEVED_BUT_NOT_GROUNDED": 0,
+    "ANSWER_INCORRECT": 0,
+    "LATENCY_OUTLIER": 0,
+    "UNKNOWN": 3
+  },
+  "diagnosis_by_query_type": {
+    "factual": {
+      "PASS": 0,
+      "WRONG_CHUNK_RETRIEVED": 0,
+      "WRONG_CHUNK_RANK": 0,
+      "INSUFFICIENT_CONTEXT": 0,
+      "RETRIEVED_BUT_NOT_GROUNDED": 0,
+      "ANSWER_INCORRECT": 0,
+      "LATENCY_OUTLIER": 0,
+      "UNKNOWN": 3
+    }
+  },
+  "metrics_by_query_type": {
+    "factual": {
+      "query_type": "factual",
+      "total_queries": 3,
+      "completed_queries": 0,
+      "failed_queries": 3,
+      "mean_precision_at_k": 0.0,
+      "mean_recall_at_k": 0.0,
+      "mrr": 0.0,
+      "answer_correctness_rate": null,
+      "groundedness_rate": null,
+      "diagnosis_counts": {
+        "PASS": 0,
+        "WRONG_CHUNK_RETRIEVED": 0,
+        "WRONG_CHUNK_RANK": 0,
+        "INSUFFICIENT_CONTEXT": 0,
+        "RETRIEVED_BUT_NOT_GROUNDED": 0,
+        "ANSWER_INCORRECT": 0,
+        "LATENCY_OUTLIER": 0,
+        "UNKNOWN": 3
+      }
+    }
+  },
+  "top_failures": [
+    {
+      "query_id": "q_calculate_total",
+      "query": "calculate total price of items in a list",
+      "category": "UNKNOWN",
+      "severity": "major",
+      "confidence": 1.0,
+      "reason": "Pipeline execution failed: retrieval failed: AttributeError: 'function' object has no attribute 'search_chunks'",
+      "action": "Inspect the pipeline execution error and underlying integration.",
+      "evidence": [
+        "Execution status: failed",
+        "Error details: retrieval failed: AttributeError: 'function' object has no attribute 'search_chunks'"
+      ]
+    },
+    {
+      "query_id": "q_fetch_data",
+      "query": "fetch data from URL using urllib",
+      "category": "UNKNOWN",
+      "severity": "major",
+      "confidence": 1.0,
+      "reason": "Pipeline execution failed: retrieval failed: AttributeError: 'function' object has no attribute 'search_chunks'",
+      "action": "Inspect the pipeline execution error and underlying integration.",
+      "evidence": [
+        "Execution status: failed",
+        "Error details: retrieval failed: AttributeError: 'function' object has no attribute 'search_chunks'"
+      ]
+    },
+    {
+      "query_id": "q_process_user",
+      "query": "process user id and name into a result dict",
+      "category": "UNKNOWN",
+      "severity": "major",
+      "confidence": 1.0,
+      "reason": "Pipeline execution failed: retrieval failed: AttributeError: 'function' object has no attribute 'search_chunks'",
+      "action": "Inspect the pipeline execution error and underlying integration.",
+      "evidence": [
+        "Execution status: failed",
+        "Error details: retrieval failed: AttributeError: 'function' object has no attribute 'search_chunks'"
+      ]
+    }
+  ],
+  "overall_insights": [
+    "Pipeline execution failure is the dominant failure mode (3 queries, 100% of failures).",
+    "3 queries suffered pipeline execution failures (categorized as UNKNOWN)."
+  ],
+  "health_profile": {
+    "score": 0.0,
+    "grade": "Critical",
+    "status": "Critical",
+    "strengths": [],
+    "weaknesses": [
+      "Low recall (mean Recall@5: 0.00)",
+      "Poor precision (mean Precision@5: 0.00)",
+      "Suboptimal ranking quality (MRR: 0.00)",
+      "Pipeline execution failures (3 queries)"
+    ],
+    "recommendations": [
+      "Inspect the pipeline execution error and underlying integration.",
+      "Increase retrieval depth or improve retrieval coverage so all required context is retrieved."
+    ]
+  },
+  "confidence": {
+    "score": 0.0,
+    "level": "Very Low",
+    "reasons": [
+      "100% of evaluation queries failed (3 queries).",
+      "Limited dataset sample size (3 queries; larger sample recommended).",
+      "Semantic judge was not configured; retrieval-only evidence."
+    ]
+  }
+}

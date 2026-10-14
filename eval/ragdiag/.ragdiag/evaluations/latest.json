@@ -1,0 +1,115 @@
+{
+  "dataset_name": "narsil_test_fixtures",
+  "dataset_version": "1.0",
+  "pipeline_name": "narsil_search_chunks",
+  "total_queries": 3,
+  "completed_queries": 3,
+  "failed_queries": 0,
+  "judged_queries": 0,
+  "judge_failures": 0,
+  "retrieval": {
+    "mean_precision_at_k": 0.20000000000000004,
+    "mean_recall_at_k": 1.0,
+    "mrr": 1.0,
+    "k": 5
+  },
+  "semantic": null,
+  "latency": {
+    "count": 3,
+    "mean_ms": 828.5456666666666,
+    "p50_ms": 334.605,
+    "p95_ms": 1685.4716999999998,
+    "p99_ms": 1805.54874,
+    "min_ms": 315.464,
+    "max_ms": 1835.568
+  },
+  "diagnosis_counts": {
+    "PASS": 2,
+    "WRONG_CHUNK_RETRIEVED": 0,
+    "WRONG_CHUNK_RANK": 0,
+    "INSUFFICIENT_CONTEXT": 0,
+    "RETRIEVED_BUT_NOT_GROUNDED": 0,
+    "ANSWER_INCORRECT": 0,
+    "LATENCY_OUTLIER": 1,
+    "UNKNOWN": 0
+  },
+  "diagnosis_by_query_type": {
+    "factual": {
+      "PASS": 2,
+      "WRONG_CHUNK_RETRIEVED": 0,
+      "WRONG_CHUNK_RANK": 0,
+      "INSUFFICIENT_CONTEXT": 0,
+      "RETRIEVED_BUT_NOT_GROUNDED": 0,
+      "ANSWER_INCORRECT": 0,
+      "LATENCY_OUTLIER": 1,
+      "UNKNOWN": 0
+    }
+  },
+  "metrics_by_query_type": {
+    "factual": {
+      "query_type": "factual",
+      "total_queries": 3,
+      "completed_queries": 3,
+      "failed_queries": 0,
+      "mean_precision_at_k": 0.20000000000000004,
+      "mean_recall_at_k": 1.0,
+      "mrr": 1.0,
+      "answer_correctness_rate": null,
+      "groundedness_rate": null,
+      "diagnosis_counts": {
+        "PASS": 2,
+        "WRONG_CHUNK_RETRIEVED": 0,
+        "WRONG_CHUNK_RANK": 0,
+        "INSUFFICIENT_CONTEXT": 0,
+        "RETRIEVED_BUT_NOT_GROUNDED": 0,
+        "ANSWER_INCORRECT": 0,
+        "LATENCY_OUTLIER": 1,
+        "UNKNOWN": 0
+      }
+    }
+  },
+  "top_failures": [
+    {
+      "query_id": "q_calculate_total",
+      "query": "calculate total price of items in a list",
+      "category": "LATENCY_OUTLIER",
+      "severity": "warning",
+      "confidence": 1.0,
+      "reason": "Retrieval latency (1835.6 ms) exceeded threshold (1000.0 ms).",
+      "action": "Investigate slow retrieval or generation paths and optimize the latency bottleneck.",
+      "evidence": [
+        "Retrieval latency: 1835.6 ms",
+        "Threshold: 1000.0 ms"
+      ]
+    }
+  ],
+  "overall_insights": [
+    "Retrieval latency outlier is the dominant failure mode (1 queries, 100% of failures).",
+    "Latency concerns detected: 1 queries exceeded latency thresholds (P95: 1685.5 ms)."
+  ],
+  "health_profile": {
+    "score": 78.2,
+    "grade": "Good",
+    "status": "Healthy",
+    "strengths": [
+      "High recall (mean Recall@5: 1.00)",
+      "Strong ranking quality (MRR: 1.00)"
+    ],
+    "weaknesses": [
+      "Poor precision (mean Precision@5: 0.20)",
+      "High retrieval latency (mean: 828.5ms, P95: 1685.5ms)"
+    ],
+    "recommendations": [
+      "Investigate slow retrieval or generation paths and optimize the latency bottleneck."
+    ]
+  },
+  "confidence": {
+    "score": 68.5,
+    "level": "Moderate",
+    "reasons": [
+      "All evaluation queries completed successfully.",
+      "Limited dataset sample size (3 queries; larger sample recommended).",
+      "Semantic judge was not configured; retrieval-only evidence."
+    ]
+  }
+}
