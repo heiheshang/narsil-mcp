@@ -31,7 +31,7 @@ use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
 };
-use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer, TokenStream};
+use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::search::scoped_doc_id;
@@ -92,12 +92,122 @@ fn build_schema() -> (Schema, Fields) {
 }
 
 fn analyzer() -> TextAnalyzer {
-    TextAnalyzer::builder(
-        NgramTokenizer::all_ngrams(GRAM_SIZE, GRAM_SIZE)
-            .expect("trigram tokenizer must be constructible"),
-    )
-    .filter(LowerCaser)
-    .build()
+    TextAnalyzer::from(TrigramTokenizer::default())
+}
+
+/// Every distinct lowercased 3-character window of the text, each once.
+///
+/// The terms are those of tantivy's `NgramTokenizer::all_ngrams(3, 3)`
+/// followed by `LowerCaser`, which lowercases per character. That pipeline
+/// allocated a `String` per window, lowercased every character three times
+/// (once per window it falls in), and handed every occurrence to the postings
+/// writer. As in SimString, the windows here are walked over `char`s in one
+/// pass, each character lowercased once, packed into a `u64` and deduplicated
+/// before tantivy sees them. The field records presence only
+/// ([`IndexRecordOption::Basic`]), so repeats carried nothing.
+#[derive(Clone, Default)]
+struct TrigramTokenizer {
+    seen: ahash::AHashSet<u64>,
+    grams: Vec<u64>,
+}
+
+/// Set on a packed trigram that holds the original characters, because one of
+/// them lowercases to more than one character.
+const RAW_GRAM: u64 = 1 << 63;
+const CHAR_BITS: u32 = 21;
+const CHAR_MASK: u64 = (1 << CHAR_BITS) - 1;
+
+/// The lowercase of `c` when it is a single character, as `char::to_lowercase`
+/// gives it. ASCII and the basic Cyrillic block skip the Unicode table lookup.
+fn lower_one(c: char) -> Option<char> {
+    if c.is_ascii() {
+        return Some(c.to_ascii_lowercase());
+    }
+    match c as u32 {
+        0x0400..=0x040F => char::from_u32(c as u32 + 0x50),
+        0x0410..=0x042F => char::from_u32(c as u32 + 0x20),
+        0x0430..=0x045F => Some(c),
+        _ => {
+            let mut lower = c.to_lowercase();
+            let first = lower.next();
+            if lower.next().is_some() {
+                None
+            } else {
+                first
+            }
+        }
+    }
+}
+
+fn pack(a: char, b: char, c: char) -> u64 {
+    (a as u64) << (2 * CHAR_BITS) | (b as u64) << CHAR_BITS | c as u64
+}
+
+fn unpack(gram: u64) -> [char; 3] {
+    // Packed from `char`s, so every field is a valid scalar value.
+    let at = |shift: u32| char::from_u32(((gram >> shift) & CHAR_MASK) as u32).unwrap_or('\0');
+    [at(2 * CHAR_BITS), at(CHAR_BITS), at(0)]
+}
+
+impl Tokenizer for TrigramTokenizer {
+    type TokenStream<'a> = TrigramStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> TrigramStream<'a> {
+        self.seen.clear();
+        self.grams.clear();
+        let mut window: [(char, Option<char>); GRAM_SIZE] = [('\0', None); GRAM_SIZE];
+        for (i, c) in text.chars().enumerate() {
+            window.rotate_left(1);
+            window[GRAM_SIZE - 1] = (c, lower_one(c));
+            if i + 1 < GRAM_SIZE {
+                continue;
+            }
+            let [(a, la), (b, lb), (c, lc)] = window;
+            let gram = match (la, lb, lc) {
+                (Some(la), Some(lb), Some(lc)) => pack(la, lb, lc),
+                _ => pack(a, b, c) | RAW_GRAM,
+            };
+            if self.seen.insert(gram) {
+                self.grams.push(gram);
+            }
+        }
+        TrigramStream {
+            grams: self.grams.iter(),
+            token: Token::default(),
+        }
+    }
+}
+
+struct TrigramStream<'a> {
+    grams: std::slice::Iter<'a, u64>,
+    token: Token,
+}
+
+impl TokenStream for TrigramStream<'_> {
+    fn advance(&mut self) -> bool {
+        let Some(&gram) = self.grams.next() else {
+            return false;
+        };
+        let text = &mut self.token.text;
+        text.clear();
+        for c in unpack(gram & !RAW_GRAM) {
+            if gram & RAW_GRAM != 0 {
+                text.extend(c.to_lowercase());
+            } else {
+                text.push(c);
+            }
+        }
+        self.token.position = self.token.position.wrapping_add(1);
+        true
+    }
+
+    fn token(&self) -> &Token {
+        &self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
 }
 
 pub struct TrigramIndex {
@@ -367,6 +477,65 @@ impl TrigramIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terms(mut analyzer: TextAnalyzer, text: &str) -> std::collections::BTreeSet<String> {
+        let mut stream = analyzer.token_stream(text);
+        let mut out = std::collections::BTreeSet::new();
+        while stream.advance() {
+            out.insert(stream.token().text.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn terms_match_ngram_tokenizer_with_lower_caser() {
+        use tantivy::tokenizer::{LowerCaser, NgramTokenizer};
+        let reference = || {
+            TextAnalyzer::builder(NgramTokenizer::all_ngrams(3, 3).unwrap())
+                .filter(LowerCaser)
+                .build()
+        };
+        for text in [
+            "",
+            "ab",
+            "abc",
+            "fn parse_config(path: &str) {}",
+            "Процедура ОбработкаПроведения(Отказ, Режим)\n\tЁлка = ЁЖИК;",
+            "ЀЍЏ ѐѝџ İstanbul ΣΑΣ Straße ǅ ﬃ 🦀🦀🦀 a\u{0}b",
+            "AAAAaaaaAAAA",
+        ] {
+            assert_eq!(
+                terms(analyzer(), text),
+                terms(reference(), text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_one_agrees_with_char_to_lowercase() {
+        for c in (0..=char::MAX as u32).filter_map(char::from_u32) {
+            let mut lower = c.to_lowercase();
+            let single = match (lower.next(), lower.next()) {
+                (Some(l), None) => Some(l),
+                _ => None,
+            };
+            assert_eq!(lower_one(c), single, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_windows_are_emitted_once() {
+        let t = terms(analyzer(), "abcabcABC");
+        assert_eq!(t.len(), 3);
+        let mut analyzer = analyzer();
+        let mut stream = analyzer.token_stream("abcabcABC");
+        let mut n = 0;
+        while stream.advance() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+    }
 
     fn populated() -> TrigramIndex {
         let idx = TrigramIndex::in_memory().unwrap();
