@@ -480,6 +480,9 @@ pub struct CodeIntelEngine {
     analysis_cache: Arc<AnalysisCache<AnalysisCacheKey, String>>,
     /// Query result cache for symbol lookups and search operations
     query_cache: Arc<QueryCache>,
+    /// Indexes read from SQLite by the constructor, handed to the background
+    /// walk so it does not read the same database a second time.
+    preloaded: DashMap<PathBuf, PersistedIndex>,
     /// Tracks whether background initialization has completed
     initialization_complete: AtomicBool,
     /// Number of repositories that have been fully indexed
@@ -943,6 +946,7 @@ impl CodeIntelEngine {
             security_engine,
             analysis_cache,
             query_cache,
+            preloaded: DashMap::new(),
             initialization_complete: AtomicBool::new(false),
             indexed_repos_count: AtomicUsize::new(0),
             total_repos_count: AtomicUsize::new(total_repos),
@@ -1020,6 +1024,7 @@ impl CodeIntelEngine {
 
                             engine.repos.insert(repo_name.clone(), metadata);
                             engine.symbols.insert(repo_name.clone(), symbols);
+                            engine.preloaded.insert(repo_path.clone(), persisted);
                             loaded_repos.push(repo_name);
                         }
                     }
@@ -1094,9 +1099,13 @@ impl CodeIntelEngine {
             // `find_similar_code` and friends answering from empty indexes.
             // The cached symbols keep tree-sitter off unchanged files.
             let persisted = if was_cached {
-                self.index_store
-                    .as_ref()
-                    .and_then(|store| store.load_or_create(repo_path).ok())
+                match self.preloaded.remove(repo_path) {
+                    Some((_, persisted)) => Some(persisted),
+                    None => self
+                        .index_store
+                        .as_ref()
+                        .and_then(|store| store.load_or_create(repo_path).ok()),
+                }
             } else {
                 None
             };
@@ -1137,6 +1146,9 @@ impl CodeIntelEngine {
                 }
             }
         }
+        // Repositories skipped above (path gone) would otherwise keep their
+        // preloaded index alive for the life of the process.
+        self.preloaded.clear();
 
         // Flush the search index once, after every repository has been walked.
         // Committing per document would fsync thousands of times; committing
