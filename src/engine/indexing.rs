@@ -2,6 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, debug_span, info, warn, Instrument};
@@ -727,35 +728,49 @@ impl CodeIntelEngine {
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
-            .build();
+            .build_parallel();
 
         // Vendored/generated content is excluded by default so committed
         // vendor/, node_modules/ etc. don't drown search results; users can
         // opt back in with a `!`-prefixed pattern in `index_exclude`.
         let index_filter = crate::security_rules::IndexFilter::new(&self.options.index_exclude)?;
         let max_file_size = self.options.index_max_file_size;
-        let mut skipped_vendored = 0usize;
-        let mut skipped_large = 0usize;
+        let skipped_vendored = AtomicUsize::new(0);
+        let skipped_large = AtomicUsize::new(0);
 
-        let files: Vec<PathBuf> = walker
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-            .filter(|e| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        walker.run(|| {
+            let tx = tx.clone();
+            let (index_filter, skipped_vendored, skipped_large) =
+                (&index_filter, &skipped_vendored, &skipped_large);
+            Box::new(move |entry| {
+                let Ok(e) = entry else {
+                    return ignore::WalkState::Continue;
+                };
+                if !e.file_type().is_some_and(|ft| ft.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
                 let rel = e.path().strip_prefix(path).unwrap_or(e.path());
                 if index_filter.is_excluded(rel) {
-                    skipped_vendored += 1;
-                    return false;
+                    skipped_vendored.fetch_add(1, Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
                 }
                 if let Some(max) = max_file_size {
                     if e.metadata().map(|m| m.len() > max).unwrap_or(false) {
-                        skipped_large += 1;
-                        return false;
+                        skipped_large.fetch_add(1, Ordering::Relaxed);
+                        return ignore::WalkState::Continue;
                     }
                 }
-                true
+                let _ = tx.send(e.into_path());
+                ignore::WalkState::Continue
             })
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        });
+        drop(tx);
+        // The parallel walk yields files in no fixed order.
+        let mut files: Vec<PathBuf> = rx.into_iter().collect();
+        files.sort_unstable();
+        let skipped_vendored = skipped_vendored.into_inner();
+        let skipped_large = skipped_large.into_inner();
         drop(walk_span);
 
         if skipped_vendored > 0 || skipped_large > 0 {
