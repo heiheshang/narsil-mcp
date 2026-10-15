@@ -9,13 +9,20 @@ use tracing::{debug, debug_span, info, warn, Instrument};
 use super::{
     collect_onec_normalized_documents, ext_to_language, read_indexable_text_file, reusable_symbols,
     symbol_kind_to_doc_type, unchanged_since, CodeIntelEngine, LanguageStats, PreparedDocuments,
-    PreparedNormalized, RepoMetadata, WalkOutcome,
+    PreparedNormalized, PreparedSymbol, RepoMetadata, WalkOutcome,
 };
 use crate::callgraph::CallGraph;
 use crate::ingest::NormalizedDocument;
 use crate::persist::PersistedIndex;
 use crate::search::{DocType, SearchDocument};
 use crate::symbols::Symbol;
+
+/// Files are prepared and indexed in chunks so the whole corpus's content and
+/// tree-sitter trees are never resident at once. The pre-streaming `collect()`
+/// held every file's parse tree simultaneously — the 20 GB OOM on the 1С
+/// config. A chunk's trees are dropped once it is indexed, with at most three
+/// chunks in flight (see [`CodeIntelEngine::run_parse_pipeline`]).
+const CHUNK_SIZE: usize = 200;
 
 /// What the walk over one repository's files shares between its stages.
 struct WalkCtx<'a> {
@@ -79,8 +86,6 @@ impl CodeIntelEngine {
         // cheap clone of this tag so searches can be scoped to one repo.
         let repo_tag: Arc<str> = Arc::from(repo_name.as_str());
 
-        let mut acc = WalkAcc::default();
-
         // Documents and the knowledge graph of an unchanged file are reused
         // only from a run of this same build; another build may produce them
         // differently.
@@ -108,18 +113,11 @@ impl CodeIntelEngine {
         );
         let reuse = if graph_loaded { same_build } else { reuse };
 
-        // Process in chunks so the whole corpus's content + tree-sitter trees
-        // are never resident at once. The pre-streaming `collect()` held every
-        // file's parse tree simultaneously — the 20 GB OOM on the 1С config.
-        // A chunk's trees are dropped once it is indexed, with at most three
-        // chunks in flight (see the parse pipeline below).
-        const CHUNK_SIZE: usize = 200;
-
         // Parse + extract in chunks; the call graph is fed incrementally
         // (function defs in pass 1, call sites in pass 2). The DashMap ref is
         // scoped to this block so the non-Send guard never crosses the neural
         // `.await` below.
-        {
+        let acc = {
             let call_graph = if self.options.call_graph_enabled {
                 self.call_graphs.get(&repo_name)
             } else {
@@ -134,110 +132,12 @@ impl CodeIntelEngine {
                 graph_loaded,
                 call_graph: call_graph.as_deref(),
             };
-
-            // One span per phase, entered once per chunk: the close event
-            // reports the phase's total across chunks, not 200 files' worth.
-            // `parse` runs alongside `index_documents`, so the two overlap.
-            let parse_span = debug_span!("parse", files = files.len());
-            let documents_span = debug_span!("index_documents");
-            let functions_span = debug_span!("callgraph_functions");
-            // Which side of the parse pipeline is the bottleneck: parsing
-            // waits on a full channel, indexing waits on an empty one.
-            let parse_wait_span = debug_span!("parse_wait");
-            let documents_wait_span = debug_span!("index_documents_wait");
-            debug!(
-                "Parsing {} files in chunks of {} (reusing cached symbols: {})",
-                files.len(),
-                CHUNK_SIZE,
-                reuse.is_some()
-            );
-
-            // Chunk N+1 is parsed on the rayon pool while this thread indexes
-            // chunk N; in lockstep each side idled while the other worked.
-            // The channel holds one chunk, so at most three are resident.
-            let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::scope(|scope| -> Result<()> {
-                scope.spawn(|| {
-                    // Moved in, so the receiver sees the end once the last chunk is sent.
-                    let parsed_tx = parsed_tx;
-                    for chunk in files.chunks(CHUNK_SIZE) {
-                        let parse_guard = parse_span.enter();
-                        let parsed_chunk: Vec<_> = chunk
-                            .par_iter()
-                            .filter_map(|file_path| self.prepare_file(&ctx, file_path))
-                            .collect();
-                        drop(parse_guard);
-                        // The receiver is gone only when indexing stopped on an error.
-                        let sent = parse_wait_span.in_scope(|| parsed_tx.send(parsed_chunk));
-                        if sent.is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                while let Ok(parsed_chunk) = documents_wait_span.in_scope(|| parsed_rx.recv()) {
-                    let documents_guard = documents_span.enter();
-                    let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
-
-                    for file in parsed_chunk {
-                        self.index_prepared_file(&ctx, &mut acc, file, &mut chunk_trees);
-                    }
-
-                    drop(documents_guard);
-
-                    // Call-graph pass 1: function definitions for this chunk.
-                    if let Some(cg) = call_graph.as_ref() {
-                        let _functions_guard = functions_span.enter();
-                        cg.collect_functions(&chunk_trees)?;
-                        // Freeing a tree walks every node; on this thread it was
-                        // a second of a BSL corpus's critical path.
-                        chunk_trees.into_par_iter().for_each(drop);
-                    }
-                }
-                Ok(())
-            })?;
-
-            // Call-graph pass 2: call sites, resolved against every function
-            // gathered in pass 1. Files whose sites pass 1 already read are
-            // only resolved; any other is re-parsed, resolved and its tree
-            // dropped on the same worker (call graph is opt-in, so the double
-            // parse only happens for it).
-            if let Some(cg) = call_graph.as_ref().filter(|_| !graph_loaded) {
-                let _calls_span = debug_span!("callgraph_calls", files = files.len()).entered();
-                debug!(
-                    "Resolving call sites across {} files, {} symbols",
-                    files.len(),
-                    acc.symbols.len()
-                );
-                std::mem::take(&mut acc.pending_calls)
-                    .into_par_iter()
-                    .for_each(|(relative_path, calls)| {
-                        cg.resolve_pending_calls(&relative_path, calls)
-                    });
-                files.par_iter().try_for_each(|file_path| {
-                    if acc.deferred_files.contains(file_path) {
-                        return Ok(());
-                    }
-                    let Some(content) = read_indexable_text_file(file_path) else {
-                        return Ok(());
-                    };
-                    // Only the tree: symbols were extracted in pass 1.
-                    let Ok(tree) = self.parser.parse_to_tree(file_path, &content) else {
-                        return Ok(());
-                    };
-                    let relative_path = file_path
-                        .strip_prefix(path)
-                        .unwrap_or(file_path)
-                        .to_string_lossy();
-                    cg.collect_file_calls(&relative_path, &content, &tree)
-                })?;
-                cg.link_extensions();
-                info!(
-                    "Built call graph for {} with {} files",
-                    repo_name, acc.file_count
-                );
+            let mut acc = self.run_parse_pipeline(&ctx, &files)?;
+            if let Some(cg) = ctx.call_graph.filter(|_| !graph_loaded) {
+                self.resolve_call_sites(cg, &ctx, &files, &mut acc, &repo_name)?;
             }
-        }
+            acc
+        };
 
         let WalkAcc {
             languages,
@@ -267,34 +167,7 @@ impl CodeIntelEngine {
             repo_name
         );
 
-        // Batch index neural embeddings if enabled
-        if let Some(ref neural) = self.neural_engine {
-            if !neural_docs.is_empty() {
-                info!(
-                    "Generating neural embeddings for {} symbols...",
-                    neural_docs.len()
-                );
-                let items: Vec<(crate::neural::NeuralDocument,)> =
-                    neural_docs.into_iter().map(|d| (d,)).collect();
-                // `index_batch` drives a blocking reqwest client. Calling it directly
-                // from this async fn runs it on a tokio worker thread, which stalls
-                // the runtime after ~128 requests: the server answers, the client
-                // never picks the response up, and every later request times out.
-                let neural = Arc::clone(neural);
-                let neural_span = debug_span!("neural_embeddings", symbols = items.len());
-                match tokio::task::spawn_blocking(move || neural.index_batch(&items))
-                    .instrument(neural_span)
-                    .await
-                {
-                    Ok(Ok(())) => info!("Neural embeddings indexed successfully"),
-                    Ok(Err(e)) => warn!(
-                        "Failed to batch index neural embeddings — semantic search falls back \
-                         to TF-IDF for these symbols: {e}"
-                    ),
-                    Err(e) => warn!("Neural embedding task panicked: {e}"),
-                }
-            }
-        }
+        self.index_neural_docs(neural_docs).await;
 
         // Record indexing metrics
         let elapsed = start_time.elapsed();
@@ -308,49 +181,211 @@ impl CodeIntelEngine {
 
         self.log_memory_breakdown();
 
-        // Transform symbols to RDF knowledge graph if enabled
         #[cfg(feature = "graph")]
-        if let Some(ref graph) = self.knowledge_graph {
-            use crate::persistence::RepositoryTransformer;
-            let _graph_span = debug_span!("knowledge_graph").entered();
-            // Same build and no file changed: the symbols, and so the graph,
-            // are what the last run wrote.
-            let graph_current = search_warm
-                && stale_files == 0
-                && removed_files == 0
-                && RepositoryTransformer::is_transformed(graph, &repo_name).unwrap_or(false);
-            if graph_current {
-                debug!("Knowledge graph for {repo_name} is up to date");
-            } else {
-                debug!(
-                    "Transforming {} symbols to RDF",
-                    self.symbols.get(&repo_name).map_or(0, |s| s.len())
-                );
-
-                if let Some(symbols) = self.symbols.get(&repo_name) {
-                    match Self::load_symbols_into_graph(graph, &repo_name, &symbols) {
-                        Ok(()) => info!(
-                            "Transformed {} symbols to RDF knowledge graph for {}",
-                            symbols.len(),
-                            repo_name
-                        ),
-                        Err(e) => warn!(
-                            "Failed to transform symbols to RDF for {}: {}",
-                            repo_name, e
-                        ),
-                    }
-                }
-                if let Err(e) = graph.flush() {
-                    warn!("Failed to flush knowledge graph: {e}");
-                }
-            }
-        }
+        self.update_knowledge_graph(&repo_name, search_warm, stale_files, removed_files);
 
         Ok(WalkOutcome {
             reparsed_files,
             indexed_files: file_count,
             stale_files,
         })
+    }
+
+    /// Embed the symbols collected for the neural engine, when it is enabled.
+    async fn index_neural_docs(&self, neural_docs: Vec<crate::neural::NeuralDocument>) {
+        let Some(ref neural) = self.neural_engine else {
+            return;
+        };
+        if neural_docs.is_empty() {
+            return;
+        }
+        info!(
+            "Generating neural embeddings for {} symbols...",
+            neural_docs.len()
+        );
+        let items: Vec<(crate::neural::NeuralDocument,)> =
+            neural_docs.into_iter().map(|d| (d,)).collect();
+        // `index_batch` drives a blocking reqwest client. Calling it directly
+        // from this async fn runs it on a tokio worker thread, which stalls
+        // the runtime after ~128 requests: the server answers, the client
+        // never picks the response up, and every later request times out.
+        let neural = Arc::clone(neural);
+        let neural_span = debug_span!("neural_embeddings", symbols = items.len());
+        match tokio::task::spawn_blocking(move || neural.index_batch(&items))
+            .instrument(neural_span)
+            .await
+        {
+            Ok(Ok(())) => info!("Neural embeddings indexed successfully"),
+            Ok(Err(e)) => warn!(
+                "Failed to batch index neural embeddings — semantic search falls back \
+                 to TF-IDF for these symbols: {e}"
+            ),
+            Err(e) => warn!("Neural embedding task panicked: {e}"),
+        }
+    }
+
+    /// Transform the repository's symbols into the RDF knowledge graph, unless
+    /// it already holds what the last run of this build wrote.
+    #[cfg(feature = "graph")]
+    fn update_knowledge_graph(
+        &self,
+        repo_name: &str,
+        search_warm: bool,
+        stale_files: usize,
+        removed_files: usize,
+    ) {
+        use crate::persistence::RepositoryTransformer;
+        let Some(ref graph) = self.knowledge_graph else {
+            return;
+        };
+        let _graph_span = debug_span!("knowledge_graph").entered();
+        // Same build and no file changed: the symbols, and so the graph,
+        // are what the last run wrote.
+        let graph_current = search_warm
+            && stale_files == 0
+            && removed_files == 0
+            && RepositoryTransformer::is_transformed(graph, repo_name).unwrap_or(false);
+        if graph_current {
+            debug!("Knowledge graph for {repo_name} is up to date");
+            return;
+        }
+        debug!(
+            "Transforming {} symbols to RDF",
+            self.symbols.get(repo_name).map_or(0, |s| s.len())
+        );
+
+        if let Some(symbols) = self.symbols.get(repo_name) {
+            match Self::load_symbols_into_graph(graph, repo_name, &symbols) {
+                Ok(()) => info!(
+                    "Transformed {} symbols to RDF knowledge graph for {}",
+                    symbols.len(),
+                    repo_name
+                ),
+                Err(e) => warn!(
+                    "Failed to transform symbols to RDF for {}: {}",
+                    repo_name, e
+                ),
+            }
+        }
+        if let Err(e) = graph.flush() {
+            warn!("Failed to flush knowledge graph: {e}");
+        }
+    }
+
+    /// Prepare files on the rayon pool while this thread indexes them, chunk
+    /// by chunk, feeding each chunk's functions to the call graph (pass 1).
+    fn run_parse_pipeline(&self, ctx: &WalkCtx<'_>, files: &[PathBuf]) -> Result<WalkAcc> {
+        let mut acc = WalkAcc::default();
+
+        // One span per phase, entered once per chunk: the close event
+        // reports the phase's total across chunks, not 200 files' worth.
+        // `parse` runs alongside `index_documents`, so the two overlap.
+        let parse_span = debug_span!("parse", files = files.len());
+        let documents_span = debug_span!("index_documents");
+        let functions_span = debug_span!("callgraph_functions");
+        // Which side of the parse pipeline is the bottleneck: parsing
+        // waits on a full channel, indexing waits on an empty one.
+        let parse_wait_span = debug_span!("parse_wait");
+        let documents_wait_span = debug_span!("index_documents_wait");
+        debug!(
+            "Parsing {} files in chunks of {} (reusing cached symbols: {})",
+            files.len(),
+            CHUNK_SIZE,
+            ctx.reuse.is_some()
+        );
+
+        // Chunk N+1 is parsed on the rayon pool while this thread indexes
+        // chunk N; in lockstep each side idled while the other worked.
+        // The channel holds one chunk, so at most three are resident.
+        let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(|| {
+                // Moved in, so the receiver sees the end once the last chunk is sent.
+                let parsed_tx = parsed_tx;
+                for chunk in files.chunks(CHUNK_SIZE) {
+                    let parse_guard = parse_span.enter();
+                    let parsed_chunk: Vec<_> = chunk
+                        .par_iter()
+                        .filter_map(|file_path| self.prepare_file(ctx, file_path))
+                        .collect();
+                    drop(parse_guard);
+                    // The receiver is gone only when indexing stopped on an error.
+                    let sent = parse_wait_span.in_scope(|| parsed_tx.send(parsed_chunk));
+                    if sent.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            while let Ok(parsed_chunk) = documents_wait_span.in_scope(|| parsed_rx.recv()) {
+                let documents_guard = documents_span.enter();
+                let mut chunk_trees: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+
+                for file in parsed_chunk {
+                    self.index_prepared_file(ctx, &mut acc, file, &mut chunk_trees);
+                }
+
+                drop(documents_guard);
+
+                // Call-graph pass 1: function definitions for this chunk.
+                if let Some(cg) = ctx.call_graph {
+                    let _functions_guard = functions_span.enter();
+                    cg.collect_functions(&chunk_trees)?;
+                    // Freeing a tree walks every node; on this thread it was
+                    // a second of a BSL corpus's critical path.
+                    chunk_trees.into_par_iter().for_each(drop);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(acc)
+    }
+
+    /// Call-graph pass 2: call sites, resolved against every function
+    /// gathered in pass 1. Files whose sites pass 1 already read are only
+    /// resolved; any other is re-parsed, resolved and its tree dropped on the
+    /// same worker (call graph is opt-in, so the double parse only happens
+    /// for it).
+    fn resolve_call_sites(
+        &self,
+        cg: &CallGraph,
+        ctx: &WalkCtx<'_>,
+        files: &[PathBuf],
+        acc: &mut WalkAcc,
+        repo_name: &str,
+    ) -> Result<()> {
+        let _calls_span = debug_span!("callgraph_calls", files = files.len()).entered();
+        debug!(
+            "Resolving call sites across {} files, {} symbols",
+            files.len(),
+            acc.symbols.len()
+        );
+        std::mem::take(&mut acc.pending_calls)
+            .into_par_iter()
+            .for_each(|(relative_path, calls)| cg.resolve_pending_calls(&relative_path, calls));
+        files.par_iter().try_for_each(|file_path| {
+            if acc.deferred_files.contains(file_path) {
+                return Ok(());
+            }
+            let Some(content) = read_indexable_text_file(file_path) else {
+                return Ok(());
+            };
+            // Only the tree: symbols were extracted in pass 1.
+            let Ok(tree) = self.parser.parse_to_tree(file_path, &content) else {
+                return Ok(());
+            };
+            let relative_path = file_path
+                .strip_prefix(ctx.path)
+                .unwrap_or(file_path)
+                .to_string_lossy();
+            cg.collect_file_calls(&relative_path, &content, &tree)
+        })?;
+        cg.link_extensions();
+        info!(
+            "Built call graph for {} with {} files",
+            repo_name, acc.file_count
+        );
+        Ok(())
     }
 
     /// Read one file on the parse pool and prepare everything that does not
@@ -524,50 +559,8 @@ impl CodeIntelEngine {
         if let Some(parsed) = parsed {
             let crate::parser::ParsedFile { symbols, tree, .. } = parsed;
 
-            for (mut symbol, prepared) in symbols.into_iter().zip(prepared.symbols) {
-                symbol.file_path = relative_path.clone();
-
-                if let Some((card, card_len)) = prepared.card {
-                    self.search_index.index_symbol_counted(
-                        Arc::clone(ctx.repo_tag),
-                        &relative_path,
-                        &symbol.name,
-                        &card,
-                        symbol_kind_to_doc_type(&symbol.kind),
-                        symbol.start_line,
-                        symbol.end_line,
-                        Some(card_len),
-                    );
-                }
-                let tokens = prepared.signature_tokens;
-
-                // Index symbol into embedding engine for similarity search
-                if let (Some(ref sig), Some(tokens)) = (&symbol.signature, tokens) {
-                    let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                    self.embedding_engine.index_tokens_embed_only(
-                        symbol_id.clone(),
-                        Arc::clone(ctx.repo_tag),
-                        relative_path.clone(),
-                        &tokens,
-                        symbol.start_line,
-                        symbol.end_line,
-                    );
-
-                    // Collect for neural batch indexing if enabled
-                    if self.neural_engine.is_some() {
-                        acc.neural_docs.push(crate::neural::NeuralDocument {
-                            id: symbol_id,
-                            repo: Arc::clone(ctx.repo_tag),
-                            file_path: relative_path.clone(),
-                            content: sig.clone(),
-                            start_line: symbol.start_line,
-                            end_line: symbol.end_line,
-                            symbol_name: Some(symbol.name.clone()),
-                        });
-                    }
-                }
-
-                acc.symbols.push(symbol);
+            for (symbol, prepared) in symbols.into_iter().zip(prepared.symbols) {
+                self.index_file_symbol(ctx, acc, &relative_path, symbol, prepared);
             }
 
             // Collect tree for call graph if enabled and tree exists
@@ -608,6 +601,61 @@ impl CodeIntelEngine {
             acc.normalized_docs
                 .push(self.index_normalized_document(Arc::clone(ctx.repo_tag), document));
         }
+    }
+
+    /// Index one symbol of a file: its search card, its signature for TF-IDF
+    /// similarity and the neural engine.
+    fn index_file_symbol(
+        &self,
+        ctx: &WalkCtx<'_>,
+        acc: &mut WalkAcc,
+        relative_path: &str,
+        mut symbol: Symbol,
+        prepared: PreparedSymbol,
+    ) {
+        symbol.file_path = relative_path.to_string();
+
+        if let Some((card, card_len)) = prepared.card {
+            self.search_index.index_symbol_counted(
+                Arc::clone(ctx.repo_tag),
+                relative_path,
+                &symbol.name,
+                &card,
+                symbol_kind_to_doc_type(&symbol.kind),
+                symbol.start_line,
+                symbol.end_line,
+                Some(card_len),
+            );
+        }
+        let tokens = prepared.signature_tokens;
+
+        // Index symbol into embedding engine for similarity search
+        if let (Some(ref sig), Some(tokens)) = (&symbol.signature, tokens) {
+            let symbol_id = format!("{}::{}", relative_path, symbol.name);
+            self.embedding_engine.index_tokens_embed_only(
+                symbol_id.clone(),
+                Arc::clone(ctx.repo_tag),
+                relative_path.to_string(),
+                &tokens,
+                symbol.start_line,
+                symbol.end_line,
+            );
+
+            // Collect for neural batch indexing if enabled
+            if self.neural_engine.is_some() {
+                acc.neural_docs.push(crate::neural::NeuralDocument {
+                    id: symbol_id,
+                    repo: Arc::clone(ctx.repo_tag),
+                    file_path: relative_path.to_string(),
+                    content: sig.clone(),
+                    start_line: symbol.start_line,
+                    end_line: symbol.end_line,
+                    symbol_name: Some(symbol.name.clone()),
+                });
+            }
+        }
+
+        acc.symbols.push(symbol);
     }
 
     /// Whether this repository's search documents and trigrams on disk can be
