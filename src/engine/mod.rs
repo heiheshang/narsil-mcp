@@ -2847,6 +2847,34 @@ impl CodeIntelEngine {
         self.options.persist_enabled && self.repo_paths.len() == 1
     }
 
+    /// The repository's 1C normalized documents with `stamp`, unless it has
+    /// none. Kept current by incremental updates, so every save writes them.
+    fn save_normalized_snapshot(&self, repo_path: &Path, repo_name: &str, stamp: &str) {
+        let Some(store) = self.index_store.as_ref() else {
+            return;
+        };
+        let Some(documents) = self.normalized_docs.get(repo_name) else {
+            return;
+        };
+        if documents.is_empty() {
+            return;
+        }
+        let _span = debug_span!("save_normalized").entered();
+        let saved = postcard::to_stdvec(stamp)
+            .and_then(|bytes| postcard::to_extend(&*documents, bytes))
+            .map_err(anyhow::Error::from)
+            .and_then(|snapshot| store.save_normalized(repo_path, &snapshot));
+        if let Err(e) = saved {
+            warn!("Failed to save 1C normalized documents for {repo_name}: {e}");
+        }
+    }
+
+    /// All 1C normalized documents of the repository, for comparing runs.
+    #[doc(hidden)]
+    pub fn repo_normalized_docs(&self, repo: &str) -> Option<Vec<NormalizedDocument>> {
+        self.normalized_docs.get(repo).map(|docs| docs.clone())
+    }
+
     pub(super) fn save_tfidf_snapshot(&self, repo_path: &Path, stamp: &str) {
         let Some(store) = self.index_store.as_ref() else {
             return;
@@ -2897,6 +2925,9 @@ impl CodeIntelEngine {
                 if with_tfidf && self.tfidf_snapshots_apply() {
                     scope.spawn(|| self.save_tfidf_snapshot(repo_path, &snapshot_stamp));
                 }
+                scope.spawn(|| {
+                    self.save_normalized_snapshot(repo_path, &repo_name, &snapshot_stamp)
+                });
                 if self.options.call_graph_enabled {
                     scope.spawn(|| {
                         if let Some(cg) = self.call_graphs.get(&repo_name) {

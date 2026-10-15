@@ -50,7 +50,7 @@ pub struct PersistedIndex {
 /// Bump it with any change to what indexing produces; a persisted index of
 /// another version is rebuilt instead of reused. `tests/index_format.rs`
 /// fails when the output on the fixtures changes and this does not.
-pub const INDEX_FORMAT_VERSION: u32 = 1;
+pub const INDEX_FORMAT_VERSION: u32 = 2;
 
 pub fn current_index_format() -> String {
     format!(
@@ -397,6 +397,17 @@ impl IndexStore {
     /// Load a call-graph snapshot from disk
     pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
         self.read_snapshot(repo_root, "callgraph.bin")
+    }
+
+    pub fn save_normalized(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
+        let path = self.snapshot_path(repo_root, "normalized.bin");
+        std::fs::write(&path, snapshot)?;
+        debug!("Saved 1C normalized documents to {:?}", path);
+        Ok(())
+    }
+
+    pub fn load_normalized(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
+        self.read_snapshot(repo_root, "normalized.bin")
     }
 }
 

@@ -37,6 +37,9 @@ struct WalkCtx<'a> {
     graph_loaded: bool,
     /// TF-IDF came from a snapshot; nothing goes into the engine.
     tfidf_loaded: bool,
+    /// 1C normalized documents came from a snapshot; metadata XML is not
+    /// normalized again.
+    normalized_loaded: bool,
     call_graph: Option<&'a CallGraph>,
 }
 
@@ -47,6 +50,7 @@ struct Restored {
     unchanged: bool,
     graph: bool,
     tfidf: bool,
+    normalized: Option<Vec<NormalizedDocument>>,
 }
 
 /// One file as the parse pool hands it to the indexing thread.
@@ -112,7 +116,7 @@ impl CodeIntelEngine {
             }
             _ => 0,
         };
-        let restored = self.restore_unchanged(
+        let mut restored = self.restore_unchanged(
             path,
             &repo_name,
             &files,
@@ -147,6 +151,7 @@ impl CodeIntelEngine {
                 search_warm,
                 graph_loaded,
                 tfidf_loaded: restored.tfidf,
+                normalized_loaded: restored.normalized.is_some(),
                 call_graph: call_graph.as_deref(),
             };
             let mut acc = self.run_parse_pipeline(&ctx, &files)?;
@@ -193,8 +198,10 @@ impl CodeIntelEngine {
 
         self.repos.insert(repo_name.clone(), metadata);
         self.symbols.insert(repo_name.clone(), symbols_vec);
-        self.normalized_docs
-            .insert(repo_name.clone(), normalized_docs_vec);
+        self.normalized_docs.insert(
+            repo_name.clone(),
+            restored.normalized.take().unwrap_or(normalized_docs_vec),
+        );
 
         self.log_memory_breakdown();
 
@@ -425,17 +432,23 @@ impl CodeIntelEngine {
         let mut prepared =
             PreparedDocuments::new(parsed.as_ref(), &content, !unchanged, !ctx.tfidf_loaded);
         if file_path.extension().is_some_and(|ext| ext == "xml") {
-            let relative = file_path
-                .strip_prefix(ctx.path)
-                .unwrap_or(file_path)
-                .to_string_lossy();
-            prepared.platform_entries =
-                crate::ingest::onec::platform_entry_points(&relative, &content);
-            let into_search = !unchanged;
-            prepared.normalized = collect_onec_normalized_documents(ctx.path, file_path)
-                .into_iter()
-                .map(|document| PreparedNormalized::new(document, into_search, !ctx.tfidf_loaded))
-                .collect();
+            if !ctx.graph_loaded {
+                let relative = file_path
+                    .strip_prefix(ctx.path)
+                    .unwrap_or(file_path)
+                    .to_string_lossy();
+                prepared.platform_entries =
+                    crate::ingest::onec::platform_entry_points(&relative, &content);
+            }
+            if !ctx.normalized_loaded {
+                let into_search = !unchanged;
+                prepared.normalized = collect_onec_normalized_documents(ctx.path, file_path)
+                    .into_iter()
+                    .map(|document| {
+                        PreparedNormalized::new(document, into_search, !ctx.tfidf_loaded)
+                    })
+                    .collect();
+            }
         }
         if let (Some(cg), Some(tree)) = (
             ctx.call_graph,
@@ -855,8 +868,49 @@ impl CodeIntelEngine {
         restored.tfidf = wants_tfidf && self.load_tfidf_snapshot(path, repo_name, persisted);
         if restored.tfidf {
             info!("{repo_name}: no file changed; TF-IDF state loaded from its snapshot");
+            // Without TF-IDF from its snapshot the documents still have to be
+            // tokenized into the engine, so they are rebuilt from the XML.
+            restored.normalized = self.load_normalized_snapshot(path, repo_name, persisted);
         }
         restored
+    }
+
+    /// The 1C normalized documents saved with `persisted`. `None` when there
+    /// are none, they are from another save, or they cannot be read.
+    fn load_normalized_snapshot(
+        &self,
+        path: &Path,
+        repo_name: &str,
+        persisted: &PersistedIndex,
+    ) -> Option<Vec<NormalizedDocument>> {
+        let _span = debug_span!("load_normalized").entered();
+        let snapshot = match self.index_store.as_ref()?.load_normalized(path) {
+            Ok(snapshot) => snapshot?,
+            Err(e) => {
+                warn!("Failed to read 1C normalized documents for {repo_name}: {e}");
+                return None;
+            }
+        };
+        let decoded = postcard::take_from_bytes::<String>(&snapshot).and_then(|(stamp, rest)| {
+            Ok((
+                stamp,
+                postcard::from_bytes::<Vec<NormalizedDocument>>(rest)?,
+            ))
+        });
+        match decoded {
+            Ok((stamp, documents)) if stamp == persisted.snapshot_stamp => {
+                info!(
+                    "{repo_name}: no file changed; {} 1C normalized documents loaded from their snapshot",
+                    documents.len()
+                );
+                Some(documents)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Failed to load 1C normalized documents for {repo_name}: {e}");
+                None
+            }
+        }
     }
 
     /// Load the TF-IDF snapshot saved with `persisted`. False when there is

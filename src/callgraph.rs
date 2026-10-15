@@ -199,6 +199,7 @@ struct Snapshot {
     name_index: Vec<(u32, Vec<u32>)>,
     file_functions: Vec<(u32, Vec<u32>)>,
     types: types::TypeSnapshot,
+    platform_entries: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4320,6 +4321,7 @@ impl CallGraph {
             name_index,
             file_functions,
             types: self.types.to_snapshot(),
+            platform_entries: self.platform_entries(),
         };
         // The stamp first, so a snapshot of another save is rejected without
         // decoding the rest.
@@ -4434,7 +4436,23 @@ impl CallGraph {
             self.file_functions.insert(path, keys);
         }
         self.types.load_snapshot(snapshot.types);
+        self.platform_entries.clear();
+        for (key, reason) in snapshot.platform_entries {
+            self.platform_entries.insert(key, reason);
+        }
         Ok(true)
+    }
+
+    /// `module::procedure` keys of the procedures the platform calls, with
+    /// the reason, sorted by key.
+    pub fn platform_entries(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .platform_entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        entries.sort_unstable();
+        entries
     }
 
     /// Get all nodes (for iteration)

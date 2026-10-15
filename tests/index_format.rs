@@ -58,6 +58,9 @@ fn call_graph_text(snapshot: &[u8]) -> String {
         })
         .collect();
     lines.sort_unstable();
+    for (key, reason) in graph.platform_entries() {
+        lines.push(format!("platform\t{key}\t{reason}"));
+    }
     lines.join("\n")
 }
 
@@ -166,6 +169,13 @@ async fn fingerprints() -> BTreeMap<&'static str, String> {
         "call_graph",
         hash(call_graph_text(
             &engine.call_graph_snapshot("fixtures").unwrap(),
+        )),
+    );
+    out.insert(
+        "normalized",
+        hash(format!(
+            "{:?}",
+            engine.repo_normalized_docs("fixtures").unwrap_or_default()
         )),
     );
     out.insert("search", hash(stored_documents(&index_dir.join("search"))));
