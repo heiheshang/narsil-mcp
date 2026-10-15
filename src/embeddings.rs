@@ -478,6 +478,50 @@ impl Default for ConcurrentVectorStore {
     }
 }
 
+/// What [`EmbeddingEngine::to_snapshot`] writes after the stamp.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    max_vocab_size: usize,
+    total_docs: usize,
+    /// Sorted by term; `ranked` is rebuilt from it.
+    document_freq: Vec<(String, usize)>,
+    /// Repository tags and file paths, stored once.
+    strings: Vec<String>,
+    documents: Vec<SnapshotDocument>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotDocument {
+    /// The id, or only what follows `file::` when `id_after_file`.
+    id: String,
+    id_after_file: bool,
+    repo: u32,
+    file: u32,
+    content: String,
+    start_line: usize,
+    end_line: usize,
+    embedding: Vec<(u32, f32)>,
+}
+
+/// Index of each distinct string, in first-seen order.
+#[derive(Default)]
+struct SnapshotStrings {
+    strings: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl SnapshotStrings {
+    fn id(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.index.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.index.insert(s.to_string(), id);
+        id
+    }
+}
+
 /// Embedding engine that combines provider and store
 pub struct EmbeddingEngine {
     provider: Arc<RwLock<TfIdfEmbedding>>,
@@ -656,6 +700,125 @@ impl EmbeddingEngine {
         (docs, content_bytes, embedding_bytes, index_bytes, df_bytes)
     }
 
+    /// Whether nothing has been indexed yet.
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty() && self.provider.read().total_docs == 0
+    }
+
+    /// The whole state as postcard bytes, prefixed by `stamp`: the IDF
+    /// statistics and every document in insertion order. Each document's
+    /// vector was computed against the statistics at its insertion, so only
+    /// the complete state reproduces the engine; the order also decides ties
+    /// between equally similar documents.
+    pub fn to_snapshot(&self, stamp: &str) -> anyhow::Result<Vec<u8>> {
+        let provider = self.provider.read();
+        let mut document_freq: Vec<(String, usize)> = provider
+            .document_freq
+            .iter()
+            .map(|(term, df)| (term.clone(), *df))
+            .collect();
+        document_freq.sort_unstable();
+        let store = self.store.inner.read();
+        let mut strings = SnapshotStrings::default();
+        let documents = store
+            .documents
+            .iter()
+            .map(|doc| {
+                let file = strings.id(&doc.file_path);
+                // Symbol ids are `file::name`; the file is already in `file`.
+                let (id_after_file, id) = match doc
+                    .id
+                    .strip_prefix(doc.file_path.as_str())
+                    .and_then(|rest| rest.strip_prefix("::"))
+                {
+                    Some(rest) => (true, rest.to_string()),
+                    None => (false, doc.id.clone()),
+                };
+                SnapshotDocument {
+                    id,
+                    id_after_file,
+                    repo: strings.id(&doc.repo),
+                    file,
+                    content: doc.content.clone(),
+                    start_line: doc.start_line,
+                    end_line: doc.end_line,
+                    embedding: doc.embedding.clone(),
+                }
+            })
+            .collect();
+        let snapshot = Snapshot {
+            max_vocab_size: provider.max_vocab_size,
+            total_docs: provider.total_docs,
+            document_freq,
+            strings: strings.strings,
+            documents,
+        };
+        let bytes = postcard::to_stdvec(stamp)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize TF-IDF state: {e}"))?;
+        postcard::to_extend(&snapshot, bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize TF-IDF state: {e}"))
+    }
+
+    /// Replace the whole state with the snapshot, provided it carries `stamp`
+    /// and was made with this engine's dimension. Returns whether it was
+    /// loaded; otherwise the engine is left as it was.
+    pub fn from_snapshot(&self, bytes: &[u8], stamp: &str) -> anyhow::Result<bool> {
+        let (saved_stamp, rest) = postcard::take_from_bytes::<String>(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize TF-IDF state: {e}"))?;
+        if saved_stamp != stamp {
+            return Ok(false);
+        }
+        let snapshot: Snapshot = postcard::from_bytes(rest)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize TF-IDF state: {e}"))?;
+        if snapshot.max_vocab_size != self.provider.read().max_vocab_size {
+            return Ok(false);
+        }
+        let strings: Vec<Arc<str>> = snapshot
+            .strings
+            .iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect();
+        let text = |id: u32| {
+            strings.get(id as usize).cloned().ok_or_else(|| {
+                anyhow::anyhow!("TF-IDF snapshot refers to string {id} of {}", strings.len())
+            })
+        };
+        let mut documents = Vec::with_capacity(snapshot.documents.len());
+        for doc in snapshot.documents {
+            let file_path = text(doc.file)?;
+            let id = if doc.id_after_file {
+                format!("{file_path}::{}", doc.id)
+            } else {
+                doc.id
+            };
+            documents.push(EmbeddedDocument {
+                id,
+                repo: text(doc.repo)?,
+                file_path: file_path.to_string(),
+                content: doc.content,
+                start_line: doc.start_line,
+                end_line: doc.end_line,
+                embedding: doc.embedding,
+            });
+        }
+
+        // Decoded in full before anything is replaced.
+        let mut provider = self.provider.write();
+        let mut store = self.store.inner.write();
+        provider.document_freq.clear();
+        provider.ranked.clear();
+        for (term, df) in snapshot.document_freq {
+            provider.ranked.insert((Reverse(df), term.clone()));
+            provider.document_freq.insert(term, df);
+        }
+        provider.total_docs = snapshot.total_docs;
+        store.clear();
+        for doc in documents {
+            store.add(doc);
+        }
+        Ok(true)
+    }
+
     /// Clear all data
     pub fn clear(&self) {
         self.store.clear();
@@ -669,6 +832,48 @@ impl EmbeddingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot must reproduce the engine exactly: the same documents in the
+    /// same order with the same vectors, and the same statistics for what is
+    /// embedded next.
+    #[test]
+    fn test_snapshot_round_trip_reproduces_engine() {
+        let engine = EmbeddingEngine::new(64);
+        let repo: Arc<str> = Arc::from("r");
+        for (i, text) in ["fn alpha(x: i32)", "fn beta() -> bool", "Процедура Гамма()"]
+            .iter()
+            .enumerate()
+        {
+            engine.index_tokens_embed_only(
+                format!("src/a.rs::f{i}"),
+                Arc::clone(&repo),
+                "src/a.rs".to_string(),
+                &tokenize_code(text),
+                i + 1,
+                i + 2,
+            );
+        }
+        engine.index_snippet_embed_only(
+            "Catalogs.Товары".to_string(),
+            Arc::clone(&repo),
+            "Catalogs/Товары.xml".to_string(),
+            "Справочник Товары".to_string(),
+            1,
+            1,
+        );
+
+        let bytes = engine.to_snapshot("s").unwrap();
+        let loaded = EmbeddingEngine::new(64);
+        assert!(!loaded.from_snapshot(&bytes, "other").unwrap());
+        assert!(loaded.is_empty());
+        assert!(loaded.from_snapshot(&bytes, "s").unwrap());
+        assert_eq!(loaded.to_snapshot("s").unwrap(), bytes);
+        assert_eq!(
+            format!("{:?}", loaded.find_similar_code("fn alpha", 10)),
+            format!("{:?}", engine.find_similar_code("fn alpha", 10))
+        );
+        assert!(!EmbeddingEngine::new(32).from_snapshot(&bytes, "s").unwrap());
+    }
 
     #[test]
     fn test_tfidf_embedding() {

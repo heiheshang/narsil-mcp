@@ -39,10 +39,10 @@ pub struct PersistedIndex {
     /// [`current_build_id`] of the binary that saved it.
     #[serde(default)]
     pub build_id: String,
-    /// Written into the call-graph snapshot saved alongside: a snapshot with
-    /// another stamp is not from the same save. Empty without a call graph.
+    /// Written into the call-graph and TF-IDF snapshots saved alongside: a
+    /// snapshot with another stamp is not from the same save.
     #[serde(default)]
-    pub call_graph_stamp: String,
+    pub snapshot_stamp: String,
 }
 
 /// Identifies the running executable: a redeployed binary (new inode, size or
@@ -84,7 +84,7 @@ impl PersistedIndex {
             repo_root,
             files: HashMap::new(),
             build_id: String::new(),
-            call_graph_stamp: String::new(),
+            snapshot_stamp: String::new(),
         }
     }
 
@@ -247,7 +247,7 @@ impl IndexStore {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let build_id = store.get_meta("build_id")?.unwrap_or_default();
-        let call_graph_stamp = store.get_meta("call_graph_stamp")?.unwrap_or_default();
+        let snapshot_stamp = store.get_meta("snapshot_stamp")?.unwrap_or_default();
 
         let mut files: HashMap<PathBuf, FileMetadata> = HashMap::new();
         store.for_each_file(&repo, |f| {
@@ -286,7 +286,7 @@ impl IndexStore {
             repo_root: repo_root.to_path_buf(),
             files,
             build_id,
-            call_graph_stamp,
+            snapshot_stamp,
         })
     }
 
@@ -313,7 +313,7 @@ impl IndexStore {
         store.set_meta("created_at", &index.created_at.to_string())?;
         store.set_meta("updated_at", &index.updated_at.to_string())?;
         store.set_meta("build_id", &index.build_id)?;
-        store.set_meta("call_graph_stamp", &index.call_graph_stamp)?;
+        store.set_meta("snapshot_stamp", &index.snapshot_stamp)?;
         info!("Saved index to {:?}", db_path);
         Ok(())
     }
@@ -338,23 +338,32 @@ impl IndexStore {
         Ok(repos)
     }
 
-    /// Path to the call-graph snapshot of a repository, with `extension`.
-    fn call_graph_path(&self, repo_root: &Path, extension: &str) -> PathBuf {
+    /// Path of a snapshot file of a repository: `<hash>.<name>`.
+    fn snapshot_path(&self, repo_root: &Path, name: &str) -> PathBuf {
         let hash = {
             let mut hasher = Sha256::new();
             hasher.update(repo_root.to_string_lossy().as_bytes());
             format!("{:x}", hasher.finalize())
         };
-        self.index_dir
-            .join(format!("{}.callgraph.{extension}", &hash[..16]))
+        self.index_dir.join(format!("{}.{name}", &hash[..16]))
+    }
+
+    fn read_snapshot(&self, repo_root: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.snapshot_path(repo_root, name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read(&path)?;
+        debug!("Loaded snapshot from {:?}", path);
+        Ok(Some(content))
     }
 
     /// Save a call-graph snapshot to disk
     pub fn save_call_graph(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
-        let path = self.call_graph_path(repo_root, "bin");
+        let path = self.snapshot_path(repo_root, "callgraph.bin");
         std::fs::write(&path, snapshot)?;
         // The JSON snapshot of earlier versions; it is never read any more.
-        let legacy = self.call_graph_path(repo_root, "json");
+        let legacy = self.snapshot_path(repo_root, "callgraph.json");
         if legacy.exists() {
             std::fs::remove_file(&legacy)?;
         }
@@ -362,16 +371,22 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Save a TF-IDF snapshot to disk
+    pub fn save_tfidf(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
+        let path = self.snapshot_path(repo_root, "tfidf.bin");
+        std::fs::write(&path, snapshot)?;
+        debug!("Saved TF-IDF state to {:?}", path);
+        Ok(())
+    }
+
+    /// Load a TF-IDF snapshot from disk
+    pub fn load_tfidf(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
+        self.read_snapshot(repo_root, "tfidf.bin")
+    }
+
     /// Load a call-graph snapshot from disk
     pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
-        let path = self.call_graph_path(repo_root, "bin");
-        if path.exists() {
-            let content = std::fs::read(&path)?;
-            debug!("Loaded call-graph from {:?}", path);
-            Ok(Some(content))
-        } else {
-            Ok(None)
-        }
+        self.read_snapshot(repo_root, "callgraph.bin")
     }
 }
 

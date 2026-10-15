@@ -956,6 +956,7 @@ async fn test_warm_start_loads_unchanged_call_graph() -> Result<()> {
         anyhow::Ok((
             engine.call_graph_snapshot(&repo_name).unwrap(),
             format!("{:?}", engine.repo_symbols(&repo_name).unwrap()),
+            engine.tfidf_snapshot().unwrap(),
         ))
     };
     let snapshot_file = || -> Result<PathBuf> {
@@ -965,9 +966,17 @@ async fn test_warm_start_loads_unchanged_call_graph() -> Result<()> {
             .expect("call-graph snapshot saved"))
     };
 
+    let tfidf_file = || -> Result<PathBuf> {
+        Ok(std::fs::read_dir(index_dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.to_string_lossy().ends_with(".tfidf.bin"))
+            .expect("TF-IDF snapshot saved"))
+    };
+
     let cold = start().await?;
     assert!(!cold.0.is_empty());
     let saved = std::fs::read(snapshot_file()?)?;
+    let saved_tfidf = std::fs::read(tfidf_file()?)?;
 
     let warm = start().await?;
     assert!(
@@ -975,10 +984,32 @@ async fn test_warm_start_loads_unchanged_call_graph() -> Result<()> {
         "warm call graph differs from the cold one"
     );
     assert_eq!(warm.1, cold.1);
+    assert!(
+        warm.2 == cold.2,
+        "restored TF-IDF state differs from the cold one"
+    );
     assert_eq!(
         std::fs::read(snapshot_file()?)?,
         saved,
         "nothing changed, so nothing is saved"
+    );
+
+    // A TF-IDF snapshot of another save is rejected and rebuilt from the
+    // files, then written back for the next start.
+    let mut foreign_tfidf = saved_tfidf.clone();
+    let stamp_byte = foreign_tfidf
+        .iter()
+        .position(|b| *b == b'/')
+        .expect("stamp");
+    foreign_tfidf[stamp_byte + 1] ^= 1;
+    std::fs::write(tfidf_file()?, &foreign_tfidf)?;
+    let rebuilt_tfidf = start().await?;
+    assert!(rebuilt_tfidf.2 == cold.2, "rebuilt TF-IDF state differs");
+    assert_eq!(rebuilt_tfidf.1, cold.1);
+    assert_eq!(
+        std::fs::read(tfidf_file()?)?,
+        saved_tfidf,
+        "TF-IDF snapshot not written back"
     );
 
     // A snapshot of another save (here: one with its stamp altered) is not
@@ -990,6 +1021,10 @@ async fn test_warm_start_loads_unchanged_call_graph() -> Result<()> {
     let rebuilt = start().await?;
     assert!(rebuilt.0 == cold.0, "graph rebuilt from source differs");
     assert_eq!(rebuilt.1, cold.1);
+    assert!(
+        rebuilt.2 == cold.2,
+        "TF-IDF state differs after a graph rebuild"
+    );
 
     // A changed file is parsed again: its new call shows up.
     std::thread::sleep(std::time::Duration::from_millis(1100));

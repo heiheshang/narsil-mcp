@@ -34,7 +34,18 @@ struct WalkCtx<'a> {
     same_build: Option<&'a PersistedIndex>,
     search_warm: bool,
     graph_loaded: bool,
+    /// TF-IDF came from a snapshot; nothing goes into the engine.
+    tfidf_loaded: bool,
     call_graph: Option<&'a CallGraph>,
+}
+
+/// What [`CodeIntelEngine::restore_unchanged`] found and loaded.
+#[derive(Default)]
+struct Restored {
+    /// No file changed since the last save of this build.
+    unchanged: bool,
+    graph: bool,
+    tfidf: bool,
 }
 
 /// One file as the parse pool hands it to the indexing thread.
@@ -103,7 +114,7 @@ impl CodeIntelEngine {
             }
             _ => 0,
         };
-        let graph_loaded = self.load_unchanged_graph(
+        let restored = self.restore_unchanged(
             path,
             &repo_name,
             &files,
@@ -111,7 +122,14 @@ impl CodeIntelEngine {
             search_warm,
             removed_files,
         );
+        let graph_loaded = restored.graph;
         let reuse = if graph_loaded { same_build } else { reuse };
+        // Rebuilt from an empty engine over unchanged files: the state a
+        // snapshot of the last save should have held.
+        let tfidf_fresh = restored.unchanged
+            && !restored.tfidf
+            && self.tfidf_snapshots_apply()
+            && self.embedding_engine.is_empty();
 
         // Parse + extract in chunks; the call graph is fed incrementally
         // (function defs in pass 1, call sites in pass 2). The DashMap ref is
@@ -130,6 +148,7 @@ impl CodeIntelEngine {
                 same_build,
                 search_warm,
                 graph_loaded,
+                tfidf_loaded: restored.tfidf,
                 call_graph: call_graph.as_deref(),
             };
             let mut acc = self.run_parse_pipeline(&ctx, &files)?;
@@ -183,6 +202,11 @@ impl CodeIntelEngine {
 
         #[cfg(feature = "graph")]
         self.update_knowledge_graph(&repo_name, search_warm, stale_files, removed_files);
+
+        if let Some(persisted) = same_build.filter(|p| tfidf_fresh && !p.snapshot_stamp.is_empty())
+        {
+            self.save_tfidf_snapshot(path, &persisted.snapshot_stamp);
+        }
 
         Ok(WalkOutcome {
             reparsed_files,
@@ -400,7 +424,8 @@ impl CodeIntelEngine {
                 .is_some_and(|persisted| unchanged_since(persisted, file_path));
         let (parsed, reused) = self.file_symbols(ctx, file_path, &content);
         self.metrics.record_file_parse(parse_start.elapsed());
-        let mut prepared = PreparedDocuments::new(parsed.as_ref(), &content, !unchanged);
+        let mut prepared =
+            PreparedDocuments::new(parsed.as_ref(), &content, !unchanged, !ctx.tfidf_loaded);
         if file_path.extension().is_some_and(|ext| ext == "xml") {
             let relative = file_path
                 .strip_prefix(ctx.path)
@@ -411,7 +436,7 @@ impl CodeIntelEngine {
             let into_search = !unchanged;
             prepared.normalized = collect_onec_normalized_documents(ctx.path, file_path)
                 .into_iter()
-                .map(|document| PreparedNormalized::new(document, into_search))
+                .map(|document| PreparedNormalized::new(document, into_search, !ctx.tfidf_loaded))
                 .collect();
         }
         if let (Some(cg), Some(tree)) = (
@@ -627,19 +652,20 @@ impl CodeIntelEngine {
                 Some(card_len),
             );
         }
-        let tokens = prepared.signature_tokens;
-
-        // Index symbol into embedding engine for similarity search
-        if let (Some(ref sig), Some(tokens)) = (&symbol.signature, tokens) {
+        if let Some(sig) = symbol.signature.as_ref() {
             let symbol_id = format!("{}::{}", relative_path, symbol.name);
-            self.embedding_engine.index_tokens_embed_only(
-                symbol_id.clone(),
-                Arc::clone(ctx.repo_tag),
-                relative_path.to_string(),
-                &tokens,
-                symbol.start_line,
-                symbol.end_line,
-            );
+            // Index symbol into embedding engine for similarity search, unless
+            // its state was restored from a snapshot.
+            if let Some(tokens) = prepared.signature_tokens {
+                self.embedding_engine.index_tokens_embed_only(
+                    symbol_id.clone(),
+                    Arc::clone(ctx.repo_tag),
+                    relative_path.to_string(),
+                    &tokens,
+                    symbol.start_line,
+                    symbol.end_line,
+                );
+            }
 
             // Collect for neural batch indexing if enabled
             if self.neural_engine.is_some() {
@@ -776,9 +802,14 @@ impl CodeIntelEngine {
         removed_files
     }
 
-    /// Load the persisted call graph when nothing changed since the last save
-    /// of this same build. Returns whether it was loaded.
-    fn load_unchanged_graph(
+    /// What a walk can take from the last save instead of rebuilding it.
+    ///
+    /// Same build and not a file added, changed or removed since that save:
+    /// the call graph this walk would build is the persisted one, the symbols
+    /// in SQLite are those the parser would extract, and the TF-IDF state is
+    /// the one this walk would compute from an empty engine. Files the last
+    /// save did not record were unreadable or binary then, and must still be.
+    fn restore_unchanged(
         &self,
         path: &Path,
         repo_name: &str,
@@ -786,27 +817,63 @@ impl CodeIntelEngine {
         same_build: Option<&PersistedIndex>,
         search_warm: bool,
         removed_files: usize,
-    ) -> bool {
-        // Same build and not a file added, changed or removed since the last
-        // save: the call graph this walk would build is the persisted one, and
-        // the symbols in SQLite are those the parser would extract. Both are
-        // loaded and nothing is parsed. Files the last save did not record
-        // were unreadable or binary then, and must still be.
-        let graph_loaded = self.options.call_graph_enabled
-            && search_warm
-            && removed_files == 0
-            && same_build.is_some_and(|persisted| {
-                let _span = debug_span!("check_unchanged").entered();
-                files.par_iter().all(|file_path| {
-                    unchanged_since(persisted, file_path)
-                        || (!persisted.files.contains_key(file_path)
-                            && read_indexable_text_file(file_path).is_none())
-                }) && self.load_call_graph_snapshot(path, repo_name, persisted)
-            });
-        if graph_loaded {
+    ) -> Restored {
+        let wants_graph = self.options.call_graph_enabled;
+        let wants_tfidf = self.tfidf_snapshots_apply() && self.embedding_engine.is_empty();
+        let mut restored = Restored::default();
+        let Some(persisted) = same_build.filter(|_| search_warm && removed_files == 0) else {
+            return restored;
+        };
+        if !wants_graph && !wants_tfidf {
+            return restored;
+        }
+        let _span = debug_span!("check_unchanged").entered();
+        restored.unchanged = files.par_iter().all(|file_path| {
+            unchanged_since(persisted, file_path)
+                || (!persisted.files.contains_key(file_path)
+                    && read_indexable_text_file(file_path).is_none())
+        });
+        if !restored.unchanged || persisted.snapshot_stamp.is_empty() {
+            return restored;
+        }
+        restored.graph = wants_graph && self.load_call_graph_snapshot(path, repo_name, persisted);
+        if restored.graph {
             info!("{repo_name}: no file changed; call graph loaded from its snapshot");
         }
-        graph_loaded
+        restored.tfidf = wants_tfidf && self.load_tfidf_snapshot(path, repo_name, persisted);
+        if restored.tfidf {
+            info!("{repo_name}: no file changed; TF-IDF state loaded from its snapshot");
+        }
+        restored
+    }
+
+    /// Load the TF-IDF snapshot saved with `persisted`. False when there is
+    /// none, it is from another save, or it cannot be read; the engine is then
+    /// left as it was.
+    fn load_tfidf_snapshot(
+        &self,
+        path: &Path,
+        repo_name: &str,
+        persisted: &PersistedIndex,
+    ) -> bool {
+        let _span = debug_span!("load_tfidf").entered();
+        let Some(store) = self.index_store.as_ref() else {
+            return false;
+        };
+        let snapshot = match store.load_tfidf(path) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!("Failed to read TF-IDF snapshot for {repo_name}: {e}");
+                return false;
+            }
+        };
+        self.embedding_engine
+            .from_snapshot(&snapshot, &persisted.snapshot_stamp)
+            .unwrap_or_else(|e| {
+                warn!("Failed to load TF-IDF snapshot for {repo_name}: {e}");
+                false
+            })
     }
 
     /// Writes the triples of `symbols`, then those of the repository, in one
@@ -863,9 +930,6 @@ impl CodeIntelEngine {
         persisted: &PersistedIndex,
     ) -> bool {
         let _span = debug_span!("load_call_graph").entered();
-        if persisted.call_graph_stamp.is_empty() {
-            return false;
-        }
         let (Some(store), Some(cg)) = (self.index_store.as_ref(), self.call_graphs.get(repo_name))
         else {
             return false;
@@ -878,7 +942,7 @@ impl CodeIntelEngine {
                 return false;
             }
         };
-        cg.from_snapshot(&snapshot, Some(&persisted.call_graph_stamp))
+        cg.from_snapshot(&snapshot, Some(&persisted.snapshot_stamp))
             .unwrap_or_else(|e| {
                 warn!("Failed to load call-graph snapshot for {repo_name}: {e}");
                 false
@@ -921,14 +985,16 @@ impl CodeIntelEngine {
             );
         }
 
-        self.embedding_engine.index_tokens_embed_only(
-            document.id.clone(),
-            repo,
-            file_path,
-            &tokens,
-            start_line,
-            end_line,
-        );
+        if let Some(tokens) = tokens {
+            self.embedding_engine.index_tokens_embed_only(
+                document.id.clone(),
+                repo,
+                file_path,
+                &tokens,
+                start_line,
+                end_line,
+            );
+        }
         document
     }
 }

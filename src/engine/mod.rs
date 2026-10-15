@@ -1232,7 +1232,7 @@ impl CodeIntelEngine {
         // --persist; skip on a fully warm cache (a cache-only load needs no
         // rewrite, and re-hashing every file is not free).
         if indexed_any {
-            match self.save_index().await {
+            match self.save_index_after_walk().await {
                 Ok(msg) => info!("{}", msg),
                 Err(e) => warn!("Failed to save index after initialization: {}", e),
             }
@@ -1327,7 +1327,7 @@ impl CodeIntelEngine {
         self.analysis_cache.clear();
         self.query_cache.clear();
         self.index_repos().await?;
-        let _ = self.save_index().await;
+        let _ = self.save_index_after_walk().await;
         Ok(())
     }
 
@@ -2814,6 +2814,38 @@ impl CodeIntelEngine {
     /// Save the current index to disk
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn save_index(&self) -> Result<String> {
+        self.save_index_with(false).await
+    }
+
+    /// [`save_index`](Self::save_index) after a walk that built TF-IDF from an
+    /// empty engine, which is when its snapshot reproduces a fresh start.
+    /// Incremental updates since leave it different from a fresh walk.
+    pub(super) async fn save_index_after_walk(&self) -> Result<String> {
+        self.save_index_with(true).await
+    }
+
+    /// TF-IDF statistics are shared by all repositories, so a snapshot of the
+    /// engine stands for one repository only when there is only one.
+    pub(super) fn tfidf_snapshots_apply(&self) -> bool {
+        self.options.persist_enabled && self.repo_paths.len() == 1
+    }
+
+    pub(super) fn save_tfidf_snapshot(&self, repo_path: &Path, stamp: &str) {
+        let Some(store) = self.index_store.as_ref() else {
+            return;
+        };
+        let _span = debug_span!("save_tfidf").entered();
+        match self.embedding_engine.to_snapshot(stamp) {
+            Ok(snapshot) => {
+                if let Err(e) = store.save_tfidf(repo_path, &snapshot) {
+                    warn!("Failed to save TF-IDF state for {:?}: {}", repo_path, e);
+                }
+            }
+            Err(e) => warn!("Failed to serialize TF-IDF state: {}", e),
+        }
+    }
+
+    async fn save_index_with(&self, with_tfidf: bool) -> Result<String> {
         if !self.options.persist_enabled {
             return Ok(
                 "Persistence is not enabled. Start with --persist flag to enable.".to_string(),
@@ -2833,24 +2865,25 @@ impl CodeIntelEngine {
                 .unwrap_or("unknown")
                 .to_string();
 
-            // Unique per save, so a warm start can tell this snapshot and this
-            // SQLite index apart from either one of an earlier save.
-            let call_graph_stamp = if self.options.call_graph_enabled {
+            // Unique per save, so a warm start can tell these snapshots and
+            // this SQLite index apart from those of an earlier save.
+            let snapshot_stamp = {
                 let nanos = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map_or(0, |d| d.as_nanos());
                 format!("{}/{nanos}", crate::persist::current_build_id())
-            } else {
-                String::new()
             };
 
-            // The call graph goes to its own file, so it is written while the
-            // SQLite index below is.
+            // The call graph and TF-IDF go to their own files, so they are
+            // written while the SQLite index below is.
             let persisted = std::thread::scope(|scope| {
+                if with_tfidf && self.tfidf_snapshots_apply() {
+                    scope.spawn(|| self.save_tfidf_snapshot(repo_path, &snapshot_stamp));
+                }
                 if self.options.call_graph_enabled {
                     scope.spawn(|| {
                         if let Some(cg) = self.call_graphs.get(&repo_name) {
-                            match cg.to_snapshot(&call_graph_stamp) {
+                            match cg.to_snapshot(&snapshot_stamp) {
                                 Ok(snapshot) => {
                                     if let Err(e) = store.save_call_graph(repo_path, &snapshot) {
                                         warn!("Failed to save call-graph for {}: {}", repo_name, e);
@@ -2865,7 +2898,7 @@ impl CodeIntelEngine {
                 // Create a persisted index from current state
                 let mut persisted = PersistedIndex::new(repo_path.clone());
                 persisted.build_id = crate::persist::current_build_id();
-                persisted.call_graph_stamp = call_graph_stamp.clone();
+                persisted.snapshot_stamp = snapshot_stamp.clone();
 
                 // Group symbols by file path
                 let mut by_file: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
@@ -3138,7 +3171,7 @@ impl CodeIntelEngine {
                         for document in normalized_documents {
                             self.index_normalized_document(
                                 Arc::from(repo_name.as_str()),
-                                PreparedNormalized::new(document, true),
+                                PreparedNormalized::new(document, true, true),
                             );
                         }
 
@@ -8328,6 +8361,12 @@ impl CodeIntelEngine {
         self.call_graphs.get(repo)?.to_snapshot("").ok()
     }
 
+    /// The TF-IDF engine's state as snapshot bytes, for comparing runs.
+    #[doc(hidden)]
+    pub fn tfidf_snapshot(&self) -> Option<Vec<u8>> {
+        self.embedding_engine.to_snapshot("").ok()
+    }
+
     /// All symbols of the repository, in index order, for comparing runs.
     #[doc(hidden)]
     pub fn repo_symbols(&self, repo: &str) -> Option<Vec<Symbol>> {
@@ -9925,7 +9964,14 @@ struct PreparedSymbol {
 }
 
 impl PreparedDocuments {
-    fn new(parsed: Option<&crate::parser::ParsedFile>, content: &str, into_search: bool) -> Self {
+    /// `embed`: symbol signatures go into the TF-IDF engine and are tokenized
+    /// for it.
+    fn new(
+        parsed: Option<&crate::parser::ParsedFile>,
+        content: &str,
+        into_search: bool,
+        embed: bool,
+    ) -> Self {
         let token_count = |text: &str| crate::search::tokenize_code(text).len() as u64;
         let Some(parsed) = parsed else {
             return Self {
@@ -9950,6 +9996,7 @@ impl PreparedDocuments {
                 signature_tokens: symbol
                     .signature
                     .as_deref()
+                    .filter(|_| embed)
                     .map(crate::search::tokenize_code),
             })
             .collect();
@@ -9969,17 +10016,20 @@ struct PreparedNormalized {
     document: NormalizedDocument,
     file_path: String,
     end_line: usize,
-    tokens: Vec<String>,
+    /// For the TF-IDF engine; `None` when it was restored from a snapshot.
+    tokens: Option<Vec<String>>,
     /// Term frequencies and their BM25 length, when it goes into search.
     search: Option<(HashMap<String, usize>, u64)>,
 }
 
 impl PreparedNormalized {
-    fn new(document: NormalizedDocument, into_search: bool) -> Self {
+    /// `embed`: the document goes into the TF-IDF engine, which needs its
+    /// tokens; without it and without `into_search` the text is not tokenized.
+    fn new(document: NormalizedDocument, into_search: bool, embed: bool) -> Self {
         let content = render_normalized_search_content(&document);
-        let tokens = crate::search::tokenize_code(&content);
+        let tokens = (into_search || embed).then(|| crate::search::tokenize_code(&content));
         let search = into_search.then(|| {
-            let term_freq = crate::search::count_terms(&tokens);
+            let term_freq = crate::search::count_terms(tokens.as_deref().unwrap_or_default());
             let doc_len = crate::tantivy_index::term_freq_doc_len(&term_freq);
             (term_freq, doc_len)
         });
@@ -9987,7 +10037,7 @@ impl PreparedNormalized {
             file_path: normalized_document_primary_source(&document),
             end_line: content.lines().count(),
             document,
-            tokens,
+            tokens: tokens.filter(|_| embed),
             search,
         }
     }
