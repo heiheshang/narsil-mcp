@@ -36,36 +36,27 @@ pub struct PersistedIndex {
     pub updated_at: u64,
     pub repo_root: PathBuf,
     pub files: HashMap<PathBuf, FileMetadata>,
-    /// [`current_build_id`] of the binary that saved it.
+    /// [`current_index_format`] of the binary that saved it.
     #[serde(default)]
-    pub build_id: String,
+    pub index_format: String,
     /// Written into the call-graph and TF-IDF snapshots saved alongside: a
     /// snapshot with another stamp is not from the same save.
     #[serde(default)]
     pub snapshot_stamp: String,
 }
 
-/// Identifies the running executable: a redeployed binary (new inode, size or
-/// mtime) gets another id. Search documents and the knowledge graph are only
-/// reused from a run of the same build, since another build may parse or
-/// render them differently.
-pub fn current_build_id() -> String {
-    let Some(metadata) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| std::fs::metadata(exe).ok())
-    else {
-        return String::new();
-    };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    #[cfg(unix)]
-    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
-    #[cfg(not(unix))]
-    let inode = 0u64;
-    format!("{}-{}-{}", metadata.len(), modified, inode)
+/// Version of everything an index saves or restores: symbols, search and
+/// substring documents, the knowledge graph, call-graph and TF-IDF snapshots.
+/// Bump it with any change to what indexing produces; a persisted index of
+/// another version is rebuilt instead of reused. `tests/index_format.rs`
+/// fails when the output on the fixtures changes and this does not.
+pub const INDEX_FORMAT_VERSION: u32 = 1;
+
+pub fn current_index_format() -> String {
+    format!(
+        "{INDEX_FORMAT_VERSION}.{}",
+        crate::search::TOKENIZER_VERSION
+    )
 }
 
 impl PersistedIndex {
@@ -83,7 +74,7 @@ impl PersistedIndex {
             updated_at: now,
             repo_root,
             files: HashMap::new(),
-            build_id: String::new(),
+            index_format: String::new(),
             snapshot_stamp: String::new(),
         }
     }
@@ -246,7 +237,7 @@ impl IndexStore {
             .get_meta("updated_at")?
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
-        let build_id = store.get_meta("build_id")?.unwrap_or_default();
+        let index_format = store.get_meta("index_format")?.unwrap_or_default();
         let snapshot_stamp = store.get_meta("snapshot_stamp")?.unwrap_or_default();
 
         let mut files: HashMap<PathBuf, FileMetadata> = HashMap::new();
@@ -285,7 +276,7 @@ impl IndexStore {
             updated_at,
             repo_root: repo_root.to_path_buf(),
             files,
-            build_id,
+            index_format,
             snapshot_stamp,
         })
     }
@@ -312,7 +303,7 @@ impl IndexStore {
         store.set_meta("repo_root", &repo)?;
         store.set_meta("created_at", &index.created_at.to_string())?;
         store.set_meta("updated_at", &index.updated_at.to_string())?;
-        store.set_meta("build_id", &index.build_id)?;
+        store.set_meta("index_format", &index.index_format)?;
         store.set_meta("snapshot_stamp", &index.snapshot_stamp)?;
         info!("Saved index to {:?}", db_path);
         Ok(())

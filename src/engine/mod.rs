@@ -504,7 +504,7 @@ struct WalkOutcome {
     /// Files walked and indexed.
     indexed_files: usize,
     /// Files whose search documents were (re)built: all of them unless the
-    /// persisted index was saved by this build.
+    /// persisted index has this index format.
     stale_files: usize,
 }
 
@@ -2883,7 +2883,7 @@ impl CodeIntelEngine {
                 let nanos = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map_or(0, |d| d.as_nanos());
-                format!("{}/{nanos}", crate::persist::current_build_id())
+                format!("{}/{nanos}", crate::persist::current_index_format())
             };
 
             // The call graph and TF-IDF go to their own files, so they are
@@ -2909,7 +2909,7 @@ impl CodeIntelEngine {
 
                 // Create a persisted index from current state
                 let mut persisted = PersistedIndex::new(repo_path.clone());
-                persisted.build_id = crate::persist::current_build_id();
+                persisted.index_format = crate::persist::current_index_format();
                 persisted.snapshot_stamp = snapshot_stamp.clone();
 
                 // Group symbols by file path

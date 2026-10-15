@@ -31,8 +31,8 @@ struct WalkCtx<'a> {
     repo_tag: &'a Arc<str>,
     /// Where symbols may come from instead of the parser.
     reuse: Option<&'a PersistedIndex>,
-    /// The persisted index, when this same build saved it.
-    same_build: Option<&'a PersistedIndex>,
+    /// The persisted index, when it has this index format.
+    same_format: Option<&'a PersistedIndex>,
     search_warm: bool,
     graph_loaded: bool,
     /// TF-IDF came from a snapshot; nothing goes into the engine.
@@ -43,7 +43,7 @@ struct WalkCtx<'a> {
 /// What [`CodeIntelEngine::restore_unchanged`] found and loaded.
 #[derive(Default)]
 struct Restored {
-    /// No file changed since the last save of this build.
+    /// No file changed since the last save.
     unchanged: bool,
     graph: bool,
     tfidf: bool,
@@ -98,18 +98,15 @@ impl CodeIntelEngine {
         // cheap clone of this tag so searches can be scoped to one repo.
         let repo_tag: Arc<str> = Arc::from(repo_name.as_str());
 
-        // Documents and the knowledge graph of an unchanged file are reused
-        // only from a run of this same build; another build may produce them
-        // differently.
-        let same_build =
-            reuse.filter(|persisted| persisted.build_id == crate::persist::current_build_id());
+        let index_format = crate::persist::current_index_format();
+        let same_format = reuse.filter(|persisted| persisted.index_format == index_format);
         // Symbols are only reusable when the walk does not also need parse
         // trees: the call graph is built from them, and they are not persisted.
-        let reuse = reuse.filter(|_| !self.options.call_graph_enabled);
+        let reuse = same_format.filter(|_| !self.options.call_graph_enabled);
 
-        let search_warm = self.prepare_search_state(&repo_name, same_build);
+        let search_warm = self.prepare_search_state(&repo_name, same_format);
         let files = self.walk_repo_files(path, &repo_name)?;
-        let removed_files = match (search_warm, same_build) {
+        let removed_files = match (search_warm, same_format) {
             (true, Some(persisted)) => {
                 self.drop_removed_files(path, &repo_tag, &repo_name, &files, persisted)
             }
@@ -119,12 +116,12 @@ impl CodeIntelEngine {
             path,
             &repo_name,
             &files,
-            same_build,
+            same_format,
             search_warm,
             removed_files,
         );
         let graph_loaded = restored.graph;
-        let reuse = if graph_loaded { same_build } else { reuse };
+        let reuse = if graph_loaded { same_format } else { reuse };
         // Rebuilt from an empty engine over unchanged files: the state a
         // snapshot of the last save should have held.
         let tfidf_fresh = restored.unchanged
@@ -146,7 +143,7 @@ impl CodeIntelEngine {
                 path,
                 repo_tag: &repo_tag,
                 reuse,
-                same_build,
+                same_format,
                 search_warm,
                 graph_loaded,
                 tfidf_loaded: restored.tfidf,
@@ -204,7 +201,7 @@ impl CodeIntelEngine {
         #[cfg(feature = "graph")]
         self.update_knowledge_graph(&repo_name, search_warm, stale_files, removed_files);
 
-        if let Some(persisted) = same_build.filter(|p| tfidf_fresh && !p.snapshot_stamp.is_empty())
+        if let Some(persisted) = same_format.filter(|p| tfidf_fresh && !p.snapshot_stamp.is_empty())
         {
             self.save_tfidf_snapshot(path, &persisted.snapshot_stamp);
         }
@@ -250,7 +247,7 @@ impl CodeIntelEngine {
     }
 
     /// Transform the repository's symbols into the RDF knowledge graph, unless
-    /// it already holds what the last run of this build wrote.
+    /// it already holds what the last run wrote.
     #[cfg(feature = "graph")]
     fn update_knowledge_graph(
         &self,
@@ -421,7 +418,7 @@ impl CodeIntelEngine {
         let content = read_indexable_text_file(file_path)?;
         let unchanged = ctx.search_warm
             && ctx
-                .same_build
+                .same_format
                 .is_some_and(|persisted| unchanged_since(persisted, file_path));
         let (parsed, reused) = self.file_symbols(ctx, file_path, &content);
         self.metrics.record_file_parse(parse_start.elapsed());
@@ -687,7 +684,7 @@ impl CodeIntelEngine {
 
     /// Whether this repository's search documents and trigrams on disk can be
     /// kept. When they cannot, both are cleared for the repository.
-    fn prepare_search_state(&self, repo_name: &str, same_build: Option<&PersistedIndex>) -> bool {
+    fn prepare_search_state(&self, repo_name: &str, same_format: Option<&PersistedIndex>) -> bool {
         // The search index persists separately from the symbol store, so a warm
         // symbol cache does not by itself prove the documents are there: a user
         // who deleted one file but not the other would otherwise get a
@@ -696,7 +693,7 @@ impl CodeIntelEngine {
         // Both indexes must hold the repository, not just one: they are
         // separate directories and a partial cache must not be mistaken for a
         // complete one.
-        let search_warm = same_build.is_some()
+        let search_warm = same_format.is_some()
             && self.search_index.tantivy().repo_doc_count(repo_name) > 0
             && self
                 .substring_index
@@ -829,14 +826,14 @@ impl CodeIntelEngine {
         path: &Path,
         repo_name: &str,
         files: &[PathBuf],
-        same_build: Option<&PersistedIndex>,
+        same_format: Option<&PersistedIndex>,
         search_warm: bool,
         removed_files: usize,
     ) -> Restored {
         let wants_graph = self.options.call_graph_enabled;
         let wants_tfidf = self.tfidf_snapshots_apply() && self.embedding_engine.is_empty();
         let mut restored = Restored::default();
-        let Some(persisted) = same_build.filter(|_| search_warm && removed_files == 0) else {
+        let Some(persisted) = same_format.filter(|_| search_warm && removed_files == 0) else {
             return restored;
         };
         if !wants_graph && !wants_tfidf {
