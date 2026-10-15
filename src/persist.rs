@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, debug_span, info, warn};
 
 use crate::store::{FileRow, SqliteStore};
 use crate::symbols::Symbol;
@@ -57,6 +57,19 @@ pub fn current_index_format() -> String {
         "{INDEX_FORMAT_VERSION}.{}",
         crate::search::TOKENIZER_VERSION
     )
+}
+
+/// Pages of a table rewritten on every save end up scattered through the
+/// file, so a cold scan of it reads 4 KiB at a time from all over the disk:
+/// 4 s for 1c-src's symbols on NVMe. One sequential pass beforehand takes
+/// 0.1 s and leaves the scan hitting the page cache.
+fn read_into_page_cache(path: &Path) {
+    let _span = debug_span!("read_into_page_cache").entered();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut buf = vec![0u8; 1 << 20];
+    while matches!(std::io::Read::read(&mut file, &mut buf), Ok(n) if n > 0) {}
 }
 
 impl PersistedIndex {
@@ -226,7 +239,9 @@ impl IndexStore {
     /// File metadata rows are read first (keyed by absolute path), then symbols
     /// are streamed and attached to their file by `repo_root.join(file_path)`.
     fn load_from_db(&self, repo_root: &Path) -> Result<PersistedIndex> {
-        let store = SqliteStore::open(&self.db_path(repo_root))?;
+        let db_path = self.db_path(repo_root);
+        read_into_page_cache(&db_path);
+        let store = SqliteStore::open(&db_path)?;
         let repo = Self::repo_key(repo_root);
 
         let created_at = store
@@ -240,6 +255,7 @@ impl IndexStore {
         let index_format = store.get_meta("index_format")?.unwrap_or_default();
         let snapshot_stamp = store.get_meta("snapshot_stamp")?.unwrap_or_default();
 
+        let files_span = debug_span!("read_files").entered();
         let mut files: HashMap<PathBuf, FileMetadata> = HashMap::new();
         store.for_each_file(&repo, |f| {
             let abs = PathBuf::from(f.path);
@@ -255,6 +271,9 @@ impl IndexStore {
             );
         })?;
 
+        drop(files_span);
+
+        let _symbols_span = debug_span!("read_symbols").entered();
         let mut dropped = 0usize;
         store.for_each_symbol(&repo, |sym| {
             let abs = repo_root.join(&sym.file_path);

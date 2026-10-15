@@ -959,8 +959,13 @@ impl CodeIntelEngine {
         if options.persist_enabled {
             if let Some(ref store) = engine.index_store {
                 for repo_path in &expanded_repos {
-                    if let Ok(persisted) = store.load_or_create(repo_path) {
+                    let loaded = {
+                        let _span = debug_span!("load_persisted").entered();
+                        store.load_or_create(repo_path)
+                    };
+                    if let Ok(persisted) = loaded {
                         if !persisted.files.is_empty() {
+                            let _span = debug_span!("restore_symbols").entered();
                             let repo_name = repo_path
                                 .file_name()
                                 .and_then(|n| n.to_str())
