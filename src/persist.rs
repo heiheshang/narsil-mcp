@@ -383,20 +383,37 @@ impl IndexStore {
         self.index_dir.join(format!("{}.{name}", &hash[..16]))
     }
 
-    fn read_snapshot(&self, repo_root: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    /// The snapshot mapped rather than read: read, 1c-src's snapshots took
+    /// 0.7 GB of heap at startup, which the allocator returned to the system
+    /// only seconds after they were decoded. Mapped, they are page cache.
+    fn read_snapshot(&self, repo_root: &Path, name: &str) -> Result<Option<memmap2::Mmap>> {
         let path = self.snapshot_path(repo_root, name);
         if !path.exists() {
             return Ok(None);
         }
-        let content = std::fs::read(&path)?;
+        let file = std::fs::File::open(&path)?;
+        // SAFETY: snapshots are only replaced by renaming a new file over
+        // them (`write_snapshot`), never rewritten in place, so the mapped
+        // file does not change while it is mapped.
+        let content = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
         debug!("Loaded snapshot from {:?}", path);
         Ok(Some(content))
     }
 
+    /// Replace a snapshot by renaming a complete new file over it, which
+    /// keeps a mapping of the old one intact and a crash from leaving half
+    /// a snapshot.
+    fn write_snapshot(&self, repo_root: &Path, name: &str, snapshot: &[u8]) -> Result<PathBuf> {
+        let path = self.snapshot_path(repo_root, name);
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, snapshot)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
     /// Save a call-graph snapshot to disk
     pub fn save_call_graph(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
-        let path = self.snapshot_path(repo_root, "callgraph.bin");
-        std::fs::write(&path, snapshot)?;
+        let path = self.write_snapshot(repo_root, "callgraph.bin", snapshot)?;
         // The JSON snapshot of earlier versions; it is never read any more.
         let legacy = self.snapshot_path(repo_root, "callgraph.json");
         if legacy.exists() {
@@ -408,30 +425,28 @@ impl IndexStore {
 
     /// Save a TF-IDF snapshot to disk
     pub fn save_tfidf(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
-        let path = self.snapshot_path(repo_root, "tfidf.bin");
-        std::fs::write(&path, snapshot)?;
+        let path = self.write_snapshot(repo_root, "tfidf.bin", snapshot)?;
         debug!("Saved TF-IDF state to {:?}", path);
         Ok(())
     }
 
     /// Load a TF-IDF snapshot from disk
-    pub fn load_tfidf(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
+    pub fn load_tfidf(&self, repo_root: &Path) -> Result<Option<memmap2::Mmap>> {
         self.read_snapshot(repo_root, "tfidf.bin")
     }
 
     /// Load a call-graph snapshot from disk
-    pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
+    pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<memmap2::Mmap>> {
         self.read_snapshot(repo_root, "callgraph.bin")
     }
 
     pub fn save_normalized(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
-        let path = self.snapshot_path(repo_root, "normalized.bin");
-        std::fs::write(&path, snapshot)?;
+        let path = self.write_snapshot(repo_root, "normalized.bin", snapshot)?;
         debug!("Saved 1C normalized documents to {:?}", path);
         Ok(())
     }
 
-    pub fn load_normalized(&self, repo_root: &Path) -> Result<Option<Vec<u8>>> {
+    pub fn load_normalized(&self, repo_root: &Path) -> Result<Option<memmap2::Mmap>> {
         self.read_snapshot(repo_root, "normalized.bin")
     }
 }
