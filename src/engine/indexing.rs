@@ -205,7 +205,10 @@ impl CodeIntelEngine {
             .record_repo_index(repo_name.clone(), elapsed, file_count, symbols_vec.len());
 
         self.repos.insert(repo_name.clone(), metadata);
-        self.symbols.insert(repo_name.clone(), symbols_vec);
+        // The symbols restored at startup, freed off the path to readiness.
+        if let Some(restored_symbols) = self.symbols.insert(repo_name.clone(), symbols_vec) {
+            std::thread::spawn(move || drop(restored_symbols));
+        }
         self.normalized_docs.insert(
             repo_name.clone(),
             restored.normalized.take().unwrap_or(normalized_docs_vec),

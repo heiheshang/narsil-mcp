@@ -7,6 +7,7 @@
 //! writer and supports safe multi-process access to a shared index path.
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -223,11 +224,24 @@ impl SqliteStore {
     pub fn for_each_symbol(&self, repo: &str, mut f: impl FnMut(Symbol)) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT symbol FROM symbols WHERE repo=?1 ORDER BY id")?;
-        let rows = stmt.query_map(params![repo], |r| r.get::<_, Vec<u8>>(0))?;
-        for row in rows {
-            f(deserialize_symbol(row?)?);
+        let mut rows = stmt.query_map(params![repo], |r| r.get::<_, Vec<u8>>(0))?;
+        // Decoding half a million symbols on one thread took longer than
+        // reading their rows.
+        const CHUNK: usize = 16 * 1024;
+        loop {
+            let blobs = rows
+                .by_ref()
+                .take(CHUNK)
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if blobs.is_empty() {
+                return Ok(());
+            }
+            let symbols = blobs
+                .into_par_iter()
+                .map(deserialize_symbol)
+                .collect::<Result<Vec<_>>>()?;
+            symbols.into_iter().for_each(&mut f);
         }
-        Ok(())
     }
 
     fn query_symbols(&self, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Symbol>> {
@@ -310,11 +324,15 @@ impl SqliteStore {
 
     // === files ===
 
-    /// Stream every file metadata row in `repo` through `f`.
+    /// Stream every file metadata row in `repo` through `f`, in no
+    /// particular order.
     pub fn for_each_file(&self, repo: &str, mut f: impl FnMut(FileRow)) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // A database holds one repository, so the primary key does not narrow
+        // the rows down; going through it fetched each row separately, three
+        // times slower than reading the table.
         let mut stmt = conn.prepare(
-            "SELECT path, content_hash, modified_time, size, lines FROM files WHERE repo=?1 ORDER BY path",
+            "SELECT path, content_hash, modified_time, size, lines FROM files NOT INDEXED WHERE repo=?1",
         )?;
         let rows = stmt.query_map(params![repo], |r| {
             Ok(FileRow {

@@ -280,13 +280,32 @@ impl IndexStore {
 
         let _symbols_span = debug_span!("read_symbols").entered();
         let mut dropped = 0usize;
-        store.for_each_symbol(&repo, |sym| {
-            let abs = repo_root.join(&sym.file_path);
-            match files.get_mut(&abs) {
-                Some(meta) => meta.symbols.push(sym),
-                None => dropped += 1,
+        // A file's symbols are stored together, so they are gathered and
+        // looked up once per file: joining and hashing a path per symbol
+        // took a second on 1c-src.
+        let mut file_symbols: Vec<Symbol> = Vec::new();
+        let mut attach = |file_symbols: &mut Vec<Symbol>| {
+            let Some(first) = file_symbols.first() else {
+                return;
+            };
+            match files.get_mut(&repo_root.join(&first.file_path)) {
+                Some(meta) => meta.symbols.append(file_symbols),
+                None => {
+                    dropped += file_symbols.len();
+                    file_symbols.clear();
+                }
             }
+        };
+        store.for_each_symbol(&repo, |sym| {
+            if file_symbols
+                .first()
+                .is_some_and(|first| first.file_path != sym.file_path)
+            {
+                attach(&mut file_symbols);
+            }
+            file_symbols.push(sym);
         })?;
+        attach(&mut file_symbols);
         if dropped > 0 {
             warn!(
                 "Dropped {} symbol(s) with no matching file row for repo {}",
