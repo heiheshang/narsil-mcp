@@ -442,7 +442,8 @@ pub struct CodeIntelEngine {
     /// `CallGraph::nodes` (`callgraph.rs`) on why "on-disk" doesn't mean
     /// "trusted" for this tool and why `ahash` here is still an accepted
     /// tradeoff rather than a real DoS exposure.
-    file_cache: FastMap<PathBuf, ()>,
+    /// The value is the file's line count, saved with the index.
+    file_cache: FastMap<PathBuf, u64>,
     chunk_cache: crate::index::text::chunk_cache::ChunkTokenCache,
     /// Synthetic normalized documents indexed separately from raw files
     normalized_docs: DashMap<String, Vec<NormalizedDocument>>,
@@ -506,6 +507,9 @@ struct WalkOutcome {
     /// Files whose search documents were (re)built: all of them unless the
     /// persisted index has this index format.
     stale_files: usize,
+    /// Unchanged files read only because the persisted index lacks their
+    /// line count; saving records it.
+    unknown_lines: usize,
 }
 
 /// Symbols for `file_path` from a persisted index, if that entry can still be
@@ -1139,6 +1143,7 @@ impl CodeIntelEngine {
                         Some(persisted) => {
                             outcome.reparsed_files > 0
                                 || outcome.stale_files > 0
+                                || outcome.unknown_lines > 0
                                 || outcome.indexed_files != persisted.files.len()
                         }
                     };
@@ -1149,6 +1154,11 @@ impl CodeIntelEngine {
                     }
                     self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 }
+            }
+            // Freeing half a million symbols took up to seconds with their
+            // pages swapped out, all before the server was ready.
+            if let Some(persisted) = persisted {
+                std::thread::spawn(move || drop(persisted));
             }
         }
         // Repositories skipped above (path gone) would otherwise keep their
@@ -1257,6 +1267,9 @@ impl CodeIntelEngine {
 
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
+        // After readiness: it walks every structure, which with swapped-out
+        // pages took seconds.
+        self.log_memory_breakdown();
 
         Ok(())
     }
@@ -2987,6 +3000,7 @@ impl CodeIntelEngine {
                             .unwrap_or(0);
 
                         let size = metadata.len();
+                        let lines = self.file_cache.get(&full_path).map(|lines| *lines);
                         let known = previous
                             .get(&full_path)
                             .filter(|(_, prev_modified, prev_size)| {
@@ -3011,6 +3025,7 @@ impl CodeIntelEngine {
                                 content_hash,
                                 modified_time: modified,
                                 size,
+                                lines,
                                 symbols: file_symbols,
                             },
                         ))
@@ -3182,7 +3197,8 @@ impl CodeIntelEngine {
                         }
 
                         // Record the file as indexed (content read from disk).
-                        self.file_cache.insert(change.path.clone(), ());
+                        self.file_cache
+                            .insert(change.path.clone(), content.lines().count() as u64);
 
                         // Update search index. The previous documents for this
                         // file go first: re-indexing on top of them used to

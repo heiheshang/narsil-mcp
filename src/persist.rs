@@ -25,6 +25,9 @@ pub struct FileMetadata {
     pub content_hash: String,
     pub modified_time: u64,
     pub size: u64,
+    /// Line count when known; a warm start reads the file otherwise.
+    #[serde(default)]
+    pub lines: Option<u64>,
     pub symbols: Vec<Symbol>,
 }
 
@@ -130,6 +133,7 @@ impl PersistedIndex {
                     .duration_since(SystemTime::UNIX_EPOCH)?
                     .as_secs(),
                 size: metadata.len(),
+                lines: None,
                 symbols,
             },
         );
@@ -266,6 +270,7 @@ impl IndexStore {
                     content_hash: f.content_hash,
                     modified_time: f.modified_time,
                     size: f.size,
+                    lines: f.lines,
                     symbols: Vec::new(),
                 },
             );
@@ -314,6 +319,7 @@ impl IndexStore {
                 content_hash: meta.content_hash.clone(),
                 modified_time: meta.modified_time,
                 size: meta.size,
+                lines: meta.lines,
             });
             symbols.extend(meta.symbols.iter().cloned());
         }
@@ -953,6 +959,7 @@ mod tests {
                 content_hash: "abc".into(),
                 modified_time: 123,
                 size: 11,
+                lines: Some(1),
                 symbols,
             },
         );
@@ -967,6 +974,7 @@ mod tests {
         assert_eq!(meta.symbols[0].file_path, "a.rs");
         assert_eq!(meta.content_hash, "abc");
         assert_eq!(meta.modified_time, 123);
+        assert_eq!(meta.lines, Some(1));
         assert_eq!(loaded.repo_root, repo.path().to_path_buf());
 
         // Timestamps must survive the round-trip (they feed `last_indexed`).

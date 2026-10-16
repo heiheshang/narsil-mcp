@@ -32,6 +32,9 @@ pub struct FileRow {
     pub content_hash: String,
     pub modified_time: u64,
     pub size: u64,
+    /// Line count, so that a warm start need not read an unchanged file.
+    /// Absent in rows written before the column existed.
+    pub lines: Option<u64>,
 }
 
 const SCHEMA_VERSION: i64 = 2;
@@ -67,6 +70,7 @@ CREATE TABLE IF NOT EXISTS files (
     content_hash  TEXT NOT NULL,
     modified_time INTEGER NOT NULL,
     size          INTEGER NOT NULL,
+    lines         INTEGER,
     PRIMARY KEY (repo, path)
 );
 CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo);
@@ -102,6 +106,16 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA_SQL)?;
+        // Added without a schema version bump: older binaries name their
+        // columns and leave it NULL.
+        let has_lines: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('files') WHERE name = 'lines'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_lines {
+            conn.execute_batch("ALTER TABLE files ADD COLUMN lines INTEGER")?;
+        }
 
         let current: Option<String> = conn
             .query_row(
@@ -300,7 +314,7 @@ impl SqliteStore {
     pub fn for_each_file(&self, repo: &str, mut f: impl FnMut(FileRow)) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT path, content_hash, modified_time, size FROM files WHERE repo=?1 ORDER BY path",
+            "SELECT path, content_hash, modified_time, size, lines FROM files WHERE repo=?1 ORDER BY path",
         )?;
         let rows = stmt.query_map(params![repo], |r| {
             Ok(FileRow {
@@ -308,6 +322,7 @@ impl SqliteStore {
                 content_hash: r.get(1)?,
                 modified_time: r.get::<_, i64>(2)? as u64,
                 size: r.get::<_, i64>(3)? as u64,
+                lines: r.get::<_, Option<i64>>(4)?.map(|lines| lines as u64),
             })
         })?;
         for row in rows {
@@ -360,8 +375,8 @@ impl SqliteStore {
             tx.execute("DELETE FROM files WHERE repo=?1", params![repo])?;
 
             let mut fstmt = tx.prepare(
-                "INSERT INTO files (repo, path, content_hash, modified_time, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO files (repo, path, content_hash, modified_time, size, lines)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for f in files {
                 fstmt.execute(params![
@@ -370,6 +385,7 @@ impl SqliteStore {
                     f.content_hash,
                     f.modified_time as i64,
                     f.size as i64,
+                    f.lines.map(|lines| lines as i64),
                 ])?;
             }
 
@@ -587,6 +603,29 @@ mod tests {
     }
 
     #[test]
+    fn test_files_without_lines_column_gain_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    repo TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL,
+                    modified_time INTEGER NOT NULL, size INTEGER NOT NULL,
+                    PRIMARY KEY (repo, path));
+                 INSERT INTO files VALUES ('repo', 'a.rs', 'abc', 1000, 10);",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let mut rows = Vec::new();
+        store
+            .for_each_file("repo", |f| rows.push((f.path, f.lines)))
+            .unwrap();
+        assert_eq!(rows, vec![("a.rs".to_string(), None)]);
+    }
+
+    #[test]
     fn test_replace_repo_and_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(&dir.path().join("test.db")).unwrap();
@@ -597,12 +636,14 @@ mod tests {
                 content_hash: "abc".into(),
                 modified_time: 1000,
                 size: 10,
+                lines: Some(1),
             },
             FileRow {
                 path: "b.rs".into(),
                 content_hash: "def".into(),
                 modified_time: 2000,
                 size: 20,
+                lines: None,
             },
         ];
         let symbols = vec![sym("foo", "a.rs", 1), sym("bar", "b.rs", 2)];
@@ -611,10 +652,15 @@ mod tests {
         assert_eq!(store.file_count(), 2);
         assert_eq!(store.symbol_count(), 2);
 
-        let mut paths = Vec::new();
-        store.for_each_file("repo", |f| paths.push(f.path)).unwrap();
-        paths.sort();
-        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        let mut rows = Vec::new();
+        store
+            .for_each_file("repo", |f| rows.push((f.path, f.lines)))
+            .unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![("a.rs".to_string(), Some(1)), ("b.rs".to_string(), None)]
+        );
 
         // Replace with a single file — old rows must be gone.
         store
@@ -625,6 +671,7 @@ mod tests {
                     content_hash: "ghi".into(),
                     modified_time: 3000,
                     size: 30,
+                    lines: Some(3),
                 }],
                 &[sym("baz", "c.rs", 1)],
             )

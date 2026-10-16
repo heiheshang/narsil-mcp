@@ -56,7 +56,12 @@ struct Restored {
 /// One file as the parse pool hands it to the indexing thread.
 struct PreparedFile {
     file_path: PathBuf,
+    /// Empty when the file was not read, see [`CodeIntelEngine::read_needless`].
     content: String,
+    lines: u64,
+    bytes: u64,
+    /// Unchanged, but its line count was not saved with the index.
+    lines_unknown: bool,
     parsed: Option<crate::parser::ParsedFile>,
     /// Symbols came from the persisted index, not the parser.
     reused: bool,
@@ -78,6 +83,8 @@ struct WalkAcc {
     total_lines: usize,
     reparsed_files: usize,
     stale_files: usize,
+    /// Unchanged files whose line count the persisted index lacks.
+    unknown_lines: usize,
 }
 
 impl CodeIntelEngine {
@@ -170,6 +177,7 @@ impl CodeIntelEngine {
             total_lines,
             reparsed_files,
             stale_files,
+            unknown_lines,
             ..
         } = acc;
 
@@ -203,8 +211,6 @@ impl CodeIntelEngine {
             restored.normalized.take().unwrap_or(normalized_docs_vec),
         );
 
-        self.log_memory_breakdown();
-
         #[cfg(feature = "graph")]
         self.update_knowledge_graph(&repo_name, search_warm, stale_files, removed_files);
 
@@ -215,6 +221,7 @@ impl CodeIntelEngine {
 
         Ok(WalkOutcome {
             reparsed_files,
+            unknown_lines,
             indexed_files: file_count,
             stale_files,
         })
@@ -232,15 +239,13 @@ impl CodeIntelEngine {
             "Generating neural embeddings for {} symbols...",
             neural_docs.len()
         );
-        let items: Vec<(crate::neural::NeuralDocument,)> =
-            neural_docs.into_iter().map(|d| (d,)).collect();
         // `index_batch` drives a blocking reqwest client. Calling it directly
         // from this async fn runs it on a tokio worker thread, which stalls
         // the runtime after ~128 requests: the server answers, the client
         // never picks the response up, and every later request times out.
         let neural = Arc::clone(neural);
-        let neural_span = debug_span!("neural_embeddings", symbols = items.len());
-        match tokio::task::spawn_blocking(move || neural.index_batch(&items))
+        let neural_span = debug_span!("neural_embeddings", symbols = neural_docs.len());
+        match tokio::task::spawn_blocking(move || neural.index_batch(neural_docs))
             .instrument(neural_span)
             .await
         {
@@ -422,11 +427,28 @@ impl CodeIntelEngine {
     /// deferred call sites. `None` when the file cannot be read as text.
     fn prepare_file(&self, ctx: &WalkCtx<'_>, file_path: &Path) -> Option<PreparedFile> {
         let parse_start = std::time::Instant::now();
-        let content = read_indexable_text_file(file_path)?;
         let unchanged = ctx.search_warm
             && ctx
                 .same_format
                 .is_some_and(|persisted| unchanged_since(persisted, file_path));
+        let recorded = ctx
+            .same_format
+            .and_then(|persisted| persisted.files.get(file_path))
+            .filter(|_| unchanged);
+        let known_lines = recorded.and_then(|metadata| metadata.lines);
+        let (content, lines, bytes) = match recorded {
+            Some(metadata) if known_lines.is_some() && Self::read_needless(ctx, file_path) => (
+                String::new(),
+                known_lines.unwrap_or_default(),
+                metadata.size,
+            ),
+            _ => {
+                let content = read_indexable_text_file(file_path)?;
+                let lines = content.lines().count() as u64;
+                let bytes = content.len() as u64;
+                (content, lines, bytes)
+            }
+        };
         let (parsed, reused) = self.file_symbols(ctx, file_path, &content);
         self.metrics.record_file_parse(parse_start.elapsed());
         let mut prepared =
@@ -465,11 +487,21 @@ impl CodeIntelEngine {
         Some(PreparedFile {
             file_path: file_path.to_path_buf(),
             content,
+            lines,
+            bytes,
+            lines_unknown: recorded.is_some() && known_lines.is_none(),
             parsed,
             reused,
             unchanged,
             prepared,
         })
+    }
+
+    /// Whether an unchanged file can be indexed without its content: it is
+    /// not parsed, and nothing taken from its text has to be rebuilt.
+    fn read_needless(ctx: &WalkCtx<'_>, file_path: &Path) -> bool {
+        ctx.graph_loaded
+            && (ctx.normalized_loaded || file_path.extension().is_none_or(|ext| ext != "xml"))
     }
 
     /// The symbols of a file, and whether they came from the persisted index
@@ -530,6 +562,9 @@ impl CodeIntelEngine {
         let PreparedFile {
             file_path,
             content,
+            lines,
+            bytes,
+            lines_unknown,
             parsed,
             reused,
             unchanged,
@@ -541,7 +576,8 @@ impl CodeIntelEngine {
             // Missing from the cache or changed on disk.
             acc.reparsed_files += 1;
         }
-        let lines = content.lines().count();
+        acc.unknown_lines += usize::from(lines_unknown);
+        let lines = lines as usize;
         acc.total_lines += lines;
 
         // Track parseable languages separately from text-only files.
@@ -559,7 +595,7 @@ impl CodeIntelEngine {
         let lang_stats = acc.languages.entry(language_key).or_default();
         lang_stats.file_count += 1;
         lang_stats.line_count += lines;
-        lang_stats.byte_count += content.len();
+        lang_stats.byte_count += bytes as usize;
 
         // Collect symbols with file path and index for embeddings
         let relative_path = file_path
@@ -609,7 +645,7 @@ impl CodeIntelEngine {
 
         // Record the file as indexed (content is read from disk on
         // demand via `content_for`, not cached here).
-        self.file_cache.insert(file_path.clone(), ());
+        self.file_cache.insert(file_path.clone(), lines as u64);
 
         // Index the whole file into search only when the parser
         // extracted no symbols (text-only / unsupported languages).

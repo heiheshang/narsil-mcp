@@ -693,6 +693,16 @@ pub mod vector_index {
             Ok(())
         }
 
+        /// Make room for `additional` more vectors at once.
+        pub fn reserve(&self, additional: usize) -> Result<()> {
+            let _ids = self.ids.write();
+            let needed = self.index.size() + additional;
+            if needed > self.index.capacity() {
+                self.index.reserve(needed)?;
+            }
+            Ok(())
+        }
+
         pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
             self.search_filtered(query, k, |_| true)
         }
@@ -847,6 +857,18 @@ impl VectorStore {
         }
     }
 
+    fn reserve(&self, additional: usize) {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(idx) => {
+                if let Err(e) = idx.reserve(additional) {
+                    tracing::warn!("Failed to reserve {} vectors: {}", additional, e);
+                }
+            }
+            VectorStore::Brute(s) => s.reserve(additional),
+        }
+    }
+
     fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
         match self {
             #[cfg(feature = "neural")]
@@ -947,6 +969,14 @@ impl SimpleVectorStore {
             // which is the honest answer.
             inner.data.extend(embedding.iter().copied());
         }
+    }
+
+    /// Make room for `additional` more vectors at once. Growing the buffer by
+    /// doubling copied it whole each time, under the lock every insert takes.
+    pub fn reserve(&self, additional: usize) {
+        let mut inner = self.inner.write();
+        inner.ids.reserve(additional);
+        inner.data.reserve(additional * self.dimension);
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
@@ -1315,23 +1345,29 @@ impl NeuralEngine {
     /// Batches are dispatched in parallel: `embed_batch` is a blocking HTTP
     /// call, and sequential dispatch left the embedding server idle between
     /// requests (~3× slower on a full corpus).
-    pub fn index_batch(&self, items: &[(NeuralDocument,)]) -> Result<()> {
+    pub fn index_batch(&self, items: Vec<NeuralDocument>) -> Result<()> {
         const BATCH_SIZE: usize = 96; // Voyage API limit is 128, use 96 for safety
 
         use rayon::prelude::*;
-        items.par_chunks(BATCH_SIZE).try_for_each(|chunk| {
-            let contents: Vec<String> = chunk.iter().map(|(doc,)| doc.content.clone()).collect();
-            let embeddings = self.backend.embed_batch(&contents)?;
+        self.store.reserve(items.len());
+        items
+            .into_par_iter()
+            .chunks(BATCH_SIZE)
+            .try_for_each(|chunk| {
+                let contents: Vec<String> = chunk.iter().map(|doc| doc.content.clone()).collect();
+                let embeddings = self.backend.embed_batch(&contents)?;
 
-            for ((doc,), embedding) in chunk.iter().zip(embeddings.iter()) {
-                // Repository-scoped key: ids are repo-relative and collide
-                // across repositories (every repo has a `src/lib.rs::main`).
-                let key = crate::search::scoped_doc_id(&doc.repo, &doc.id);
-                self.store.add(&key, embedding);
-                self.documents.write().insert(key, doc.clone());
-            }
-            Ok(())
-        })
+                let mut keyed = Vec::with_capacity(chunk.len());
+                for (doc, embedding) in chunk.into_iter().zip(embeddings.iter()) {
+                    // Repository-scoped key: ids are repo-relative and collide
+                    // across repositories (every repo has a `src/lib.rs::main`).
+                    let key = crate::search::scoped_doc_id(&doc.repo, &doc.id);
+                    self.store.add(&key, embedding);
+                    keyed.push((key, doc));
+                }
+                self.documents.write().extend(keyed);
+                Ok(())
+            })
     }
 
     /// Search for similar code across every indexed repository
