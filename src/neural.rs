@@ -857,6 +857,16 @@ impl VectorStore {
         }
     }
 
+    fn add_many<'a>(&self, items: impl IntoIterator<Item = (&'a str, &'a [f32])>) {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(_) => items
+                .into_iter()
+                .for_each(|(doc_id, embedding)| self.add(doc_id, embedding)),
+            VectorStore::Brute(s) => s.add_many(items),
+        }
+    }
+
     fn reserve(&self, additional: usize) {
         match self {
             #[cfg(feature = "neural")]
@@ -950,23 +960,31 @@ impl Vectors {
         &self.data[start..start + dimension]
     }
 
-    /// The slot holding `vector`, stored first if no slot holds it yet.
-    fn intern(&mut self, vector: &[f32]) -> u32 {
-        use std::hash::{BuildHasher, Hasher};
+    /// The slot already holding `vector`, whose [`vector_hash`] is `hash`.
+    fn find(&self, vector: &[f32], hash: u64) -> Option<u32> {
+        let &slot = self.by_hash.get(&hash)?;
+        bits_equal(self.vector(slot, vector.len()), vector).then_some(slot)
+    }
+
+    /// The slot holding `vector`, whose [`vector_hash`] is `hash`, stored
+    /// first if no slot holds it yet.
+    fn intern(&mut self, vector: &[f32], hash: u64) -> u32 {
         let dimension = vector.len();
-        let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
-        vector.iter().for_each(|x| hasher.write_u32(x.to_bits()));
-        let hash = hasher.finish();
-        if let Some(&slot) = self.by_hash.get(&hash) {
-            if bits_equal(self.vector(slot, dimension), vector) {
-                return slot;
-            }
+        if let Some(slot) = self.find(vector, hash) {
+            return slot;
         }
         let slot = (self.data.len() / dimension) as u32;
         self.data.extend_from_slice(vector);
         self.by_hash.entry(hash).or_insert(slot);
         slot
     }
+}
+
+fn vector_hash(vector: &[f32]) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    vector.iter().for_each(|x| hasher.write_u32(x.to_bits()));
+    hasher.finish()
 }
 
 fn bits_equal(a: &[f32], b: &[f32]) -> bool {
@@ -987,28 +1005,47 @@ impl SimpleVectorStore {
     /// to the flat buffer would shift every subsequent vector's offset and
     /// silently corrupt every later search.
     pub fn add(&self, doc_id: &str, embedding: &[f32]) {
-        if embedding.len() != self.dimension {
-            tracing::warn!(
-                "Refusing vector for {}: expected {} dimensions, got {}",
-                doc_id,
-                self.dimension,
-                embedding.len()
-            );
-            return;
-        }
+        self.add_many([(doc_id, embedding)]);
+    }
 
-        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        // A zero vector has no direction; it scores 0 against everything,
-        // which is the honest answer.
-        let normalized: Vec<f32> = if norm > 0.0 {
-            embedding.iter().map(|x| x / norm).collect()
-        } else {
-            embedding.to_vec()
-        };
+    /// [`add`](Self::add) for several vectors under one lock. Everything
+    /// that does not touch the store is done before taking it: with the
+    /// hashing inside, indexing threads queued on it and 1c-src's vectors
+    /// took 2.8 s instead of 1.
+    pub fn add_many<'a>(&self, items: impl IntoIterator<Item = (&'a str, &'a [f32])>) {
+        let prepared: Vec<(Arc<str>, Vec<f32>, u64)> = items
+            .into_iter()
+            .filter(|(doc_id, embedding)| {
+                let fits = embedding.len() == self.dimension;
+                if !fits {
+                    tracing::warn!(
+                        "Refusing vector for {}: expected {} dimensions, got {}",
+                        doc_id,
+                        self.dimension,
+                        embedding.len()
+                    );
+                }
+                fits
+            })
+            .map(|(doc_id, embedding)| {
+                let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                // A zero vector has no direction; it scores 0 against
+                // everything, which is the honest answer.
+                let normalized: Vec<f32> = if norm > 0.0 {
+                    embedding.iter().map(|x| x / norm).collect()
+                } else {
+                    embedding.to_vec()
+                };
+                let hash = vector_hash(&normalized);
+                (Arc::from(doc_id), normalized, hash)
+            })
+            .collect();
         let mut inner = self.inner.write();
-        let slot = inner.intern(&normalized);
-        inner.ids.push(Arc::from(doc_id));
-        inner.slots.push(slot);
+        for (doc_id, vector, hash) in prepared {
+            let slot = inner.intern(&vector, hash);
+            inner.ids.push(doc_id);
+            inner.slots.push(slot);
+        }
     }
 
     /// Make room for `additional` more ids at once. Growing by doubling
@@ -1400,14 +1437,18 @@ impl NeuralEngine {
                 let contents: Vec<String> = chunk.iter().map(|doc| doc.content.clone()).collect();
                 let embeddings = self.backend.embed_batch(&contents)?;
 
-                let mut keyed = Vec::with_capacity(chunk.len());
-                for (doc, embedding) in chunk.into_iter().zip(embeddings.iter()) {
-                    // Repository-scoped key: ids are repo-relative and collide
-                    // across repositories (every repo has a `src/lib.rs::main`).
-                    let key = crate::search::scoped_doc_id(&doc.repo, &doc.id);
-                    self.store.add(&key, embedding);
-                    keyed.push((key, doc));
-                }
+                // Repository-scoped keys: ids are repo-relative and collide
+                // across repositories (every repo has a `src/lib.rs::main`).
+                let keyed: Vec<(String, NeuralDocument)> = chunk
+                    .into_iter()
+                    .map(|doc| (crate::search::scoped_doc_id(&doc.repo, &doc.id), doc))
+                    .collect();
+                self.store.add_many(
+                    keyed
+                        .iter()
+                        .zip(embeddings.iter())
+                        .map(|((key, _), embedding)| (key.as_str(), embedding.as_slice())),
+                );
                 self.documents.write().extend(keyed);
                 Ok(())
             })
