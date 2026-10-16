@@ -379,8 +379,10 @@ impl LanguageParser {
                 language: tree_sitter_haskell::LANGUAGE.into(),
                 extensions: vec!["hs", "lhs"],
                 symbol_query: r#"
-                    (decl name: (variable) @function.name) @function.def
-                    (decl names: (binding_list (variable) @function.name)) @function.def
+                    (bind name: (variable) @function.name) @function.def
+                    (function name: (variable) @function.name) @function.def
+                    (signature name: (variable) @function.name) @function.def
+                    (signature names: (binding_list (variable) @function.name)) @function.def
                     (data_type (name) @struct.name) @struct.def
                     (class (name) @trait.name) @trait.def
                 "#,
@@ -423,17 +425,27 @@ impl LanguageParser {
                 language: tree_sitter_julia::LANGUAGE.into(),
                 extensions: vec!["jl"],
                 symbol_query: r#"
-                    (module_definition (identifier) @mod.name) @mod.def
+                    (module_definition name: (identifier) @mod.name) @mod.def
 
                     (function_definition
                       (signature
                         (call_expression (identifier) @function.name))) @function.def
+                    (function_definition
+                      (signature
+                        (typed_expression
+                          (call_expression (identifier) @function.name)))) @function.def
 
-                    (short_function_definition
+                    (assignment .
                       (call_expression (identifier) @function.name)) @function.def
+                    (assignment .
+                      (typed_expression
+                        (call_expression (identifier) @function.name))) @function.def
 
                     (struct_definition
-                      (identifier) @struct.name) @struct.def
+                      (type_head (identifier) @struct.name)) @struct.def
+                    (struct_definition
+                      (type_head
+                        (parametrized_type_expression (identifier) @struct.name))) @struct.def
                 "#,
             },
             // R
@@ -1246,6 +1258,24 @@ end
     }
 
     #[test]
+    fn every_symbol_query_compiles() {
+        // A query that does not compile is logged once and the language then
+        // yields no symbols at all, which no other test notices unless it
+        // covers that language.
+        let parser = LanguageParser::new().unwrap();
+        let broken: Vec<String> = parser
+            .configs
+            .iter()
+            .filter_map(|lazy| {
+                Query::new(&lazy.config.language, lazy.config.symbol_query)
+                    .err()
+                    .map(|e| format!("{}: {e}", lazy.config.name))
+            })
+            .collect();
+        assert!(broken.is_empty(), "{broken:#?}");
+    }
+
+    #[test]
     fn test_parse_haskell() {
         let parser = LanguageParser::new().unwrap();
         let content = r#"
@@ -1506,39 +1536,38 @@ int add(int a, int b) => a + b;
     #[test]
     fn test_parse_julia() {
         let parser = LanguageParser::new().unwrap();
-        // Simplified test case
         let content = r#"
+module Shapes
+
 function greet(name)
     println("Hello")
 end
 
+function area(s)::Float64
+    s.side^2
+end
+
+square(x) = x * x
+
 struct Person
     name
+end
+
+mutable struct Point{T}
+    x::T
+end
+
 end
         "#;
 
         let parsed = parser.parse_file(Path::new("test.jl"), content).unwrap();
         assert_eq!(parsed.language, "julia");
-
-        // Julia symbol extraction is limited due to complex AST structure
-        // We verify that the parser works by checking the tree was created
-        assert!(
-            parsed.tree.is_some(),
-            "Should successfully parse Julia code"
+        let mut names: Vec<_> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["Person", "Point", "Shapes", "area", "greet", "square"]
         );
-        // If symbols are extracted, verify they contain expected names
-        let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
-        eprintln!("Found Julia symbols: {:?}", names);
-        if !names.is_empty() {
-            // Check that function definitions produce symbol entries
-            assert!(
-                parsed
-                    .symbols
-                    .iter()
-                    .any(|s| s.kind == crate::symbols::SymbolKind::Function),
-                "Should find at least one function symbol"
-            );
-        }
     }
 
     #[test]
