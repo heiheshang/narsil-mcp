@@ -15,6 +15,20 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` in mimalloc v3's `mi_option_e`; `libmimalloc-sys`
+/// does not export it.
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// Have mimalloc return freed pages to the OS when they are freed. By
+/// default it defers that to the thread that owns them, and the threads that
+/// built 1c-src's startup structures sit idle afterwards: 1.3 GB freed
+/// during startup stayed resident for 16 to over 40 seconds, and the peak
+/// was 5.7 GB instead of 4.8.
+fn return_freed_memory_at_once() {
+    // SAFETY: sets a process-wide option; safe at any time.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
 #[derive(ClapParser, Debug)]
 #[command(name = "narsil-mcp")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
@@ -161,6 +175,7 @@ struct ServerArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    return_freed_memory_at_once();
     let args = Args::parse();
 
     // Handle subcommands (config, tools)
@@ -803,5 +818,19 @@ profiles:
         assert!(trace_spans_enabled(Some("true")));
         assert!(!trace_spans_enabled(Some("0")));
         assert!(!trace_spans_enabled(None));
+    }
+}
+
+#[cfg(test)]
+mod allocator_tests {
+    use super::*;
+
+    #[test]
+    fn purge_delay_option_has_its_documented_default() {
+        // A shifted enum would make `return_freed_memory_at_once` change
+        // some other option without a sound. 1000 ms is v3's default, set in
+        // its options.c; the header comment still says 10.
+        let default = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
+        assert_eq!(default, 1000);
     }
 }

@@ -202,6 +202,8 @@ crate-type = ["cdylib", "rlib"]
 # что бинарь помечен required-features = ["native"] и под wasm не строится.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = "0.1"  # Global allocator (lower peak RSS than glibc malloc on huge indexes)
+# The same library as mimalloc's, for `mi_option_set` (see `return_freed_memory_at_once`).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [[bin]]
 name = "narsil-mcp"
