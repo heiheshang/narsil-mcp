@@ -510,7 +510,9 @@ impl KnowledgeGraph {
     /// Returns true if the store is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        // Not `len() == 0`: counting scans every quad, 0.75 s for 1c-src's
+        // 3.9 million on each startup.
+        self.store.is_empty().unwrap_or(true)
     }
 
     /// Exports the graph to Turtle format.
