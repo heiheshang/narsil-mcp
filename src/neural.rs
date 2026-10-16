@@ -947,17 +947,25 @@ struct Vectors {
     ids: Vec<Arc<str>>,
     /// For each id, the index of its vector in `data`.
     slots: Vec<u32>,
-    /// Distinct vectors, `dimension` floats each, L2-normalised.
-    data: Vec<f32>,
+    /// Distinct vectors, `dimension` floats each, L2-normalised, in blocks
+    /// of `VECTORS_PER_BLOCK`. One growing buffer was copied whole at each
+    /// doubling, the old and new copies both resident: 0.3 GB more at the
+    /// peak of 1c-src's startup.
+    blocks: Vec<Vec<f32>>,
+    /// Distinct vectors stored.
+    count: usize,
     /// A vector's hash to the slot holding it. Only a hint: the slot is
     /// compared before it is shared.
     by_hash: ahash::AHashMap<u64, u32>,
 }
 
+const VECTORS_PER_BLOCK: usize = 1024;
+
 impl Vectors {
     fn vector(&self, slot: u32, dimension: usize) -> &[f32] {
-        let start = slot as usize * dimension;
-        &self.data[start..start + dimension]
+        let slot = slot as usize;
+        let start = (slot % VECTORS_PER_BLOCK) * dimension;
+        &self.blocks[slot / VECTORS_PER_BLOCK][start..start + dimension]
     }
 
     /// The slot already holding `vector`, whose [`vector_hash`] is `hash`.
@@ -973,8 +981,16 @@ impl Vectors {
         if let Some(slot) = self.find(vector, hash) {
             return slot;
         }
-        let slot = (self.data.len() / dimension) as u32;
-        self.data.extend_from_slice(vector);
+        if self.count.is_multiple_of(VECTORS_PER_BLOCK) {
+            self.blocks
+                .push(Vec::with_capacity(VECTORS_PER_BLOCK * dimension));
+        }
+        let slot = self.count as u32;
+        self.blocks
+            .last_mut()
+            .expect("a block was just made room in")
+            .extend_from_slice(vector);
+        self.count += 1;
         self.by_hash.entry(hash).or_insert(slot);
         slot
     }
@@ -1087,7 +1103,7 @@ impl SimpleVectorStore {
         // top and is the one displaced.
         let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k + 1);
         // Each distinct vector is scored once, for the first id that uses it.
-        let mut scores: Vec<Option<f32>> = vec![None; inner.data.len() / self.dimension];
+        let mut scores: Vec<Option<f32>> = vec![None; inner.count];
 
         for (i, (id, &slot)) in inner.ids.iter().zip(&inner.slots).enumerate() {
             if !allow(id) {
@@ -2638,6 +2654,22 @@ mod tests {
     }
 
     #[test]
+    fn vectors_past_the_first_block_are_found() {
+        let store = SimpleVectorStore::new(2);
+        let n = VECTORS_PER_BLOCK + 10;
+        for i in 0..n {
+            let angle = i as f32 * 0.001;
+            store.add(&format!("v{i}"), &[angle.cos(), angle.sin()]);
+        }
+        assert_eq!(store.inner.read().count, n);
+        let last = (n - 1) as f32 * 0.001;
+        assert_eq!(
+            store.search(&[last.cos(), last.sin()], 1)[0].0,
+            format!("v{}", n - 1)
+        );
+    }
+
+    #[test]
     fn identical_vectors_are_stored_once() {
         let store = SimpleVectorStore::new(3);
         store.add("a", &[1.0, 2.0, 2.0]);
@@ -2646,7 +2678,7 @@ mod tests {
         store.add("c", &[2.0, 4.0, 4.0]);
 
         assert_eq!(store.len(), 3);
-        assert_eq!(store.inner.read().data.len(), 2 * 3);
+        assert_eq!(store.inner.read().count, 2);
         let found = store.search(&[1.0, 2.0, 2.0], 3);
         let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(&ids[..2], ["a", "c"]);

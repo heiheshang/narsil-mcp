@@ -510,6 +510,8 @@ struct WalkOutcome {
     /// Unchanged files read only because the persisted index lacks their
     /// line count; saving records it.
     unknown_lines: usize,
+    /// Files in the persisted index the walk started from, if any.
+    persisted_files: Option<usize>,
 }
 
 /// Symbols for `file_path` from a persisted index, if that entry can still be
@@ -1120,7 +1122,7 @@ impl CodeIntelEngine {
             };
 
             info!("Indexing repository: {:?}", repo_path);
-            let outcome = match persisted.as_ref() {
+            let outcome = match persisted {
                 Some(persisted) => {
                     info!(
                         "Repository {} loaded from cache; re-walking with {} cached files",
@@ -1138,13 +1140,13 @@ impl CodeIntelEngine {
                     // Rewrite the persisted index only when this walk changed
                     // it. Saving re-hashes every file, so a pass that merely
                     // confirmed the cache must not pay for it on each startup.
-                    let changed = match persisted.as_ref() {
+                    let changed = match outcome.persisted_files {
                         None => true,
-                        Some(persisted) => {
+                        Some(persisted_files) => {
                             outcome.reparsed_files > 0
                                 || outcome.stale_files > 0
                                 || outcome.unknown_lines > 0
-                                || outcome.indexed_files != persisted.files.len()
+                                || outcome.indexed_files != persisted_files
                         }
                     };
                     if changed {
@@ -1154,11 +1156,6 @@ impl CodeIntelEngine {
                     }
                     self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 }
-            }
-            // Freeing half a million symbols took up to seconds with their
-            // pages swapped out, all before the server was ready.
-            if let Some(persisted) = persisted {
-                std::thread::spawn(move || drop(persisted));
             }
         }
         // Repositories skipped above (path gone) would otherwise keep their
@@ -1337,11 +1334,7 @@ impl CodeIntelEngine {
     /// warm cache therefore left every search tool answering from an empty
     /// index. Re-walking restores them; reusing the cached symbols keeps the
     /// expensive part — tree-sitter parsing — off unchanged files.
-    async fn index_repo_warm(
-        &self,
-        path: &Path,
-        persisted: &PersistedIndex,
-    ) -> Result<WalkOutcome> {
+    async fn index_repo_warm(&self, path: &Path, persisted: PersistedIndex) -> Result<WalkOutcome> {
         self.index_repo_inner(path, Some(persisted)).await
     }
 

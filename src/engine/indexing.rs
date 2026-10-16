@@ -91,12 +91,12 @@ impl CodeIntelEngine {
     #[tracing::instrument(
         name = "index_repo",
         skip_all,
-        fields(repo = tracing::field::Empty, warm = reuse.is_some())
+        fields(repo = tracing::field::Empty, warm = persisted.is_some())
     )]
     pub(super) async fn index_repo_inner(
         &self,
         path: &Path,
-        reuse: Option<&PersistedIndex>,
+        persisted: Option<PersistedIndex>,
     ) -> Result<WalkOutcome> {
         let start_time = std::time::Instant::now();
         let repo_name = path
@@ -110,6 +110,7 @@ impl CodeIntelEngine {
         let repo_tag: Arc<str> = Arc::from(repo_name.as_str());
 
         let index_format = crate::persist::current_index_format();
+        let reuse = persisted.as_ref();
         let same_format = reuse.filter(|persisted| persisted.index_format == index_format);
         // Symbols are only reusable when the walk does not also need parse
         // trees: the call graph is built from them, and they are not persisted.
@@ -168,6 +169,17 @@ impl CodeIntelEngine {
             acc
         };
 
+        let tfidf_stamp = same_format
+            .filter(|p| tfidf_fresh && !p.snapshot_stamp.is_empty())
+            .map(|p| p.snapshot_stamp.clone());
+        let persisted_files = persisted.as_ref().map(|p| p.files.len());
+        // The neural phase below needs none of it. Freed in the background:
+        // half a million symbols took up to seconds with their pages
+        // swapped out.
+        if let Some(persisted) = persisted {
+            std::thread::spawn(move || drop(persisted));
+        }
+
         let WalkAcc {
             languages,
             symbols: symbols_vec,
@@ -197,18 +209,21 @@ impl CodeIntelEngine {
             repo_name
         );
 
+        let symbol_count = symbols_vec.len();
+        // Before the neural phase, so that the symbols restored at startup
+        // are not held through it. Freed off the path to readiness.
+        if let Some(restored_symbols) = self.symbols.insert(repo_name.clone(), symbols_vec) {
+            std::thread::spawn(move || drop(restored_symbols));
+        }
+
         self.index_neural_docs(neural_docs).await;
 
         // Record indexing metrics
         let elapsed = start_time.elapsed();
         self.metrics
-            .record_repo_index(repo_name.clone(), elapsed, file_count, symbols_vec.len());
+            .record_repo_index(repo_name.clone(), elapsed, file_count, symbol_count);
 
         self.repos.insert(repo_name.clone(), metadata);
-        // The symbols restored at startup, freed off the path to readiness.
-        if let Some(restored_symbols) = self.symbols.insert(repo_name.clone(), symbols_vec) {
-            std::thread::spawn(move || drop(restored_symbols));
-        }
         self.normalized_docs.insert(
             repo_name.clone(),
             restored.normalized.take().unwrap_or(normalized_docs_vec),
@@ -217,9 +232,8 @@ impl CodeIntelEngine {
         #[cfg(feature = "graph")]
         self.update_knowledge_graph(&repo_name, search_warm, stale_files, removed_files);
 
-        if let Some(persisted) = same_format.filter(|p| tfidf_fresh && !p.snapshot_stamp.is_empty())
-        {
-            self.save_tfidf_snapshot(path, &persisted.snapshot_stamp);
+        if let Some(stamp) = tfidf_stamp {
+            self.save_tfidf_snapshot(path, &stamp);
         }
 
         Ok(WalkOutcome {
@@ -227,6 +241,7 @@ impl CodeIntelEngine {
             unknown_lines,
             indexed_files: file_count,
             stale_files,
+            persisted_files,
         })
     }
 
