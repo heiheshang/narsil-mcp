@@ -9,12 +9,13 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, debug_span, info, warn};
+use tree_sitter::Tree;
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
@@ -494,6 +495,10 @@ pub struct CodeIntelEngine {
     #[cfg(feature = "graph")]
     knowledge_graph: Option<Arc<crate::persistence::KnowledgeGraph>>,
 }
+
+/// A changed file as the call graph sees it: its path relative to the
+/// repository, and its content and tree unless it is gone.
+type ChangedSource = (String, Option<(String, Tree)>);
 
 /// What a repository walk did, so the caller can tell a cache-confirming pass
 /// from one that actually found new or changed code.
@@ -3115,6 +3120,9 @@ impl CodeIntelEngine {
         // Same exclusion rules as the index walk: a change under vendor/
         // etc. must not leak into the index through the watcher.
         let index_filter = crate::security_rules::IndexFilter::new(&self.options.index_exclude)?;
+        // Per repository: each changed file, with its content and tree unless
+        // it is gone. The call graph is updated once for all of them.
+        let mut graph_changes: HashMap<String, (PathBuf, Vec<ChangedSource>)> = HashMap::new();
 
         for change in changes {
             // Find which repo this file belongs to. Notify may emit canonical
@@ -3167,26 +3175,16 @@ impl CodeIntelEngine {
                             }
                         }
 
-                        // Update call-graph for this file if enabled
                         if self.options.call_graph_enabled {
-                            if let Some(cg) = self.call_graphs.get(&repo_name) {
-                                let _ = cg.remove_functions_for_file(&rel_path);
-                                if let Some(parsed) = &parsed {
-                                    if let Some(tree) = &parsed.tree {
-                                        let _ = cg.collect_functions(&[(
-                                            rel_path.clone(),
-                                            content.clone(),
-                                            tree.clone(),
-                                        )]);
-                                        let _ = cg.collect_calls(&[(
-                                            rel_path.clone(),
-                                            content.clone(),
-                                            tree.clone(),
-                                        )]);
-                                        cg.link_extensions();
-                                    }
-                                }
-                            }
+                            let source = parsed
+                                .as_ref()
+                                .and_then(|parsed| parsed.tree.clone())
+                                .map(|tree| (content.clone(), tree));
+                            graph_changes
+                                .entry(repo_name.clone())
+                                .or_insert_with(|| (repo_path.clone(), Vec::new()))
+                                .1
+                                .push((rel_path.clone(), source));
                         }
 
                         // Record the file as indexed (content read from disk).
@@ -3252,14 +3250,12 @@ impl CodeIntelEngine {
                         symbols.retain(|s| s.file_path != rel_path);
                     }
 
-                    // Remove from call-graph
                     if self.options.call_graph_enabled {
-                        if let Some(cg) = self.call_graphs.get(&repo_name) {
-                            let _ = cg.remove_functions_for_file(&rel_path);
-                            // An extension procedure of the deleted file must
-                            // not stay reachable from the method it extended.
-                            cg.link_extensions();
-                        }
+                        graph_changes
+                            .entry(repo_name.clone())
+                            .or_insert_with(|| (repo_path.clone(), Vec::new()))
+                            .1
+                            .push((rel_path.clone(), None));
                     }
 
                     // Remove from file cache
@@ -3284,12 +3280,86 @@ impl CodeIntelEngine {
             }
         }
 
+        for (repo_name, (repo_path, changed)) in graph_changes {
+            if let Some(cg) = self.call_graphs.get(&repo_name) {
+                self.update_call_graph(&cg, &repo_path, changed);
+            }
+        }
+
         // Save index if persistence is enabled
         if self.options.persist_enabled && count > 0 {
             let _ = self.save_index().await;
         }
 
         Ok(count)
+    }
+
+    /// Bring the call graph up to date with changed files: their own
+    /// functions and calls, and the calls of every other file to a function
+    /// that appeared in them or disappeared from them. Those edges were
+    /// resolved when their file was read, so a function added later stayed
+    /// without callers and a moved one kept them at its old place.
+    ///
+    /// A function whose key is unchanged leaves the edges to it as they are,
+    /// so an edit inside bodies rereads nothing; with every function of the
+    /// file counted, saving `ОбщегоНазначения` of УТ reread 4.5 thousand
+    /// files, 15 s. The price: a changed result type or `Экспорт` alone does
+    /// not re-resolve the calls elsewhere.
+    fn update_call_graph(&self, cg: &CallGraph, repo_path: &Path, changed: Vec<ChangedSource>) {
+        let started = std::time::Instant::now();
+        let changed_paths: HashSet<String> = changed.iter().map(|(path, _)| path.clone()).collect();
+        let mut old_keys: HashSet<String> = HashSet::new();
+        for (path, _) in &changed {
+            old_keys.extend(cg.function_keys_in_file(path));
+            let _ = cg.remove_functions_for_file(path);
+        }
+        let sources: Vec<(String, String, Tree)> = changed
+            .into_iter()
+            .filter_map(|(path, source)| source.map(|(content, tree)| (path, content, tree)))
+            .collect();
+        let _ = cg.collect_functions(&sources);
+        let new_keys: HashSet<String> = sources
+            .iter()
+            .flat_map(|(path, _, _)| cg.function_keys_in_file(path))
+            .collect();
+        let names: HashSet<String> = old_keys
+            .symmetric_difference(&new_keys)
+            .map(|key| CallGraph::bare_name(key).to_string())
+            .collect();
+
+        let callers: Vec<String> = cg
+            .files_calling(&names)
+            .into_iter()
+            .filter(|path| !changed_paths.contains(path))
+            .collect();
+        let _ = cg.collect_calls(&sources);
+        // Their functions are the same, only their calls are resolved anew.
+        // A chunk at a time: the callers of a common name in УТ are 175 MB of
+        // source, and their trees all at once would be several times that.
+        let mut reread = 0;
+        for chunk in callers.chunks(256) {
+            let reread_sources: Vec<(String, String, Tree)> = chunk
+                .par_iter()
+                .filter_map(|path| {
+                    let full = repo_path.join(path);
+                    let content = read_indexable_text_file(&full)?;
+                    let tree = self.parser.parse_to_tree(&full, &content).ok()?;
+                    Some((path.clone(), content, tree))
+                })
+                .collect();
+            for (path, _, _) in &reread_sources {
+                cg.clear_calls_for_file(path);
+            }
+            let _ = cg.collect_calls(&reread_sources);
+            reread += reread_sources.len();
+        }
+        cg.link_extensions();
+        info!(
+            "Call graph updated for {} changed file(s) and {} file(s) calling them in {:?}",
+            changed_paths.len(),
+            reread,
+            started.elapsed()
+        );
     }
 
     // === Git Integration Methods ===

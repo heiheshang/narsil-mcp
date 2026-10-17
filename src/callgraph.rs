@@ -772,6 +772,51 @@ impl CallGraph {
             .map(|module| format!("{module} event {}", node.name))
     }
 
+    /// The keys of the functions defined in `path`.
+    pub fn function_keys_in_file(&self, path: &str) -> Vec<String> {
+        self.file_functions
+            .get(path)
+            .map(|keys| keys.clone())
+            .unwrap_or_default()
+    }
+
+    /// Files with a call to one of `names`, resolved or not. An edge is
+    /// resolved once, when its file is read, so these are the files whose
+    /// edges a change to the functions of that name can make wrong.
+    pub fn files_calling(&self, names: &HashSet<String>) -> HashSet<String> {
+        if names.is_empty() {
+            return HashSet::new();
+        }
+        // The last segment of a key (`file::Type::name`) or of an unresolved
+        // target (`pkg.Func`). Not `bare_name`, which validates the name
+        // character by character: over the million edges of УТ that took
+        // a second and a half per saved file.
+        fn last_segment(target: &str) -> &str {
+            let after_path = target.rsplit("::").next().unwrap_or(target);
+            after_path.rsplit('.').next().unwrap_or(after_path)
+        }
+        self.nodes
+            .iter()
+            .filter(|node| {
+                node.calls
+                    .iter()
+                    .any(|edge| names.contains(last_segment(&edge.target)))
+            })
+            .map(|node| node.file_path.clone())
+            .collect()
+    }
+
+    /// Drop the calls made by the functions of `path`, keeping the functions:
+    /// what [`collect_calls`](Self::collect_calls) of an unchanged file needs
+    /// first, since it only appends.
+    pub fn clear_calls_for_file(&self, path: &str) {
+        for key in self.function_keys_in_file(path) {
+            if let Some(mut node) = self.nodes.get_mut(&key) {
+                node.calls.clear();
+            }
+        }
+    }
+
     /// Remove all functions defined in a file from the call graph.
     /// Call this before re-indexing a file to clean up stale function definitions.
     pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {

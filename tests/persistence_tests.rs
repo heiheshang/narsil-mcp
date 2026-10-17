@@ -1108,3 +1108,130 @@ async fn test_warm_start_reports_the_same_languages() -> Result<()> {
 
     Ok(())
 }
+
+/// `--watch` edges are resolved when the caller's file is read. A change to
+/// another file used to leave them as they were: a call to a function that
+/// appeared later stayed unresolved, and one to a function that moved kept
+/// pointing at its old place.
+mod watch_call_graph {
+    use super::TestRepo;
+    use anyhow::Result;
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+    use tempfile::TempDir;
+
+    async fn engine(repo: &TestRepo, index_dir: &TempDir) -> Result<(CodeIntelEngine, String)> {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            EngineOptions {
+                git_enabled: false,
+                call_graph_enabled: true,
+                persist_enabled: false,
+                watch_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        let name = repo
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        Ok((engine, name))
+    }
+
+    fn change(repo: &TestRepo, file: &str, change_type: ChangeType) -> FileChange {
+        FileChange {
+            path: repo.path().join(file),
+            change_type,
+        }
+    }
+
+    async fn callers(engine: &CodeIntelEngine, repo: &str, function: &str) -> Result<String> {
+        engine.get_callers(repo, function, false, 1, None).await
+    }
+
+    #[tokio::test]
+    async fn a_function_added_later_gets_its_callers() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file("src/a.rs", "pub fn kickoff() { helper_fn(); }\n")?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+
+        repo.add_rust_file("src/b.rs", "pub fn helper_fn() {}\n")?;
+        engine
+            .process_file_changes(&[change(&repo, "src/b.rs", ChangeType::Created)])
+            .await?;
+
+        let report = callers(&engine, &name, "helper_fn").await?;
+        assert!(report.contains("kickoff"), "{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_common_module_added_later_gets_its_callers() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file(
+            "CommonModules/Клиент/Ext/Module.bsl",
+            "Процедура Запустить() Экспорт\n\tСервис.Сделать();\nКонецПроцедуры\n",
+        )?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+
+        let module = "CommonModules/Сервис/Ext/Module.bsl";
+        repo.add_rust_file(module, "Процедура Сделать() Экспорт\nКонецПроцедуры\n")?;
+        engine
+            .process_file_changes(&[change(&repo, module, ChangeType::Created)])
+            .await?;
+
+        let report = callers(&engine, &name, "Сделать").await?;
+        assert!(report.contains("Запустить"), "{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_function_is_not_called_any_more() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file("src/a.rs", "pub fn kickoff() { helper_fn(); }\n")?;
+        repo.add_rust_file("src/b.rs", "pub fn helper_fn() {}\n")?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+
+        std::fs::remove_file(repo.path().join("src/b.rs"))?;
+        engine
+            .process_file_changes(&[change(&repo, "src/b.rs", ChangeType::Deleted)])
+            .await?;
+
+        let report = engine.get_callees(&name, "kickoff", false, 1, None).await?;
+        assert!(!report.contains("src/b.rs"), "{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_moved_function_keeps_its_callers() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file("src/a.rs", "pub fn kickoff() { helper_fn(); }\n")?;
+        repo.add_rust_file("src/b.rs", "pub fn helper_fn() {}\n")?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+        assert!(callers(&engine, &name, "helper_fn")
+            .await?
+            .contains("kickoff"));
+
+        std::fs::remove_file(repo.path().join("src/b.rs"))?;
+        engine
+            .process_file_changes(&[change(&repo, "src/b.rs", ChangeType::Deleted)])
+            .await?;
+        repo.add_rust_file("src/c.rs", "pub fn helper_fn() {}\n")?;
+        engine
+            .process_file_changes(&[change(&repo, "src/c.rs", ChangeType::Created)])
+            .await?;
+
+        let report = callers(&engine, &name, "helper_fn").await?;
+        assert!(report.contains("kickoff"), "{report}");
+        Ok(())
+    }
+}
