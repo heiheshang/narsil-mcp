@@ -9,3 +9,6 @@
 # 3: Julia symbols (the query never compiled) and Haskell's grammar 0.24; the
 # fixtures have neither language, so the hash is the version 1 one.
 3 symbols 8ee212593f8368da215a54ac67673f5c56a605d91ebb5d7f83e182446ef14224
+# 4: Go package-level const/var as symbols; the only Go fixture has none, so
+# the hash is the version 1 one.
+4 symbols 8ee212593f8368da215a54ac67673f5c56a605d91ebb5d7f83e182446ef14224

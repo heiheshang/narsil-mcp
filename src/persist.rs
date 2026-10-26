@@ -53,7 +53,7 @@ pub struct PersistedIndex {
 /// Bump it with any change to what indexing produces; a persisted index of
 /// another version is rebuilt instead of reused. `tests/index_format.rs`
 /// fails when the output on the fixtures changes and this does not.
-pub const INDEX_FORMAT_VERSION: u32 = 3;
+pub const INDEX_FORMAT_VERSION: u32 = 4;
 
 pub fn current_index_format() -> String {
     format!(
