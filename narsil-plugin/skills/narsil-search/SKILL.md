@@ -33,7 +33,7 @@ your `repo` value points at.
 
 | What you have | Tool | Notes |
 |---|---|---|
-| Exact identifier | `find_symbols` | Add `symbol_type` to cut noise: `function`, `method`, `struct`, `class`, `interface`, `enum`, `trait`, `type` (aliases only), `field`, `test`. Go and Rust declare data as `struct`/`interface`, not `class` |
+| Exact identifier | `find_symbols` | Add `symbol_type` to cut noise: `function`, `method`, `struct`, `class`, `interface`, `enum`, `trait`, `type` (aliases only), `field`, `test`, `constant`, `variable`. Go and Rust declare data as `struct`/`interface`, not `class`. Go `const`/`var` are symbols only at package level (block members included); a local `var` inside a function is not — use `search_code` |
 | Identifier you may be misspelling | `workspace_symbol_search` | Fuzzy; use when `find_symbols` returns nothing |
 | Exact string, error text, config key | `search_code` | Case-insensitive **substring**, no regex. Ranked and truncated - see below |
 | Where an identifier is *used*, not defined | `find_symbol_usages`, `find_references` | The right tool for call sites; `search_code` ranks definitions above them |

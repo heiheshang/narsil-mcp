@@ -1884,8 +1884,10 @@ impl CodeIntelEngine {
             Some("type") => Some(SymbolKind::TypeAlias),
             Some("field") => Some(SymbolKind::Field),
             Some("test") => Some(SymbolKind::TestCase),
+            Some("constant") => Some(SymbolKind::Constant),
+            Some("variable") => Some(SymbolKind::Variable),
             Some(other) => anyhow::bail!(
-                "Unknown symbol_type '{}'. Expected one of: struct, class, enum, interface, function, method, trait, type, field, test, all",
+                "Unknown symbol_type '{}'. Expected one of: struct, class, enum, interface, function, method, trait, type, field, test, constant, variable, all",
                 other
             ),
         };

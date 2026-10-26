@@ -198,6 +198,9 @@ impl LanguageParser {
                     (type_declaration (type_spec name: (type_identifier) @type.name)) @type.def
                     (type_declaration (type_alias name: (type_identifier) @type.name)) @type.def
                     (field_declaration name: (field_identifier) @field.name) @field.def
+                    (source_file (const_declaration (const_spec name: (identifier) @const.name (#not-eq? @const.name "_")) @const.def))
+                    (source_file (var_declaration (var_spec name: (identifier) @var.name (#not-eq? @var.name "_")) @var.def))
+                    (source_file (var_declaration (var_spec_list (var_spec name: (identifier) @var.name (#not-eq? @var.name "_")) @var.def)))
                     (call_expression
                       function: (selector_expression field: (field_identifier) @_run)
                       arguments: (argument_list . [(interpreted_string_literal) (raw_string_literal)] @test.name)
@@ -1968,6 +1971,60 @@ func (o *Operation) ID() string { return o.OperationUUID }
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn test_parse_go_package_vars_and_consts() {
+        use crate::symbols::SymbolKind;
+        let parser = LanguageParser::new().unwrap();
+        let code = r#"
+package solerror
+
+const Single = "x"
+
+const (
+    KindA Kind = iota
+    KindB
+    _
+)
+
+var MetricKindEnum = struct {
+    Counter string
+}{Counter: "counter"}
+
+var (
+    ErrA, ErrB = ErrorCode{Code: "a"}, ErrorCode{Code: "b"}
+    _ Coder = (*ErrorCode)(nil)
+)
+
+func f() {
+    var local = 1
+    const localConst = 2
+}
+"#;
+        let parsed = parser.parse_file(Path::new("error.go"), code).unwrap();
+        let kind_of = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.kind.clone())
+        };
+        assert_eq!(kind_of("Single"), Some(SymbolKind::Constant));
+        assert_eq!(kind_of("KindA"), Some(SymbolKind::Constant));
+        assert_eq!(kind_of("KindB"), Some(SymbolKind::Constant));
+        assert_eq!(kind_of("MetricKindEnum"), Some(SymbolKind::Variable));
+        assert_eq!(kind_of("ErrA"), Some(SymbolKind::Variable));
+        assert_eq!(kind_of("ErrB"), Some(SymbolKind::Variable));
+        let enum_var = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "MetricKindEnum")
+            .unwrap();
+        assert_eq!((enum_var.start_line, enum_var.end_line), (12, 14));
+        assert!(parsed.symbols.iter().all(|s| s.name != "_"));
+        assert_eq!(kind_of("local"), None);
+        assert_eq!(kind_of("localConst"), None);
     }
 
     #[test]

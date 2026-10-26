@@ -343,7 +343,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "field", "test", "all"], "description": "Type of symbol to find (default: all). 'field' = struct fields (Go); 'test' = named test cases (Go t.Run, JS describe/it/test), whose line range covers the whole case block"},
+                    "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "field", "test", "constant", "variable", "all"], "description": "Type of symbol to find (default: all). 'field' = struct fields (Go); 'test' = named test cases (Go t.Run, JS describe/it/test), whose line range covers the whole case block; 'constant'/'variable' = top-level const/var (Go package level, including members of const (...)/var (...) blocks)"},
                     "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex — use 'name_regex' for that."},
                     "query": {"type": "string", "description": "Alias for 'pattern'"},
                     "name": {"type": "string", "description": "Alias for 'pattern'"},
