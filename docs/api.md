@@ -50,7 +50,7 @@ Keep stdin open until the answers arrive: on EOF the server exits.
 
 ### Sessions
 
-- An HTTP session expires after **30 minutes** without requests. A request with an expired or unknown id gets `Unknown Mcp-Session-Id`; the client must `initialize` again.
+- An HTTP session expires after **24 hours** without requests (longer than any idle-stop window, so a client survives an on-demand restart). A request with an expired or unknown id gets `Unknown Mcp-Session-Id`; the client must `initialize` again.
 - A request without the header (other than `initialize`) gets `Missing Mcp-Session-Id header: call initialize first`.
 - Sessions live in memory: a server restart drops all of them.
 

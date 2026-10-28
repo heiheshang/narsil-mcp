@@ -78,7 +78,12 @@ pub struct AppState {
 ///
 /// Clients normally drop the connection rather than sending `DELETE /mcp`, so
 /// expiry — not the explicit teardown — is what actually retires a session.
-const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+///
+/// Must be well above the idle window of on-demand deployments (30 min on
+/// .136): a client returning after the server was stopped for idleness
+/// presents its old id, and Cursor does not re-`initialize` on the 404.
+/// Memory stays bounded by `MAX_SESSIONS`, not by the TTL.
+const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Hard cap on tracked sessions. `/mcp` has no authentication by design and
 /// the server binds `0.0.0.0`, so anyone who can reach the port can mint
@@ -828,6 +833,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
         (Some(sid), _) => {
             let mut store = state.sessions.lock().unwrap();
             if !store.touch(sid, Instant::now()) {
+                warn!("Rejected request with unknown Mcp-Session-Id: {}", sid);
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({
@@ -1248,5 +1254,26 @@ mod tests {
 
         assert_eq!(restored.len(), 0);
         assert!(!restored.touch("stale", later));
+    }
+
+    /// 28.10.2026 on .136: last call 07:28, stopped for idleness 07:59,
+    /// woken by the same client 08:02. With a 30-minute TTL the session was
+    /// dropped on load and Cursor stayed stuck on the 404.
+    #[test]
+    fn test_session_survives_idle_stop_and_wake() {
+        const IDLE_STOP: Duration = Duration::from_secs(30 * 60);
+        let mut store = SessionStore::new();
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+
+        store.insert("cursor".to_string(), now);
+        let stopped = now + IDLE_STOP + Duration::from_secs(60);
+        let snapshot = store.snapshot(stopped, now_wall + IDLE_STOP + Duration::from_secs(60));
+
+        let woken_after = Duration::from_secs(34 * 60 + 30);
+        let mut restored =
+            SessionStore::from_persisted(snapshot, now_wall + woken_after, now + woken_after);
+
+        assert!(restored.touch("cursor", now + woken_after));
     }
 }
