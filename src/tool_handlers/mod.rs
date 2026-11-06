@@ -196,13 +196,15 @@ impl ToolRegistry {
         &self,
         name: &str,
         engine: &CodeIntelEngine,
-        args: Value,
+        mut args: Value,
     ) -> Result<String> {
         let handler = self
             .handlers
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
         validate_tool_args(name, &args, ArgValidationMode::from_env())?;
+        // A worktree is addressed by name, branch or path and indexed on first use.
+        engine.resolve_repo_arg(&mut args).await?;
         let span = tracing::info_span!("tool", name = name);
         async {
             tracing::debug!("Executing tool {}", name);

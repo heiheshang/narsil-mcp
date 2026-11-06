@@ -5,6 +5,7 @@
 mod indexing;
 mod repo_registry;
 mod search;
+mod worktree;
 
 use repo_registry::RepoRegistry;
 pub use repo_registry::{RepoEntry, RepoKind, RepoState};
@@ -359,6 +360,10 @@ pub struct EngineOptions {
     /// Maximum file size in bytes to index; larger files are skipped and
     /// counted in the indexing log. None = unlimited.
     pub index_max_file_size: Option<u64>,
+    /// Linked git worktrees: discovered and indexed lazily, eagerly or not.
+    pub worktree_mode: crate::config::schema::WorktreeMode,
+    /// How long a tool call waits for a worktree to finish indexing.
+    pub worktree_wait: std::time::Duration,
     /// Enable RDF knowledge graph storage (requires graph feature)
     #[cfg(feature = "graph")]
     pub graph_enabled: bool,
@@ -382,6 +387,8 @@ impl Default for EngineOptions {
             cache_ttl_seconds: 1800,
             index_exclude: Vec::new(),
             index_max_file_size: Some(10 * 1024 * 1024),
+            worktree_mode: crate::config::schema::WorktreeMode::default(),
+            worktree_wait: std::time::Duration::from_secs(60),
             #[cfg(feature = "graph")]
             graph_enabled: false,
             #[cfg(feature = "graph")]
@@ -495,6 +502,17 @@ pub struct CodeIntelEngine {
     indexed_repos_count: AtomicUsize,
     /// Total number of repositories to index
     total_repos_count: AtomicUsize,
+    /// One lock per worktree being indexed on demand.
+    index_jobs: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Set once the engine is in an `Arc`; lets indexing outlive a tool call.
+    self_ref: std::sync::OnceLock<std::sync::Weak<CodeIntelEngine>>,
+    /// The worktree the server process was started in.
+    cwd_worktree: std::sync::OnceLock<String>,
+    /// Roots to start or stop watching, consumed by the watch-mode task.
+    watch_tx: tokio::sync::mpsc::UnboundedSender<crate::persist::WatchCommand>,
+    watch_rx: parking_lot::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::persist::WatchCommand>>,
+    >,
     /// RDF knowledge graph for persistent code intelligence data (when graph is enabled)
     #[cfg(feature = "graph")]
     knowledge_graph: Option<Arc<crate::persistence::KnowledgeGraph>>,
@@ -894,6 +912,7 @@ impl CodeIntelEngine {
         };
 
         let total_repos = expanded_repos.len();
+        let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // The BM25 index is persisted alongside the symbol store. It used to be
         // an in-RAM map rebuilt from source on every boot, which is most of what
@@ -971,9 +990,15 @@ impl CodeIntelEngine {
             initialization_complete: AtomicBool::new(false),
             indexed_repos_count: AtomicUsize::new(0),
             total_repos_count: AtomicUsize::new(total_repos),
+            index_jobs: DashMap::new(),
+            self_ref: std::sync::OnceLock::new(),
+            cwd_worktree: std::sync::OnceLock::new(),
+            watch_tx,
+            watch_rx: parking_lot::Mutex::new(Some(watch_rx)),
             #[cfg(feature = "graph")]
             knowledge_graph,
         };
+        engine.discover_all_worktrees();
 
         // Try to load persisted indexes first if persistence is enabled
         let mut loaded_repos: Vec<String> = Vec::new();
@@ -1105,6 +1130,8 @@ impl CodeIntelEngine {
 
             if !repo_path.exists() {
                 warn!("Repository path does not exist: {:?}", repo_path);
+                self.registry
+                    .set_state(&repo_name, RepoState::Failed("path does not exist".into()));
                 continue;
             }
 
@@ -1277,6 +1304,12 @@ impl CodeIntelEngine {
         }
     }
 
+    /// Whether an indexed file belongs to the repository at `repo_path`: under
+    /// it, and not under a worktree nested inside it.
+    pub(super) fn owns_file(&self, repo_path: &Path, file: &Path) -> bool {
+        file.starts_with(repo_path) && !self.registry.in_nested_repo(repo_path, file)
+    }
+
     /// The key a repository root is stored under.
     pub(super) fn repo_key(&self, repo_path: &Path) -> String {
         self.registry.key_for_root(repo_path).unwrap_or_else(|| {
@@ -1341,11 +1374,18 @@ impl CodeIntelEngine {
             let repo_path = &entry.path;
             if repo_path.exists() {
                 info!("Indexing repository: {:?}", repo_path);
-                if let Err(e) = self.index_repo(repo_path).await {
-                    warn!("Failed to index {:?}: {}", repo_path, e);
+                match self.index_repo(repo_path).await {
+                    Ok(()) => self.registry.set_state(&entry.key, RepoState::Ready),
+                    Err(e) => {
+                        warn!("Failed to index {:?}: {}", repo_path, e);
+                        self.registry
+                            .set_state(&entry.key, RepoState::Failed(e.to_string()));
+                    }
                 }
             } else {
                 warn!("Repository path does not exist: {:?}", repo_path);
+                self.registry
+                    .set_state(&entry.key, RepoState::Failed("path does not exist".into()));
             }
         }
         Ok(())
@@ -1536,7 +1576,7 @@ impl CodeIntelEngine {
             let mut file_info: Vec<(PathBuf, SystemTime)> = self
                 .file_cache
                 .iter()
-                .filter(|entry| entry.key().starts_with(&repo_path))
+                .filter(|entry| self.owns_file(&repo_path, entry.key()))
                 .filter_map(|entry| {
                     let path = entry.key().clone();
                     std::fs::metadata(&path)
@@ -1752,6 +1792,7 @@ impl CodeIntelEngine {
             output.push_str("*No repositories indexed yet.*\n");
         }
 
+        output.push_str(&self.worktrees_markdown(None));
         Ok(output)
     }
 
@@ -2297,7 +2338,7 @@ impl CodeIntelEngine {
                 let file_path = entry.key();
 
                 // Check if file is in this repo
-                if !file_path.starts_with(&repo_path) {
+                if !self.owns_file(&repo_path, file_path) {
                     continue;
                 }
 
@@ -2581,7 +2622,7 @@ impl CodeIntelEngine {
 
         for entry in self.file_cache.iter() {
             let file_path = entry.key();
-            if !file_path.starts_with(repo_path) {
+            if !self.owns_file(repo_path, file_path) {
                 continue;
             }
 
@@ -2719,7 +2760,7 @@ impl CodeIntelEngine {
 
             for entry in self.file_cache.iter() {
                 let fp = entry.key();
-                if !fp.starts_with(&repo_path) || fp == &file_path {
+                if !self.owns_file(&repo_path, fp) || fp == &file_path {
                     continue;
                 }
 
@@ -2929,6 +2970,15 @@ impl CodeIntelEngine {
     }
 
     async fn save_index_with(&self, with_tfidf: bool) -> Result<String> {
+        self.save_index_filtered(with_tfidf, None).await
+    }
+
+    /// Saves one repository's index, leaving the others' files alone.
+    pub(super) async fn save_index_only(&self, key: &str) -> Result<String> {
+        self.save_index_filtered(false, Some(key)).await
+    }
+
+    async fn save_index_filtered(&self, with_tfidf: bool, only: Option<&str>) -> Result<String> {
         if !self.options.persist_enabled {
             return Ok(
                 "Persistence is not enabled. Start with --persist flag to enable.".to_string(),
@@ -2942,6 +2992,9 @@ impl CodeIntelEngine {
 
         let mut saved_count = 0;
         for entry in self.indexed_roots() {
+            if only.is_some_and(|key| key != entry.key) {
+                continue;
+            }
             let repo_path = &entry.path;
             let repo_name = entry.key.clone();
             // A worktree inside this tree is saved on its own.
@@ -3162,6 +3215,10 @@ impl CodeIntelEngine {
             let Some(owner) = self.registry.owner_of(&change.path) else {
                 continue;
             };
+            if owner.is_worktree() && !owner.path.exists() {
+                self.unregister_repo(&owner.key, "worktree directory removed");
+                continue;
+            }
             if owner.is_worktree() && owner.state != RepoState::Ready {
                 debug!(repo = %owner.key, path = ?change.path, "change in unindexed worktree ignored");
                 continue;
@@ -3937,6 +3994,7 @@ impl CodeIntelEngine {
             }
         }
 
+        output.push_str(&self.worktrees_markdown(repo));
         Ok(output)
     }
 
@@ -5628,7 +5686,7 @@ impl CodeIntelEngine {
 
         for file_entry in self.file_cache.iter() {
             let file_path = file_entry.key();
-            if !file_path.starts_with(&repo_path) {
+            if !self.owns_file(&repo_path, file_path) {
                 continue;
             }
 
@@ -5757,7 +5815,7 @@ impl CodeIntelEngine {
         let files_to_analyze: Vec<std::path::PathBuf> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| self.owns_file(&repo_path, entry.key()))
             .filter(|entry| {
                 if let Some(specific_path) = path {
                     // Support both file and directory paths by checking if path matches
@@ -6001,7 +6059,7 @@ impl CodeIntelEngine {
         let files_to_analyze: Vec<std::path::PathBuf> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| self.owns_file(&repo_path, entry.key()))
             .filter(|entry| {
                 if let Some(specific_path) = path {
                     // Support both file and directory paths by checking if path matches
@@ -6159,7 +6217,7 @@ impl CodeIntelEngine {
         let files: Vec<(std::path::PathBuf, String)> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| self.owns_file(&repo_path, entry.key()))
             .filter(|entry| !exclude_tests || !is_test_file(&entry.key().to_string_lossy()))
             .filter(|entry| !is_security_exemplar_file(&entry.key().to_string_lossy()))
             .filter(|entry| {
@@ -6417,7 +6475,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| self.owns_file(&repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -6548,7 +6606,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| self.owns_file(&repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -6611,7 +6669,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| self.owns_file(&repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -7780,7 +7838,7 @@ impl CodeIntelEngine {
         for entry in self.file_cache.iter() {
             let path = entry.key();
 
-            if !path.starts_with(&repo_path) {
+            if !self.owns_file(&repo_path, path) {
                 continue;
             }
             let Some(content) = self.content_for(path) else {
@@ -8691,7 +8749,7 @@ impl CodeIntelEngine {
             }
 
             let file_path = entry.key();
-            if !file_path.starts_with(&repo_path) {
+            if !self.owns_file(&repo_path, file_path) {
                 continue;
             }
 
@@ -9378,7 +9436,7 @@ impl CodeIntelEngine {
         let files: Vec<FileInfo> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| self.owns_file(&repo_path, entry.key()))
             .map(|entry| {
                 let path = entry.key();
                 let path_str = path.to_string_lossy().to_string();

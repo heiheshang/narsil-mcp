@@ -215,6 +215,15 @@ impl RepoRegistry {
             .collect()
     }
 
+    /// Whether `file` lies in another registered repository nested inside
+    /// `root`, and so is not `root`'s.
+    pub fn in_nested_repo(&self, root: &Path, file: &Path) -> bool {
+        self.entries
+            .read()
+            .iter()
+            .any(|e| e.path != root && e.path.starts_with(root) && file.starts_with(&e.path))
+    }
+
     pub fn worktrees_of(&self, primary: &str) -> Vec<RepoEntry> {
         self.entries
             .read()
@@ -309,6 +318,15 @@ mod tests {
             "app"
         );
         assert!(registry.owner_of(Path::new("/elsewhere/lib.rs")).is_none());
+        assert!(registry.in_nested_repo(
+            Path::new("/src/app"),
+            Path::new("/src/app/.worktrees/x/lib.rs")
+        ));
+        assert!(!registry.in_nested_repo(
+            Path::new("/src/app/.worktrees/x"),
+            Path::new("/src/app/.worktrees/x/lib.rs")
+        ));
+        assert!(!registry.in_nested_repo(Path::new("/src/app"), Path::new("/src/app/lib.rs")));
         assert_eq!(
             registry.nested_roots(Path::new("/src/app")),
             vec![PathBuf::from("/src/app/.worktrees/x")]

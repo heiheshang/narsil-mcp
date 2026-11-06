@@ -108,6 +108,16 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_MAX_FILE_SIZE")]
     max_file_size: Option<u64>,
 
+    /// Linked git worktrees of the repositories: lazy (default; indexed on
+    /// first use), eager (indexed in the background) or off.
+    #[arg(long, env = "NARSIL_WORKTREES")]
+    worktrees: Option<config::schema::WorktreeMode>,
+
+    /// Seconds a tool call waits for a worktree to be indexed before it
+    /// returns and leaves the indexing running in the background.
+    #[arg(long, env = "NARSIL_WORKTREE_INDEX_WAIT_SECS", default_value = "60")]
+    worktree_index_wait_secs: u64,
+
     /// Enable index persistence (save/load index to/from disk)
     #[arg(short, long, env = "NARSIL_PERSIST")]
     persist: bool,
@@ -316,6 +326,8 @@ async fn main() -> Result<()> {
             Some(n) => Some(n),
             None => engine::EngineOptions::default().index_max_file_size,
         },
+        worktree_mode: server_args.worktrees.unwrap_or_default(),
+        worktree_wait: std::time::Duration::from_secs(server_args.worktree_index_wait_secs),
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
@@ -336,6 +348,7 @@ async fn main() -> Result<()> {
     }
 
     let engine = Arc::new(engine);
+    engine.set_self_ref();
 
     // Start background initialization task (indexing repos, git init)
     let init_engine = Arc::clone(&engine);
@@ -353,6 +366,7 @@ async fn main() -> Result<()> {
                 warn!("Error during background initialization: {}", e);
             }
         }
+        init_engine.index_startup_worktrees().await;
     });
 
     // Start watch mode in background if enabled.
@@ -436,6 +450,9 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     }
     if server_args.max_file_size.is_none() {
         server_args.max_file_size = profile.max_file_size;
+    }
+    if server_args.worktrees.is_none() {
+        server_args.worktrees = profile.worktrees;
     }
 
     apply_bool_default(&mut server_args.git, profile.git);

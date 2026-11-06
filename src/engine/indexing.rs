@@ -782,12 +782,18 @@ impl CodeIntelEngine {
         let walk_span = debug_span!("walk").entered();
         debug!("Walking {:?}", path);
         // Use ignore crate to respect .gitignore
+        // Worktrees inside this tree are repositories of their own.
+        let nested = self.registry.nested_roots(path);
+        if !nested.is_empty() {
+            debug!(repo = repo_name, skipped = ?nested, "nested worktree excluded from walk");
+        }
         let walker = ignore::WalkBuilder::new(path)
             .hidden(true)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
+            .filter_entry(move |entry| !nested.iter().any(|root| entry.path() == root))
             .build_parallel();
 
         // Vendored/generated content is excluded by default so committed

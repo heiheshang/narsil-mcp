@@ -676,6 +676,13 @@ impl AsyncFileWatcher {
     }
 }
 
+/// A root to start or stop watching while watch mode runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchCommand {
+    Watch(PathBuf),
+    Unwatch(PathBuf),
+}
+
 /// A detected file change
 #[derive(Debug, Clone)]
 pub struct FileChange {
@@ -858,16 +865,38 @@ pub async fn run_watch_mode(
 ) {
     info!("Starting async watch mode background task");
 
-    let (_watcher, mut rx) = match engine.create_async_file_watcher() {
+    let (mut watcher, mut rx) = match engine.create_async_file_watcher() {
         Some((w, r)) => (w, r),
         None => {
             warn!("Failed to create async file watcher, watch mode disabled");
             return;
         }
     };
+    // Roots indexed later (git worktrees) are added through this channel.
+    let (_idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut commands = engine.take_watch_commands().unwrap_or(idle_rx);
 
     loop {
         tokio::select! {
+            Some(command) = commands.recv() => {
+                match command {
+                    WatchCommand::Watch(path) => {
+                        if watcher.watched_paths().contains(&path) {
+                            continue;
+                        }
+                        if let Err(e) = watcher.watch(&path) {
+                            warn!("Failed to watch {:?}: {}", path, e);
+                        }
+                    }
+                    WatchCommand::Unwatch(path) => {
+                        if let Err(e) = watcher.unwatch(&path) {
+                            debug!("Failed to unwatch {:?}: {}", path, e);
+                        } else {
+                            info!("Stopped watching {:?}", path);
+                        }
+                    }
+                }
+            }
             // Receive batched file change events
             Some(changes) = rx.recv() => {
                 if !changes.is_empty() {

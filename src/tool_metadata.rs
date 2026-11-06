@@ -131,7 +131,7 @@ lazy_static! {
 
         map.insert("list_repos", ToolMetadata {
             name: "list_repos",
-            description: "List all indexed repositories with metadata (path, language breakdown, file count)",
+            description: "List all indexed repositories with metadata (path, language breakdown, file count), and the git worktrees of each. Any tool's `repo` also takes a worktree name (`<repo>@<dir>`), `<repo>@<branch>` or a worktree's absolute path; the worktree is indexed on first use.",
             category: ToolCategory::Repository,
             tags: ["repository", "index", "metadata", "list"].iter().copied().collect(),
             stability: StabilityLevel::Stable,

@@ -407,6 +407,19 @@ impl VectorStore {
         self.documents.clear();
         self.id_to_idx.clear();
     }
+
+    /// Drop every document of `repo`; returns how many were dropped.
+    pub fn remove_repo(&mut self, repo: &str) -> usize {
+        let before = self.documents.len();
+        self.documents.retain(|doc| &*doc.repo != repo);
+        self.id_to_idx = self
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(idx, doc)| (crate::search::scoped_doc_id(&doc.repo, &doc.id), idx))
+            .collect();
+        before - self.documents.len()
+    }
 }
 
 impl Default for VectorStore {
@@ -469,6 +482,10 @@ impl ConcurrentVectorStore {
 
     pub fn clear(&self) {
         self.inner.write().clear();
+    }
+
+    pub fn remove_repo(&self, repo: &str) -> usize {
+        self.inner.write().remove_repo(repo)
     }
 }
 
@@ -817,6 +834,12 @@ impl EmbeddingEngine {
             store.add(doc);
         }
         Ok(true)
+    }
+
+    /// Drop the documents of one repository. Document frequencies keep its
+    /// terms until the next full rebuild.
+    pub fn remove_repo(&self, repo: &str) -> usize {
+        self.store.remove_repo(repo)
     }
 
     /// Clear all data

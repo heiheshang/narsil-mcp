@@ -879,14 +879,6 @@ impl VectorStore {
         }
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
-        match self {
-            #[cfg(feature = "neural")]
-            VectorStore::Ann(idx) => idx.search(query, k),
-            VectorStore::Brute(s) => s.search(query, k),
-        }
-    }
-
     fn search_filtered<F>(&self, query: &[f32], k: usize, allow: F) -> Vec<(String, f32)>
     where
         F: Fn(&str) -> bool,
@@ -1490,7 +1482,9 @@ impl NeuralEngine {
 
         let documents = self.documents.read();
         let results = match repo {
-            None => self.store.search(&query_embedding, k),
+            None => self
+                .store
+                .search_filtered(&query_embedding, k, |id| documents.contains_key(id)),
             Some(repo) => self.store.search_filtered(&query_embedding, k, |id| {
                 documents.get(id).is_some_and(|doc| &*doc.repo == repo)
             }),
@@ -1571,6 +1565,16 @@ impl NeuralEngine {
     pub fn clear(&self) {
         self.store.clear();
         self.documents.write().clear();
+    }
+
+    /// Forget the documents of one repository. Their vectors stay in the
+    /// store, but results are mapped through `documents`, so they are never
+    /// returned.
+    pub fn remove_repo(&self, repo: &str) -> usize {
+        let mut documents = self.documents.write();
+        let before = documents.len();
+        documents.retain(|_, doc| &*doc.repo != repo);
+        before - documents.len()
     }
 
     /// Check if neural search is available

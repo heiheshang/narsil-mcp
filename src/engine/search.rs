@@ -141,7 +141,7 @@ impl CodeIntelEngine {
             for file in self
                 .file_cache
                 .iter()
-                .filter(|e| e.key().starts_with(repo_path))
+                .filter(|e| self.owns_file(repo_path, e.key()))
             {
                 owners.push((repo_entry.key().clone(), repo_path.clone()));
                 files.push(file.key().clone());
@@ -289,7 +289,7 @@ impl CodeIntelEngine {
                 self.file_cache
                     .iter()
                     .map(|e| e.key().clone())
-                    .filter(|p| p.starts_with(repo_path))
+                    .filter(|p| self.owns_file(repo_path, p))
                     .filter(|p| !exclude_tests || !is_test_file(&p.to_string_lossy())),
             );
 

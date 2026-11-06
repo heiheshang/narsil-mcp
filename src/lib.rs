@@ -77,6 +77,8 @@ pub mod remote;
 pub mod streaming;
 #[cfg(feature = "native")]
 pub mod tool_handlers;
+#[cfg(feature = "native")]
+pub mod worktree;
 
 // WASM module (only compiled when targeting wasm32)
 #[cfg(feature = "wasm")]
