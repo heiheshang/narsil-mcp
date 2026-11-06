@@ -140,7 +140,15 @@ inside a worktree.
 - A worktree inside the main repository's tree (for example
   `.claude/worktrees/x`) is excluded from the main repository's walk and results.
 - With `--persist`, each worktree gets its own index database. With `--watch`,
-  it is watched once indexed. A removed worktree is dropped from every index.
+  it is watched once indexed, and a worktree created inside a watched tree is
+  registered as soon as its `.git` file appears. A removed worktree is dropped
+  from every index.
+- Search documents of worktrees not indexed in the current run are dropped at
+  startup, so a worktree's first use after a restart rebuilds its search
+  documents (its symbols still come from its index database).
+- When a repository in `--repos` is a subdirectory of its checkout (a package
+  in a monorepo), each worktree is indexed at the same subdirectory, not as a
+  whole.
 - An HTTP server shared by several clients can index a worktree by path only if
   that path exists on the server's host.
 
