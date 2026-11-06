@@ -64,13 +64,14 @@ An empty narsil result has five quite different causes. Check in this order:
    symbol.
 
 5. **Which checkout was indexed, and is your file inside it?** `--repos` lists
-   specific paths, and a second checkout of the same project — a git worktree, a
-   release clone — is a different path. Code you just wrote in
-   `worktree/<branch>/go-rest-api` is invisible to a server started on the
-   primary checkout, however fresh its index is, and `--watch` will never see it
-   either. Adding the path needs a restart, and a worktree whose last directory
-   component repeats the primary's produces two repositories contending for one
-   name (see `narsil-search`).
+   specific paths. Git worktrees of those repositories are found automatically
+   (unless the server runs with `--worktrees off`) and appear in `list_repos` as
+   `<repo>@<directory>`, but each is its own repository: code you just wrote in a
+   worktree is not in `<repo>`, only in `<repo>@<worktree>`. A worktree is indexed
+   on its first call and watched from then on; `not indexed yet` in `list_repos`
+   is normal, and `is being indexed; retry` means wait, not "absent". A separate
+   clone or a checkout of another repository is still invisible until its path
+   is in `--repos`, which needs a restart.
 
    The complement of this is worth stating too, because it is the more common
    wrong conclusion: **tests are indexed**. Test files and test-helper packages
@@ -106,5 +107,5 @@ Remote GitHub repos (`add_remote_repo`, `get_remote_file`) need `--remote` and a
 | Assume the tool list you saw last session still holds | Presets and flags change per server; `get_index_status` is cheap |
 | Treat a dead server's silence as a fact about the code | Name the server that failed to connect, and scope the answer to what you could actually query |
 | Reuse a repo name across narsil servers | `list_repos` on each; names are per server |
-| Search for code you wrote in a worktree the server was not started on | Check the indexed paths first; a checkout outside `--repos` is not stale, it is absent |
+| Search `<repo>` for code you wrote in a git worktree | Search `<repo>@<worktree>` from `list_repos`; a clone outside `--repos` is not stale, it is absent |
 | Report a directory (tests, fixtures) as "not indexed" from empty hits | Confirm against `get_index_status` file counts; only the built-in exclusions are actually missing |

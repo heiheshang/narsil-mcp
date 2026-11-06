@@ -11,6 +11,7 @@ narsil-mcp supports flexible configuration through multiple layers, allowing you
 - [Configuration File Format](#configuration-file-format)
 - [Presets](#presets)
 - [Named Repository Profiles](#named-repository-profiles)
+- [Git Worktrees](#git-worktrees)
 - [Environment Variables](#environment-variables)
 - [CLI Commands](#cli-commands)
 - [Categories](#categories)
@@ -100,6 +101,51 @@ narsil-mcp config profiles
 
 CLI flags still win, so `narsil-mcp --profile platform --repos ~/src/one-off`
 uses the explicit `--repos` value while keeping profile feature defaults.
+
+A profile can also set `worktrees: lazy | eager | off` — see
+[Git Worktrees](#git-worktrees).
+
+## Git Worktrees
+
+The linked git worktrees of every repository in `--repos` are found at startup
+with `git worktree list`. Each becomes a repository of its own; nothing has to
+be added to `--repos`, and worktrees created after startup are found when first
+addressed.
+
+| Flag | Env | Default | Meaning |
+|------|-----|---------|---------|
+| `--worktrees <mode>` | `NARSIL_WORKTREES` | `lazy` | `lazy`: registered at startup, indexed on first use. `eager`: indexed in the background after the repositories. `off`: not discovered (behaviour before worktree support). |
+| `--worktree-index-wait-secs <n>` | `NARSIL_WORKTREE_INDEX_WAIT_SECS` | `60` | How long a tool call waits for a worktree to be indexed. Past that the call returns and indexing continues in the background. |
+
+**Addressing a worktree** — any tool's `repo` argument accepts:
+
+| Form | Example | Notes |
+|------|---------|-------|
+| `<repo>@<directory>` | `narsil-mcp@fix-install-fork` | The name shown by `list_repos`. A second worktree with the same directory name gets `~2`. |
+| `<repo>@<branch>` | `app@feature-login` for branch `feature/login` | `/` in the branch is written as `-`. |
+| Absolute path | `/home/me/src/app/.claude/worktrees/x` | A path below the worktree root works too. |
+
+`<repo>` without `@` always means the main checkout, even when the server runs
+inside a worktree.
+
+**Behaviour:**
+
+- The worktree the server process was started in is indexed right away, in the
+  background.
+- A call to a worktree that is not indexed yet indexes it first. If that takes
+  longer than the wait, the call fails with `Worktree '…' is being indexed; retry
+  the request shortly`; progress is in `get_index_status`.
+- A search without `repo` covers only repositories that are indexed, so it does
+  not index every worktree at once.
+- A worktree inside the main repository's tree (for example
+  `.claude/worktrees/x`) is excluded from the main repository's walk and results.
+- With `--persist`, each worktree gets its own index database. With `--watch`,
+  it is watched once indexed. A removed worktree is dropped from every index.
+- An HTTP server shared by several clients can index a worktree by path only if
+  that path exists on the server's host.
+
+`list_repos` and `get_index_status` list the worktrees with their branch and
+state (`not indexed yet`, `indexing`, `indexed`, `failed`).
 
 ## Configuration Levels
 
@@ -373,6 +419,16 @@ narsil-mcp --git
 
 export NARSIL_PROFILE=platform
 narsil-mcp
+```
+
+### NARSIL_WORKTREES and NARSIL_WORKTREE_INDEX_WAIT_SECS
+
+How git worktrees are handled (`lazy`, `eager`, `off`) and how long a call waits
+for one to be indexed — see [Git Worktrees](#git-worktrees):
+
+```bash
+export NARSIL_WORKTREES=eager
+export NARSIL_WORKTREE_INDEX_WAIT_SECS=120
 ```
 
 ### NARSIL_ENABLED_CATEGORIES

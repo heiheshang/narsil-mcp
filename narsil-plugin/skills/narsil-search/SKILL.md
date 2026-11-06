@@ -21,13 +21,21 @@ meant. An unknown `repo` name comes back as an error, not as "no results", so a
 typo is visible.
 
 Parameter names are short: `repo`, `symbol`, `path`, `function`, `query`. The
-`repo` value is the **name** from `list_repos`, never a filesystem path.
+`repo` value is the **name** from `list_repos`.
 
-Two indexed paths whose last component is the same — a git worktree at
-`worktree/<branch>/go-rest-api` alongside the primary `go-rest-api` — arrive as
-two repositories competing for one name. `list_repos` is the only place that
-shows how the server resolved that, so check it before trusting which checkout
-your `repo` value points at.
+**Git worktrees.** `list_repos` also lists the worktrees of every indexed
+repository under "Git Worktrees", named `<repo>@<directory>`. Code you are
+editing in a worktree is only in that worktree's index: `repo: "go-rest-api"`
+is always the primary checkout. Address the worktree as `go-rest-api@<dir>`, as
+`go-rest-api@<branch>` with `/` written as `-` (`feature/x` → `feature-x`), or by
+its absolute path. A worktree is indexed on its first call; if that takes longer
+than the server's wait, the call returns `Worktree '…' is being indexed; retry`
+- that is "not ready yet", never "no such code". Retry, or watch
+`get_index_status`. A search without `repo` does not include worktrees nobody
+has asked for yet.
+
+Two repositories whose directories share a name get `name` and `name~2`;
+`list_repos` shows which path each one is.
 
 ## Pick by what you know, cheapest first
 
@@ -160,7 +168,7 @@ answers itself without a second call.
 | Omit `repo` because "there is only one" | Pass it anyway; index contents change between sessions |
 | Put two identifiers, or a sentence, into `find_symbols` / `search_code` | One name or one distinctive token per call; a phrase goes to `hybrid_search` / `neural_search` |
 | Conclude "the tests do not cover this" from an empty search | Test files and test helpers are indexed like any source; only `vendor/`-class paths are excluded by default. Check the wording, then the checkout (`narsil-repo-state`) |
-| Say "this code does not exist" after searching the wrong checkout | A worktree or second clone is invisible unless its path is in `--repos`; `list_repos` shows what is actually there |
+| Say "this code does not exist" after searching the wrong checkout | In a git worktree, search `<repo>@<worktree>` (see `list_repos`), not `<repo>`; a separate clone is invisible unless its path is in `--repos` |
 
 ## Stop rule
 

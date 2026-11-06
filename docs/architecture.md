@@ -98,6 +98,7 @@ narsil-mcp is a high-performance MCP (Model Context Protocol) server written in 
 | `mcp.rs` | JSON-RPC 2.0 protocol handler |
 | `tool_handlers/` | 90 tool implementations (trait dispatch) |
 | `git.rs` | Git blame, history, contributors |
+| `worktree.rs` | `git worktree list` parsing, checkout root and common dir |
 | `lsp.rs` | Language Server Protocol integration |
 | `neural.rs` | API-based & ONNX embedding backends |
 | `remote.rs` | GitHub repository cloning & API access |
@@ -176,6 +177,35 @@ pub struct ToolRegistry {
 **Pattern:** Facade + Singleton (Arc-wrapped)
 
 The core engine managing all code analysis operations.
+
+#### Repository Registry (`src/engine/repo_registry.rs`)
+
+Every repository root the engine knows, the key its data is stored under, and
+its state (`Registered`, `Indexing`, `Ready`, `Failed`). All per-repository
+maps — symbols, call graphs, git handles, search documents — are keyed by that
+key. Primary repositories (`--repos`) keep their directory name; a second one
+with the same name gets `~2`. Git worktrees are registered as
+`<primary>@<directory>`.
+
+The registry is behind a `RwLock`, so repositories can be added while the
+server runs. A file belongs to the innermost registered root containing it, so
+a worktree nested in its primary's tree (`.claude/worktrees/x`) is excluded
+from the primary's walk, results and saved index.
+
+#### Worktrees (`src/engine/worktree.rs`)
+
+- Discovery at startup (`--worktrees lazy|eager|off`) registers worktrees
+  without indexing them.
+- `ToolRegistry::dispatch` resolves `args["repo"]` (key, `<repo>@<branch>`
+  alias or path) before any handler runs, so every tool supports worktrees.
+- On first use, `ensure_repo_indexed` runs the same per-repository steps as
+  startup: call graph, warm or cold walk, git, snapshot, save, watch. One lock
+  per key keeps concurrent calls from walking twice. The wait is bounded by
+  `--worktree-index-wait-secs`; the work goes on in a task holding the
+  engine's `Arc`.
+- New roots reach the running watcher through a `WatchCommand` channel. A
+  removed worktree is dropped from tantivy, trigrams, TF-IDF, neural documents
+  and the maps.
 
 #### Symbol Index
 ```rust

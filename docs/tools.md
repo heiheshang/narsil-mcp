@@ -8,7 +8,7 @@
 
 | Tool | Description |
 |------|-------------|
-| `list_repos` | List all indexed repositories with metadata |
+| `list_repos` | List all indexed repositories with metadata, and the git worktrees of each with their state |
 | `get_project_structure` | Get directory tree with file icons and sizes |
 | `get_file` | Get file contents with optional line range |
 | `get_excerpt` | Extract code around specific lines with context |

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Git worktrees are indexed.** A server started on the main checkout used to
+  search only that checkout, so in a session inside a git worktree the branch's
+  code was not found. The worktrees of every repository in `--repos` are now
+  found with `git worktree list` and become repositories of their own:
+  `<repo>@<directory>`, also reachable as `<repo>@<branch>` (`/` → `-`) or by
+  absolute path, including worktrees created after startup. They are indexed on
+  first use (the server's own working directory right away), with their own
+  index database, watcher and git handle. `--worktrees lazy|eager|off`
+  (`NARSIL_WORKTREES`) and `--worktree-index-wait-secs`
+  (`NARSIL_WORKTREE_INDEX_WAIT_SECS`, 60) control it. `list_repos` and
+  `get_index_status` show each worktree's branch and state.
+- Two repositories whose directories share a name no longer overwrite each
+  other's index: the second is `name~2`.
+
 - **BSL notify descriptions are calls.** `Новый ОписаниеОповещения("Обработчик",
   ЭтотОбъект)` is how 1C calls a procedure asynchronously; the graph now has a
   `Callback` edge from the procedure that builds the description to the

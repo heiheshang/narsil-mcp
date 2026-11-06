@@ -19,6 +19,7 @@ This is a fork of [postrv/narsil-mcp](https://github.com/postrv/narsil-mcp). On 
 - **Streaming indexing** — files are processed in windows and the call graph is built in two streamed passes, so peak memory no longer scales with the whole corpus.
 - **1C:Enterprise (BSL) support** — parses 1С/BSL modules (`.bsl`) via tree-sitter-bsl and normalizes 1С XML metadata into searchable documents.
 - **Leaner search** — the full-text index and TF-IDF embeddings store only what's needed, keeping memory bounded on large repositories.
+- **Git worktrees** — worktrees of every indexed repository are found automatically and indexed on first use, addressed as `<repo>@<worktree>`, by branch or by path; see [Git worktrees](docs/configuration.md#git-worktrees).
 
 ## Why narsil-mcp?
 
