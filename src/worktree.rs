@@ -9,7 +9,11 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreeInfo {
+    /// The directory to index: the worktree root, or the same subdirectory
+    /// of it that the primary is of its own checkout.
     pub path: PathBuf,
+    /// The worktree root's directory name.
+    pub name: String,
     pub head: String,
     pub branch: Option<String>,
     pub detached: bool,
@@ -125,15 +129,28 @@ fn canonical(path: &Path) -> PathBuf {
 pub fn list_worktrees(primary: &Path) -> Result<Vec<WorktreeInfo>> {
     let output = git_output(primary, &["worktree", "list", "--porcelain"])?;
     let primary = canonical(primary);
+    let own_root = checkout_root(&primary)
+        .ok_or_else(|| anyhow!("{primary:?} is not inside a git checkout"))?;
+    // A primary below its checkout root (a monorepo package) maps to the
+    // same package in every other worktree, not to the whole tree.
+    let subdir = primary
+        .strip_prefix(&own_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let worktrees: Vec<WorktreeInfo> = parse_porcelain(&output)
         .into_iter()
         .filter_map(|mut info| {
+            let root = canonical(&info.path);
             let reason = if info.bare {
                 Some("bare")
             } else if info.prunable {
                 Some("prunable")
-            } else if !info.path.is_dir() {
+            } else if !root.is_dir() {
                 Some("missing")
+            } else if root == own_root {
+                Some("the primary's own checkout")
+            } else if !root.join(&subdir).is_dir() {
+                Some("no such subdirectory")
             } else {
                 None
             };
@@ -141,8 +158,13 @@ pub fn list_worktrees(primary: &Path) -> Result<Vec<WorktreeInfo>> {
                 debug!(path = ?info.path, reason, "worktree skipped");
                 return None;
             }
-            info.path = canonical(&info.path);
-            (info.path != primary).then_some(info)
+            info.name = root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("worktree")
+                .to_string();
+            info.path = root.join(&subdir);
+            Some(info)
         })
         .collect();
     debug!(primary = ?primary, count = worktrees.len(), "worktrees discovered");
@@ -303,5 +325,31 @@ prunable gitdir file points to non-existent location
 
         std::fs::remove_dir_all(&wt).unwrap();
         assert!(list_worktrees(&primary).unwrap().is_empty());
+    }
+
+    #[test]
+    fn subdirectory_primary_maps_to_same_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mono = dir.path().canonicalize().unwrap().join("mono");
+        std::fs::create_dir_all(mono.join("pkg")).unwrap();
+        git(&mono, &["init", "-q"]);
+        std::fs::write(mono.join("pkg/a.rs"), "fn a() {}\n").unwrap();
+        git(&mono, &["add", "."]);
+        git(&mono, &["commit", "-q", "-m", "init"]);
+        let wt = dir.path().canonicalize().unwrap().join("wt");
+        git(
+            &mono,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "x"],
+        );
+
+        let worktrees = list_worktrees(&mono.join("pkg")).unwrap();
+        assert_eq!(worktrees.len(), 1, "the monorepo itself is not a worktree");
+        assert_eq!(worktrees[0].path, wt.join("pkg"));
+        assert_eq!(worktrees[0].name, "wt");
+
+        // From inside a linked worktree the main checkout is another worktree.
+        let from_wt = list_worktrees(&wt).unwrap();
+        assert_eq!(from_wt.len(), 1);
+        assert_eq!(from_wt[0].path, mono);
     }
 }

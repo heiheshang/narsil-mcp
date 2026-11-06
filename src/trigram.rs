@@ -346,6 +346,15 @@ impl TrigramIndex {
         }
     }
 
+    /// Repositories that have live files in the index.
+    pub fn repos(&self) -> Vec<String> {
+        self.ensure_fresh();
+        crate::tantivy_index::distinct_terms(&self.reader, self.fields.repo)
+            .into_iter()
+            .filter(|repo| self.repo_file_count(repo) > 0)
+            .collect()
+    }
+
     /// Number of files indexed for `repo`.
     pub fn repo_file_count(&self, repo: &str) -> usize {
         self.ensure_fresh();

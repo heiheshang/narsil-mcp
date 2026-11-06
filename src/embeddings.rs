@@ -410,8 +410,19 @@ impl VectorStore {
 
     /// Drop every document of `repo`; returns how many were dropped.
     pub fn remove_repo(&mut self, repo: &str) -> usize {
+        self.remove_where(|doc| &*doc.repo == repo)
+    }
+
+    /// Drop the documents of `repo` whose file lies under `dir` (relative).
+    pub fn remove_under(&mut self, repo: &str, dir: &std::path::Path) -> usize {
+        self.remove_where(|doc| {
+            &*doc.repo == repo && std::path::Path::new(&doc.file_path).starts_with(dir)
+        })
+    }
+
+    fn remove_where(&mut self, drop: impl Fn(&EmbeddedDocument) -> bool) -> usize {
         let before = self.documents.len();
-        self.documents.retain(|doc| &*doc.repo != repo);
+        self.documents.retain(|doc| !drop(doc));
         self.id_to_idx = self
             .documents
             .iter()
@@ -486,6 +497,10 @@ impl ConcurrentVectorStore {
 
     pub fn remove_repo(&self, repo: &str) -> usize {
         self.inner.write().remove_repo(repo)
+    }
+
+    pub fn remove_under(&self, repo: &str, dir: &std::path::Path) -> usize {
+        self.inner.write().remove_under(repo, dir)
     }
 }
 
@@ -840,6 +855,11 @@ impl EmbeddingEngine {
     /// terms until the next full rebuild.
     pub fn remove_repo(&self, repo: &str) -> usize {
         self.store.remove_repo(repo)
+    }
+
+    /// Drop the documents of `repo` whose file lies under `dir` (relative).
+    pub fn remove_under(&self, repo: &str, dir: &std::path::Path) -> usize {
+        self.store.remove_under(repo, dir)
     }
 
     /// Clear all data

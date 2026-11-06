@@ -417,3 +417,168 @@ async fn unknown_worktree_name_is_an_error() -> Result<()> {
     assert!(err.contains("app@wt"), "{err}");
     Ok(())
 }
+
+#[tokio::test]
+async fn subdirectory_primary_is_not_its_whole_checkout() -> Result<()> {
+    let fx = Fixture::new()?;
+    std::fs::create_dir(fx.primary.join("pkg"))?;
+    std::fs::write(fx.primary.join("pkg/p.rs"), "pub fn pkg_fn() {}\n")?;
+    git(&fx.primary, &["add", "."])?;
+    git(&fx.primary, &["commit", "-qm", "pkg"])?;
+    let wt = fx.add_worktree("wt", "feature/x")?;
+    let pkg = fx.primary.join("pkg");
+
+    let index_dir = TempDir::new_in(fx.root.path())?;
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![pkg.clone()],
+        fx.options(WorktreeMode::Lazy),
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let listed = call(&engine, "list_repos", json!({})).await?;
+    assert!(listed.contains("**pkg@wt**"), "{listed}");
+    assert!(
+        listed.contains(&wt.join("pkg").display().to_string()),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("pkg@app"),
+        "the checkout is not a worktree:\n{listed}"
+    );
+
+    let found = search(&engine, pkg.to_str().unwrap(), "pkg_fn").await?;
+    assert!(found.contains("p.rs"), "{found}");
+    let listed = call(&engine, "list_repos", json!({})).await?;
+    assert!(listed.contains("**pkg@wt** — not indexed yet"), "{listed}");
+    Ok(())
+}
+
+/// The watcher saw the files of a worktree created inside the primary's tree
+/// before anyone named the worktree.
+#[tokio::test]
+async fn files_watched_before_registration_leave_the_primary() -> Result<()> {
+    let fx = Fixture::new()?;
+    let mut options = fx.options(WorktreeMode::Lazy);
+    options.watch_enabled = true;
+    let (engine, _idx) = fx.engine(options).await?;
+
+    let wt = fx.add_worktree("app/wts/y", "feature/y")?;
+    let leak = wt.join("leak.rs");
+    std::fs::write(&leak, "pub fn leakyfunc() {}\n")?;
+    engine
+        .process_file_changes(&[FileChange {
+            path: leak,
+            change_type: ChangeType::Created,
+        }])
+        .await?;
+    let leaked = call(
+        &engine,
+        "find_symbols",
+        json!({"repo": "app", "pattern": "leakyfunc"}),
+    )
+    .await?;
+    assert!(
+        leaked.contains("leakyfunc"),
+        "precondition: the watcher put it in the primary\n{leaked}"
+    );
+
+    let in_wt = search(&engine, "app@y", "leakyfunc").await?;
+    assert!(in_wt.contains("leak.rs"), "{in_wt}");
+    let symbols = call(
+        &engine,
+        "find_symbols",
+        json!({"repo": "app", "pattern": "leakyfunc"}),
+    )
+    .await?;
+    assert!(!symbols.contains("leakyfunc"), "{symbols}");
+    let semantic = call(
+        &engine,
+        "semantic_search",
+        json!({"repo": "app", "query": "leakyfunc"}),
+    )
+    .await?;
+    assert!(!semantic.contains("leak.rs"), "{semantic}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn watcher_registers_worktree_from_its_git_file() -> Result<()> {
+    let fx = Fixture::new()?;
+    let mut options = fx.options(WorktreeMode::Lazy);
+    options.watch_enabled = true;
+    let (engine, _idx) = fx.engine(options).await?;
+
+    let wt = fx.add_worktree("app/wts/z", "feature/z")?;
+    let file = wt.join("early.rs");
+    std::fs::write(&file, "pub fn early_fn() {}\n")?;
+    engine
+        .process_file_changes(&[
+            FileChange {
+                path: wt.join(".git"),
+                change_type: ChangeType::Created,
+            },
+            FileChange {
+                path: file,
+                change_type: ChangeType::Created,
+            },
+        ])
+        .await?;
+
+    let symbols = call(
+        &engine,
+        "find_symbols",
+        json!({"repo": "app", "pattern": "early_fn"}),
+    )
+    .await?;
+    assert!(!symbols.contains("early_fn"), "{symbols}");
+    let listed = call(&engine, "list_repos", json!({})).await?;
+    assert!(listed.contains("**app@z** — not indexed yet"), "{listed}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn path_inside_nested_worktree_resolves_to_it() -> Result<()> {
+    let fx = Fixture::new()?;
+    let wt = fx.add_worktree("app/wts/x", "feature/x")?;
+    std::fs::create_dir(wt.join("lib"))?;
+    std::fs::write(wt.join("lib/deep.rs"), "pub fn deep_only_fn() {}\n")?;
+    // DashMap iteration order changes with every map, so try several engines.
+    for _ in 0..4 {
+        let (engine, _idx) = fx.engine(fx.options(WorktreeMode::Lazy)).await?;
+        search(&engine, "app@x", "deep_only_fn").await?;
+        let found = call(
+            &engine,
+            "semantic_search",
+            json!({"repo": wt.join("lib").to_str().unwrap(), "query": "deep_only_fn"}),
+        )
+        .await?;
+        assert!(found.contains("deep.rs"), "{found}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_worktree_documents_are_dropped_on_restart() -> Result<()> {
+    let fx = Fixture::new()?;
+    let gone = fx.add_worktree("gone", "feature/gone")?;
+    let index = TempDir::new_in(fx.root.path())?;
+    let mut options = fx.options(WorktreeMode::Lazy);
+    options.persist_enabled = true;
+    {
+        let engine = fx.engine_at(index.path(), options.clone()).await?;
+        search(&engine, "app@gone", WT_ONLY).await?;
+    }
+    git(
+        &fx.primary,
+        &["worktree", "remove", "--force", gone.to_str().unwrap()],
+    )?;
+
+    let engine = fx.engine_at(index.path(), options).await?;
+    for tool in ["semantic_search", "search_code", "hybrid_search"] {
+        let out = call(&engine, tool, json!({"query": WT_ONLY})).await?;
+        assert!(!out.contains("only_in_wt.rs"), "{tool}:\n{out}");
+    }
+    Ok(())
+}

@@ -72,14 +72,17 @@ impl RepoRegistry {
         self.register(path, sanitize_key_part(&basename(path)), RepoKind::Primary)
     }
 
+    /// `name` is the worktree's directory name; `path` may lie below it when
+    /// the primary is a subdirectory of its checkout.
     pub fn register_worktree(
         &self,
         primary_key: &str,
         path: &Path,
+        name: &str,
         branch: Option<String>,
         head: String,
     ) -> String {
-        let wanted = format!("{primary_key}@{}", sanitize_key_part(&basename(path)));
+        let wanted = format!("{primary_key}@{}", sanitize_key_part(name));
         self.register(
             path,
             wanted,
@@ -95,9 +98,18 @@ impl RepoRegistry {
     fn register(&self, path: &Path, wanted: String, kind: RepoKind) -> String {
         let mut entries = self.entries.write();
         if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
-            if let (RepoKind::Worktree { .. }, RepoKind::Worktree { .. }) = (&existing.kind, &kind)
+            // Branch and HEAD move; the primary it was found under does not.
+            if let (
+                RepoKind::Worktree {
+                    branch: old_branch,
+                    head: old_head,
+                    ..
+                },
+                RepoKind::Worktree { branch, head, .. },
+            ) = (&mut existing.kind, kind)
             {
-                existing.kind = kind;
+                *old_branch = branch;
+                *old_head = head;
             }
             return existing.key.clone();
         }
@@ -256,10 +268,11 @@ mod tests {
     fn registering_same_path_twice_keeps_key() {
         let registry = RepoRegistry::new();
         registry.register_primary(Path::new("/src/app"));
-        let first = registry.register_worktree("app", Path::new("/wt/x"), None, "abc".into());
+        let first = registry.register_worktree("app", Path::new("/wt/x"), "x", None, "abc".into());
         let again = registry.register_worktree(
             "app",
             Path::new("/wt/x"),
+            "x",
             Some("feature/x".into()),
             "def".into(),
         );
@@ -267,6 +280,9 @@ mod tests {
         assert_eq!(again, "app@x");
         assert_eq!(registry.len(), 2);
         assert_eq!(registry.entry("app@x").unwrap().branch(), Some("feature/x"));
+        registry.register_primary(Path::new("/src/other"));
+        registry.register_worktree("other", Path::new("/wt/x"), "x", None, "f".into());
+        assert_eq!(registry.worktrees_of("app").len(), 1, "keeps its primary");
     }
 
     #[test]
@@ -276,6 +292,7 @@ mod tests {
         let key = registry.register_worktree(
             "app",
             Path::new("/src/app/.claude/worktrees/fix-x"),
+            "fix-x",
             Some("fix/x".into()),
             "abc".into(),
         );
@@ -295,6 +312,7 @@ mod tests {
         registry.register_worktree(
             "app",
             Path::new("/tmp/wt1"),
+            "wt1",
             Some("feature/login".into()),
             "abc".into(),
         );
@@ -308,7 +326,13 @@ mod tests {
     fn owner_is_innermost_root() {
         let registry = RepoRegistry::new();
         registry.register_primary(Path::new("/src/app"));
-        registry.register_worktree("app", Path::new("/src/app/.worktrees/x"), None, "a".into());
+        registry.register_worktree(
+            "app",
+            Path::new("/src/app/.worktrees/x"),
+            "x",
+            None,
+            "a".into(),
+        );
         let owner = registry
             .owner_of(Path::new("/src/app/.worktrees/x/lib.rs"))
             .unwrap();
@@ -337,7 +361,7 @@ mod tests {
     fn indexed_count_ignores_unindexed_worktrees() {
         let registry = RepoRegistry::new();
         registry.register_primary(Path::new("/src/app"));
-        registry.register_worktree("app", Path::new("/wt/x"), None, "a".into());
+        registry.register_worktree("app", Path::new("/wt/x"), "x", None, "a".into());
         assert_eq!(registry.indexed_count(), 1);
         registry.set_state("app@x", RepoState::Indexing);
         assert_eq!(registry.indexed_count(), 2);

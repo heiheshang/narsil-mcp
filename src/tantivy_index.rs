@@ -668,6 +668,15 @@ impl TantivyIndex {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Repositories that have live documents in the index.
+    pub fn repos(&self) -> Vec<String> {
+        self.ensure_fresh();
+        distinct_terms(&self.reader, self.fields.repo)
+            .into_iter()
+            .filter(|repo| self.repo_doc_count(repo) > 0)
+            .collect()
+    }
+
     /// How many documents a repository currently has indexed.
     ///
     /// Guards the incremental path: the search index and the symbol store are
@@ -1093,4 +1102,25 @@ mod delete_ordering_tests {
             "both repositories must be searchable, got {hits:?}"
         );
     }
+}
+
+/// Every value of a `STRING` field present in the index's term dictionaries.
+/// Terms of deleted documents linger until a merge, so callers check counts.
+pub(crate) fn distinct_terms(reader: &IndexReader, field: Field) -> Vec<String> {
+    let searcher = reader.searcher();
+    let mut terms = std::collections::BTreeSet::new();
+    for segment in searcher.segment_readers() {
+        let Ok(inverted) = segment.inverted_index(field) else {
+            continue;
+        };
+        let Ok(mut stream) = inverted.terms().stream() else {
+            continue;
+        };
+        while stream.advance() {
+            if let Ok(term) = std::str::from_utf8(stream.key()) {
+                terms.insert(term.to_string());
+            }
+        }
+    }
+    terms.into_iter().collect()
 }

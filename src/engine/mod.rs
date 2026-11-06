@@ -504,6 +504,11 @@ pub struct CodeIntelEngine {
     total_repos_count: AtomicUsize,
     /// One lock per worktree being indexed on demand.
     index_jobs: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Set when `--reindex` has walked and saved the primaries; startup
+    /// signals the same through `initialization_complete`.
+    primaries_reindexed: AtomicBool,
+    /// `git rev-parse --git-common-dir` of each primary, asked once.
+    common_dirs: DashMap<String, Option<PathBuf>>,
     /// Set once the engine is in an `Arc`; lets indexing outlive a tool call.
     self_ref: std::sync::OnceLock<std::sync::Weak<CodeIntelEngine>>,
     /// The worktree the server process was started in.
@@ -991,6 +996,8 @@ impl CodeIntelEngine {
             indexed_repos_count: AtomicUsize::new(0),
             total_repos_count: AtomicUsize::new(total_repos),
             index_jobs: DashMap::new(),
+            primaries_reindexed: AtomicBool::new(false),
+            common_dirs: DashMap::new(),
             self_ref: std::sync::OnceLock::new(),
             cwd_worktree: std::sync::OnceLock::new(),
             watch_tx,
@@ -1118,6 +1125,7 @@ impl CodeIntelEngine {
         }
 
         info!("Starting background initialization");
+        self.drop_unindexed_search_docs();
 
         // Index repos that weren't loaded from persistence
         let mut indexed_any = false;
@@ -1370,7 +1378,11 @@ impl CodeIntelEngine {
     }
 
     async fn index_repos(&self) -> Result<()> {
-        for entry in self.indexed_roots() {
+        let roots = self
+            .indexed_roots()
+            .into_iter()
+            .filter(|e| !e.is_worktree() || e.state == RepoState::Ready);
+        for entry in roots {
             let repo_path = &entry.path;
             if repo_path.exists() {
                 info!("Indexing repository: {:?}", repo_path);
@@ -1409,6 +1421,19 @@ impl CodeIntelEngine {
     }
 
     pub async fn reindex_all(&self) -> Result<()> {
+        // A worktree being indexed on demand finishes first; none starts
+        // until the primaries are back.
+        let worktrees: Vec<String> = self
+            .indexed_roots()
+            .into_iter()
+            .filter(RepoEntry::is_worktree)
+            .map(|e| e.key)
+            .collect();
+        let jobs: Vec<_> = worktrees.iter().map(|key| self.index_job(key)).collect();
+        let mut _guards = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            _guards.push(job.lock().await);
+        }
         self.repos.clear();
         self.symbols.clear();
         self.file_cache.clear();
@@ -1421,6 +1446,7 @@ impl CodeIntelEngine {
         self.query_cache.clear();
         self.index_repos().await?;
         let _ = self.save_index_after_walk().await;
+        self.primaries_reindexed.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1505,18 +1531,25 @@ impl CodeIntelEngine {
 
         if name.contains('/') || name.contains('\\') {
             let as_path = PathBuf::from(name);
-            for entry in self.repos.iter() {
-                let repo_path = &entry.value().path;
-                if as_path == *repo_path || as_path.starts_with(repo_path) {
-                    return Ok(entry.key().clone());
-                }
-                if let (Ok(canonical), Ok(repo_canonical)) =
-                    (as_path.canonicalize(), repo_path.canonicalize())
-                {
-                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
-                        return Ok(entry.key().clone());
-                    }
-                }
+            let canonical = as_path.canonicalize().ok();
+            // The innermost root wins: a worktree nested in a repository's
+            // tree is not that repository.
+            let innermost = self
+                .repos
+                .iter()
+                .filter(|entry| {
+                    let repo_path = &entry.value().path;
+                    as_path.starts_with(repo_path)
+                        || canonical.as_ref().is_some_and(|canonical| {
+                            repo_path
+                                .canonicalize()
+                                .is_ok_and(|repo| canonical.starts_with(repo))
+                        })
+                })
+                .max_by_key(|entry| entry.value().path.components().count())
+                .map(|entry| entry.key().clone());
+            if let Some(key) = innermost {
+                return Ok(key);
             }
         }
 
@@ -2995,6 +3028,9 @@ impl CodeIntelEngine {
             if only.is_some_and(|key| key != entry.key) {
                 continue;
             }
+            if entry.is_worktree() && entry.state != RepoState::Ready {
+                continue;
+            }
             let repo_path = &entry.path;
             let repo_name = entry.key.clone();
             // A worktree inside this tree is saved on its own.
@@ -3206,6 +3242,7 @@ impl CodeIntelEngine {
         // Per repository: each changed file, with its content and tree unless
         // it is gone. The call graph is updated once for all of them.
         let mut graph_changes: HashMap<String, (PathBuf, Vec<ChangedSource>)> = HashMap::new();
+        self.register_new_worktrees(changes);
 
         for change in changes {
             // Find which repo this file belongs to. Notify may emit canonical

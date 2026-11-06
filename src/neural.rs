@@ -1577,6 +1577,16 @@ impl NeuralEngine {
         before - documents.len()
     }
 
+    /// Forget the documents of `repo` whose file lies under `dir` (relative).
+    pub fn remove_under(&self, repo: &str, dir: &std::path::Path) -> usize {
+        let mut documents = self.documents.write();
+        let before = documents.len();
+        documents.retain(|_, doc| {
+            &*doc.repo != repo || !std::path::Path::new(&doc.file_path).starts_with(dir)
+        });
+        before - documents.len()
+    }
+
     /// Check if neural search is available
     pub fn is_available(&self) -> bool {
         self.config.enabled
