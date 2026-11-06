@@ -556,17 +556,23 @@ impl SymbolResolver {
         // Also index all internal symbols for comprehensive lookup
         // (useful for find-references, go-to-definition across files)
         for symbol in symbols {
-            // Use qualified_name if available, otherwise just name
-            let sym_name = symbol.qualified_name.as_ref().unwrap_or(&symbol.name);
-            // Skip if already indexed via exports to avoid duplicates
-            if indexed_names.contains(sym_name) {
-                continue;
+            // Index under both the bare and the qualified name: a lookup by
+            // `method` must still land, and one by `Receiver::method` must
+            // reach only that receiver's method.
+            for sym_name in [Some(&symbol.name), symbol.qualified_name.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                // Skip if already indexed via exports to avoid duplicates
+                if indexed_names.contains(sym_name) {
+                    continue;
+                }
+                indexed_names.insert(sym_name.clone());
+                self.symbol_index
+                    .entry(sym_name.clone())
+                    .or_default()
+                    .push(path.to_path_buf());
             }
-            indexed_names.insert(sym_name.clone());
-            self.symbol_index
-                .entry(sym_name.clone())
-                .or_default()
-                .push(path.to_path_buf());
         }
     }
 

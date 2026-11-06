@@ -2,17 +2,32 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand};
-use narsil_mcp::{config, http_server, index, lsp, mcp, neural, persist, repo, streaming};
+use narsil_mcp::{config, engine, http_server, lsp, mcp, neural, persist, repo, streaming};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 // mimalloc: glibc's default allocator retains freed arenas, inflating peak RSS
 // by ~2-4 GB on the 1C reindex (469k symbols, 5M edges). mimalloc returns
 // memory to the OS more eagerly.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `mi_option_purge_delay` in mimalloc v3's `mi_option_e`; `libmimalloc-sys`
+/// does not export it.
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// Have mimalloc return freed pages to the OS when they are freed. By
+/// default it defers that to the thread that owns them, and the threads that
+/// built 1c-src's startup structures sit idle afterwards: 1.3 GB freed
+/// during startup stayed resident for 16 to over 40 seconds, and the peak
+/// was 5.7 GB instead of 4.8.
+fn return_freed_memory_at_once() {
+    // SAFETY: sets a process-wide option; safe at any time.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
 
 #[derive(ClapParser, Debug)]
 #[command(name = "narsil-mcp")]
@@ -93,6 +108,16 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_MAX_FILE_SIZE")]
     max_file_size: Option<u64>,
 
+    /// Linked git worktrees of the repositories: lazy (default; indexed on
+    /// first use), eager (indexed in the background) or off.
+    #[arg(long, env = "NARSIL_WORKTREES")]
+    worktrees: Option<config::schema::WorktreeMode>,
+
+    /// Seconds a tool call waits for a worktree to be indexed before it
+    /// returns and leaves the indexing running in the background.
+    #[arg(long, env = "NARSIL_WORKTREE_INDEX_WAIT_SECS", default_value = "60")]
+    worktree_index_wait_secs: u64,
+
     /// Enable index persistence (save/load index to/from disk)
     #[arg(short, long, env = "NARSIL_PERSIST")]
     persist: bool,
@@ -160,6 +185,7 @@ struct ServerArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    return_freed_memory_at_once();
     let args = Args::parse();
 
     // Handle subcommands (config, tools)
@@ -175,18 +201,30 @@ async fn main() -> Result<()> {
     let mut server_args = args.server;
 
     // Initialize logging to stderr (stdout is for MCP protocol)
-    let level = if server_args.verbose {
-        Level::DEBUG
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let (filter, rejected_rust_log) = log_filter(server_args.verbose, rust_log.as_deref());
+    let filter_shown = filter.to_string();
+    let trace_spans = trace_spans_enabled(std::env::var("NARSIL_TRACE_SPANS").ok().as_deref());
+    let span_events = if trace_spans {
+        FmtSpan::CLOSE
     } else {
-        Level::INFO
+        FmtSpan::NONE
     };
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
+        .with_env_filter(filter)
+        .with_span_events(span_events)
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting narsil-mcp v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(error) = rejected_rust_log {
+        warn!("Ignoring invalid RUST_LOG: {}", error);
+    }
+    info!(
+        "Log filter: {} (span close events: {})",
+        filter_shown, trace_spans
+    );
 
     apply_named_profile(&mut server_args)?;
 
@@ -271,7 +309,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize the code intelligence engine with options
-    let options = index::EngineOptions {
+    let options = engine::EngineOptions {
         git_enabled: server_args.git,
         call_graph_enabled: server_args.call_graph,
         persist_enabled: server_args.persist,
@@ -286,8 +324,10 @@ async fn main() -> Result<()> {
         index_max_file_size: match server_args.max_file_size {
             Some(0) => None,
             Some(n) => Some(n),
-            None => index::EngineOptions::default().index_max_file_size,
+            None => engine::EngineOptions::default().index_max_file_size,
         },
+        worktree_mode: server_args.worktrees.unwrap_or_default(),
+        worktree_wait: std::time::Duration::from_secs(server_args.worktree_index_wait_secs),
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
@@ -297,7 +337,7 @@ async fn main() -> Result<()> {
     // NOTE: Engine creation is now fast and returns immediately.
     // Indexing happens in background to allow quick MCP server startup.
     let mut engine =
-        index::CodeIntelEngine::with_options(server_args.index_path, repos, options).await?;
+        engine::CodeIntelEngine::with_options(server_args.index_path, repos, options).await?;
 
     // Initialize remote repository support if enabled
     if server_args.remote {
@@ -308,6 +348,7 @@ async fn main() -> Result<()> {
     }
 
     let engine = Arc::new(engine);
+    engine.set_self_ref();
 
     // Start background initialization task (indexing repos, git init)
     let init_engine = Arc::clone(&engine);
@@ -315,8 +356,9 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if reindex_flag {
             info!("Re-indexing all repositories...");
-            if let Err(e) = init_engine.reindex_all().await {
-                warn!("Error during re-indexing: {}", e);
+            match init_engine.reindex_all().await {
+                Ok(()) => info!("Re-indexing complete"),
+                Err(e) => warn!("Error during re-indexing: {}", e),
             }
         } else {
             // Complete deferred initialization
@@ -324,6 +366,7 @@ async fn main() -> Result<()> {
                 warn!("Error during background initialization: {}", e);
             }
         }
+        init_engine.index_startup_worktrees().await;
     });
 
     // Start watch mode in background if enabled.
@@ -407,6 +450,9 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     }
     if server_args.max_file_size.is_none() {
         server_args.max_file_size = profile.max_file_size;
+    }
+    if server_args.worktrees.is_none() {
+        server_args.worktrees = profile.worktrees;
     }
 
     apply_bool_default(&mut server_args.git, profile.git);
@@ -533,6 +579,27 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+/// The log filter: `RUST_LOG` when it is set and parses, otherwise `debug`
+/// with `--verbose` and `info` without. The second value is the parse error
+/// of a rejected `RUST_LOG`, to be reported once logging is up.
+fn log_filter(verbose: bool, rust_log: Option<&str>) -> (EnvFilter, Option<String>) {
+    let fallback = || EnvFilter::new(if verbose { "debug" } else { "info" });
+    let Some(directives) = rust_log.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (fallback(), None);
+    };
+    match EnvFilter::try_new(directives) {
+        Ok(filter) => (filter, None),
+        Err(e) => (fallback(), Some(format!("{directives:?}: {e}"))),
+    }
+}
+
+fn trace_spans_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "on")
+    )
 }
 
 #[cfg(test)]
@@ -739,5 +806,48 @@ profiles:
         assert!(args.server.git);
         assert!(args.server.call_graph);
         assert_eq!(args.server.preset.as_deref(), Some("balanced"));
+    }
+
+    #[test]
+    fn log_filter_defaults_follow_verbose_flag() {
+        assert_eq!(log_filter(false, None).0.to_string(), "info");
+        assert_eq!(log_filter(true, None).0.to_string(), "debug");
+        assert_eq!(log_filter(true, Some("  ")).0.to_string(), "debug");
+    }
+
+    #[test]
+    fn log_filter_takes_rust_log_when_valid() {
+        let (filter, rejected) = log_filter(false, Some("narsil_mcp=trace"));
+        assert_eq!(filter.to_string(), "narsil_mcp=trace");
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn log_filter_falls_back_on_invalid_rust_log() {
+        let (filter, rejected) = log_filter(true, Some("narsil_mcp=loudest"));
+        assert_eq!(filter.to_string(), "debug");
+        assert!(rejected.unwrap().contains("narsil_mcp=loudest"));
+    }
+
+    #[test]
+    fn trace_spans_only_on_explicit_opt_in() {
+        assert!(trace_spans_enabled(Some("1")));
+        assert!(trace_spans_enabled(Some("true")));
+        assert!(!trace_spans_enabled(Some("0")));
+        assert!(!trace_spans_enabled(None));
+    }
+}
+
+#[cfg(test)]
+mod allocator_tests {
+    use super::*;
+
+    #[test]
+    fn purge_delay_option_has_its_documented_default() {
+        // A shifted enum would make `return_freed_memory_at_once` change
+        // some other option without a sound. 1000 ms is v3's default, set in
+        // its options.c; the header comment still says 10.
+        let default = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
+        assert_eq!(default, 1000);
     }
 }

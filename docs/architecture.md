@@ -1,3 +1,5 @@
+[← Security Rules](security.md) · [Back to README](../README.md) · [Performance →](performance.md)
+
 # Architecture & Design Patterns
 
 **Version:** 1.8.0 | **Language:** Rust (Edition 2021) | **Last updated:** 2025-08-20
@@ -82,7 +84,7 @@ narsil-mcp is a high-performance MCP (Model Context Protocol) server written in 
 | `parser.rs` | Tree-sitter language abstraction |
 | `extract.rs` | AST-aware symbol extraction |
 | `search.rs` | Tantivy BM25 full-text search |
-| `index.rs` | CodeIntelEngine (main orchestrator) |
+| `engine/mod.rs` | CodeIntelEngine (main orchestrator) |
 | `store.rs` | SQLite persistence layer |
 | `embeddings.rs` | TF-IDF vector space embeddings |
 | `incremental.rs` | Merkle tree change detection |
@@ -96,6 +98,7 @@ narsil-mcp is a high-performance MCP (Model Context Protocol) server written in 
 | `mcp.rs` | JSON-RPC 2.0 protocol handler |
 | `tool_handlers/` | 90 tool implementations (trait dispatch) |
 | `git.rs` | Git blame, history, contributors |
+| `worktree.rs` | `git worktree list` parsing, checkout root and common dir |
 | `lsp.rs` | Language Server Protocol integration |
 | `neural.rs` | API-based & ONNX embedding backends |
 | `remote.rs` | GitHub repository cloning & API access |
@@ -169,11 +172,40 @@ pub struct ToolRegistry {
 - **sparql:** RDF knowledge graph queries
 - **ccg:** Code Context Graph export/import
 
-### 3. CodeIntelEngine (`src/index.rs`)
+### 3. CodeIntelEngine (`src/engine/mod.rs`)
 
 **Pattern:** Facade + Singleton (Arc-wrapped)
 
 The core engine managing all code analysis operations.
+
+#### Repository Registry (`src/engine/repo_registry.rs`)
+
+Every repository root the engine knows, the key its data is stored under, and
+its state (`Registered`, `Indexing`, `Ready`, `Failed`). All per-repository
+maps — symbols, call graphs, git handles, search documents — are keyed by that
+key. Primary repositories (`--repos`) keep their directory name; a second one
+with the same name gets `~2`. Git worktrees are registered as
+`<primary>@<directory>`.
+
+The registry is behind a `RwLock`, so repositories can be added while the
+server runs. A file belongs to the innermost registered root containing it, so
+a worktree nested in its primary's tree (`.claude/worktrees/x`) is excluded
+from the primary's walk, results and saved index.
+
+#### Worktrees (`src/engine/worktree.rs`)
+
+- Discovery at startup (`--worktrees lazy|eager|off`) registers worktrees
+  without indexing them.
+- `ToolRegistry::dispatch` resolves `args["repo"]` (key, `<repo>@<branch>`
+  alias or path) before any handler runs, so every tool supports worktrees.
+- On first use, `ensure_repo_indexed` runs the same per-repository steps as
+  startup: call graph, warm or cold walk, git, snapshot, save, watch. One lock
+  per key keeps concurrent calls from walking twice. The wait is bounded by
+  `--worktree-index-wait-secs`; the work goes on in a task holding the
+  engine's `Arc`.
+- New roots reach the running watcher through a `WatchCommand` channel. A
+  removed worktree is dropped from tantivy, trigrams, TF-IDF, neural documents
+  and the maps.
 
 #### Symbol Index
 ```rust
@@ -591,3 +623,45 @@ Backward compatible (no breaking changes)
 **This architecture demonstrates professional systems design with emphasis on performance, reliability, and extensibility across a complex code analysis platform.**
 
 Last updated: 2025-08-20
+
+## Overview Diagram
+
+```
++-----------------------------------------------------------------+
+|                         MCP Server                               |
+|  +-----------------------------------------------------------+  |
+|  |                   JSON-RPC over stdio                      |  |
+|  +-----------------------------------------------------------+  |
+|                              |                                   |
+|  +---------------------------v-------------------------------+  |
+|  |                   Code Intel Engine                        |  |
+|  |  +------------+ +------------+ +------------------------+  |  |
+|  |  |  Symbol    | |   File     | |    Search Engine       |  |  |
+|  |  |  Index     | |   Cache    | |  (Tantivy + TF-IDF)    |  |  |
+|  |  | (DashMap)  | | (DashMap)  | +------------------------+  |  |
+|  |  +------------+ +------------+                              |  |
+|  |  +------------+ +------------+ +------------------------+  |  |
+|  |  | Call Graph | |  Taint     | |   Security Rules       |  |  |
+|  |  |  Analysis  | |  Tracker   | |   Engine               |  |  |
+|  |  +------------+ +------------+ +------------------------+  |  |
+|  +-----------------------------------------------------------+  |
+|                              |                                   |
+|  +---------------------------v-------------------------------+  |
+|  |                Tree-sitter Parser                          |  |
+|  |  +------+ +------+ +------+ +------+ +------+             |  |
+|  |  | Rust | |Python| |  JS  | |  TS  | | Go   | ...         |  |
+|  |  +------+ +------+ +------+ +------+ +------+             |  |
+|  +-----------------------------------------------------------+  |
+|                              |                                   |
+|  +---------------------------v-------------------------------+  |
+|  |                Repository Walker                           |  |
+|  |           (ignore crate - respects .gitignore)             |  |
+|  +-----------------------------------------------------------+  |
++-----------------------------------------------------------------+
+```
+
+## See Also
+
+- [Performance](performance.md) — benchmarks
+- [Development](development.md) — working on the code
+- [Repository Structure](REPO_STRUCTURE.md) — repository layout

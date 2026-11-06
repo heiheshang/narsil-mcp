@@ -131,7 +131,7 @@ lazy_static! {
 
         map.insert("list_repos", ToolMetadata {
             name: "list_repos",
-            description: "List all indexed repositories with metadata (path, language breakdown, file count)",
+            description: "List all indexed repositories with metadata (path, language breakdown, file count), and the git worktrees of each. Any tool's `repo` also takes a worktree name (`<repo>@<dir>`), `<repo>@<branch>` or a worktree's absolute path; the worktree is indexed on first use.",
             category: ToolCategory::Repository,
             tags: ["repository", "index", "metadata", "list"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -343,14 +343,16 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
-                    "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex."},
+                    "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "field", "test", "constant", "variable", "all"], "description": "Type of symbol to find (default: all). 'field' = struct fields (Go); 'test' = named test cases (Go t.Run, JS describe/it/test), whose line range covers the whole case block; 'constant'/'variable' = top-level const/var (Go package level, including members of const (...)/var (...) blocks)"},
+                    "pattern": {"type": "string", "description": "Case-insensitive substring match on symbol names; exact matches are ranked first. Not a glob/regex — use 'name_regex' for that."},
                     "query": {"type": "string", "description": "Alias for 'pattern'"},
                     "name": {"type": "string", "description": "Alias for 'pattern'"},
-                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py'); a bare filename matches at any depth"},
+                    "name_regex": {"type": "string", "description": "Regex (case-insensitive) matched against symbol names, e.g. '^On[A-Z]' or 'Handler$'. Combine with 'pattern' to AND both; omit 'pattern' to match by shape alone."},
+                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py', '**/*.{go,proto}'); a bare filename matches at any depth"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
-                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated"},
-                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
+                    "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated. Pass 0 for no limit — a genuine full enumeration."},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"},
+                    "compact": {"type": "boolean", "description": "Return a flat 'name (file:line)' list with no markdown headers, grouping, or signatures — cheaper to generate and parse when you just need the names (default: false)"}
                 },
                 "required": ["repo"]
             }),
@@ -360,7 +362,7 @@ lazy_static! {
 
         map.insert("get_symbol_definition", ToolMetadata {
             name: "get_symbol_definition",
-            description: "Get the full definition of a symbol with surrounding context. Returns the source code with line numbers.",
+            description: "Get the full definition of a symbol with surrounding context. Namesakes are reported and can be picked apart with 'file' or 'receiver'. Returns the source code with line numbers. For a large body, narrow it instead of reading it whole: 'outline' for the control-flow skeleton, 'contains' to keep only matching lines, 'offset'/'max_lines' to page through it.",
             category: ToolCategory::Symbols,
             tags: ["symbol", "definition", "source", "context"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -371,7 +373,14 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Fully qualified symbol name (e.g., 'MyStruct', 'module::function')"},
-                    "context_lines": {"type": "integer", "description": "Number of context lines before/after (default: 5)"}
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
+                    "context_lines": {"type": "integer", "description": "Number of context lines before/after (default: 5; ignored when outline/contains/offset/max_lines narrow the body)"},
+                    "outline": {"type": "boolean", "description": "Print only the control-flow skeleton of the body — signature plus if/switch/case/for/return lines — with the gaps marked. Use on long functions to find the line range worth reading."},
+                    "contains": {"type": "string", "description": "Case-insensitive regex; only body lines matching it are printed (plus the signature). A grep scoped to one symbol."},
+                    "offset": {"type": "integer", "description": "Skip this many body lines before printing (default: 0)"},
+                    "max_lines": {"type": "integer", "description": "Print at most this many body lines (default: 0 = no cap)"},
+                    "file": {"type": "string", "description": "Disambiguate namesakes by file — a repo-relative path, a suffix of one ('models/bank.go'), or failing those any fragment of the path ('bank')"},
+                    "receiver": {"type": "string", "description": "Disambiguate namesakes by owning type: the Go receiver, Rust impl type, or class that declares the method, e.g. receiver 'PaymentStore' for 'Save'"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -392,6 +401,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Symbol name to find references for"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "include_definition": {"type": "boolean", "description": "Include the definition location (default: true)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -424,7 +434,7 @@ lazy_static! {
 
         map.insert("find_symbol_usages", ToolMetadata {
             name: "find_symbol_usages",
-            description: "Find all usages of a symbol across files, including imports and re-exports. Cross-language aware for JS/TS projects.",
+            description: "Find all usages of a symbol across files, including imports and re-exports. Accepts qualified names (Type::method) and disambiguates namesakes with receiver or file like get_symbol_definition. Searches source for the bare identifier at call sites.",
             category: ToolCategory::Symbols,
             tags: ["symbol", "usages", "imports", "exports"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -435,8 +445,11 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "include_imports": {"type": "boolean", "description": "Include import statements (default: true)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
+                    "file": {"type": "string", "description": "Disambiguate namesakes by file — a path, a suffix of one, or failing those any fragment of the path"},
+                    "receiver": {"type": "string", "description": "Disambiguate methods by owning type (Go receiver, Rust impl, class name)"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -477,7 +490,8 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Symbol name or partial name to search for"},
                     "kind": {"type": "string", "enum": ["function", "class", "struct", "interface", "enum", "variable", "all"], "description": "Filter by symbol kind (default: all)"},
-                    "limit": {"type": "integer", "description": "Maximum results to return (default: 20)"}
+                    "limit": {"type": "integer", "description": "Maximum results to return (default: 20)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
                 },
                 "required": ["query"]
             }),
@@ -489,7 +503,7 @@ lazy_static! {
 
         map.insert("search_code", ToolMetadata {
             name: "search_code",
-            description: "Semantic and keyword search across code. Returns ranked excerpts with surrounding context.",
+            description: "Case-insensitive substring search across code (no regex); a space in the query matches any run of whitespace, so alignment and tabs do not matter. Matches are ranked - declaration lines outrank call sites - and truncated to max_results. For call sites of a known identifier use find_symbol_usages or find_references.",
             category: ToolCategory::Search,
             tags: ["search", "code", "keyword", "semantic"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -498,11 +512,11 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query - can be natural language or code pattern"},
+                    "query": {"type": "string", "description": "Literal text to look for; matched as a case-insensitive substring within one line, not as a regex; each whitespace run matches any whitespace run"},
                     "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
-                    "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md'; a bare filename matches at any depth"},
+                    "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. 'src/**/*.rs', '**/README.md', '**/*.{json,md,yml}'; a bare filename matches at any depth. Narrowing here beats raising max_results when the wanted hit is out-ranked"},
                     "path": {"type": "string", "description": "Alias for 'file_pattern'"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10); the header reports how many lines matched in total when the list was cut"},
                     "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -514,7 +528,7 @@ lazy_static! {
 
         map.insert("semantic_search", ToolMetadata {
             name: "semantic_search",
-            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries. Pass `repo` to search inside a single repository.",
+            description: "Keyword search ranked by BM25 over symbols (name, signature, doc comment) with code-aware tokenization and code synonyms. Not meaning-based despite the name: query words must occur in the code, so a query in another language than the code, or phrased in words the code does not use, returns unrelated hits (the output flags weak matches and lists matched terms per hit). For meaning-based or cross-language search use `neural_search` (requires --neural); for a known name use `search_code` or `find_symbols`. Pass `repo` to search inside a single repository.",
             category: ToolCategory::Search,
             tags: ["search", "semantic", "bm25", "ranking"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -527,6 +541,7 @@ lazy_static! {
                     "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
                     "doc_type": {"type": "string", "enum": ["file", "function", "class", "struct", "method"], "description": "Filter by document type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -537,7 +552,7 @@ lazy_static! {
 
         map.insert("hybrid_search", ToolMetadata {
             name: "hybrid_search",
-            description: "Perform hybrid search combining BM25 keyword search with TF-IDF semantic similarity using Reciprocal Rank Fusion (RRF).",
+            description: "Perform hybrid search fusing three rankings with Reciprocal Rank Fusion (RRF): BM25 over symbol cards (name, signature, doc comment), TF-IDF over signatures, and query-token overlap with function bodies. mode=bm25|tfidf uses a single index. The first hybrid call after startup builds the body token cache and is slower.",
             category: ToolCategory::Search,
             tags: ["search", "hybrid", "bm25", "tfidf", "rrf"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -549,6 +564,7 @@ lazy_static! {
                     "query": {"type": "string"},
                     "repo": {"type": "string", "description": "Optional: limit to specific repository"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "mode": {"type": "string", "enum": ["hybrid", "bm25", "tfidf"], "description": "Search mode: hybrid (default), bm25 only, or tfidf only"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -571,7 +587,8 @@ lazy_static! {
                 "properties": {
                     "query": {"type": "string", "description": "Natural language or code query"},
                     "repo": {"type": "string", "description": "Repository name from list_repos: restricts the search to that repository (optional, searches all indexed repos if omitted)"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"}
                 },
                 "required": ["query"]
             }),
@@ -594,6 +611,7 @@ lazy_static! {
                     "repo": {"type": "string", "description": "Optional: limit to specific repository"},
                     "chunk_type": {"type": "string", "enum": ["function", "method", "class", "trait", "module", "all"], "description": "Filter by chunk type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -616,6 +634,7 @@ lazy_static! {
                     "query": {"type": "string", "description": "Code snippet to find similar code for"},
                     "repo": {"type": "string", "description": "Repository to search in (optional, searches all if omitted)"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
                 "required": ["query"]
@@ -637,7 +656,9 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Symbol name to find similar code for"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
+                    "limit": {"type": "integer", "description": "Alias for 'max_results'"}
                 },
                 "required": ["repo", "symbol"]
             }),
@@ -659,6 +680,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find clones of"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "threshold": {"type": "number", "description": "Similarity threshold 0-1 (default: 0.8)"}
                 },
                 "required": ["repo", "path", "function"]
@@ -748,6 +770,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Focus on specific function (optional)"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "depth": {"type": "integer", "description": "Maximum depth to traverse (default: 3)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
                 },
@@ -759,7 +782,7 @@ lazy_static! {
 
         map.insert("get_callers", ToolMetadata {
             name: "get_callers",
-            description: "Find functions that call a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Each result says what it was matched on — an unmarked entry is exact, `name match only` is one namesake out of several, `not in graph` is a third-party or stdlib call. Requires --call-graph flag.",
+            description: "Find functions that call a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Each result says what it was matched on — an unmarked entry is exact, `name match only` is a guess — one namesake out of several, or a method the standard library also defines, `not in graph` is a third-party or stdlib call. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callers", "callgraph", "references", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -770,6 +793,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find callers of"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "transitive": {"type": "boolean", "description": "Include transitive callers (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
@@ -782,7 +806,7 @@ lazy_static! {
 
         map.insert("get_callees", ToolMetadata {
             name: "get_callees",
-            description: "Find functions called by a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Each result says what it was matched on — an unmarked entry is exact, `name match only` is one namesake out of several, `not in graph` is a third-party or stdlib call. Requires --call-graph flag.",
+            description: "Find functions called by a given function. Accepts a bare name (`Handle`), a qualified method (`Server.Handle`) or a graph key (`main.go::Server::Handle`); methods are keyed `file::Type::name`, and when several functions share a name the answer says which one it reported on and lists the rest. Each result says what it was matched on — an unmarked entry is exact, `name match only` is a guess — one namesake out of several, or a method the standard library also defines, `not in graph` is a third-party or stdlib call. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callees", "callgraph", "dependencies", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -793,6 +817,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "function": {"type": "string", "description": "Function name to find callees of"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "transitive": {"type": "boolean", "description": "Include transitive callees (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
@@ -836,7 +861,8 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "function": {"type": "string", "description": "Function name to analyze"}
+                    "function": {"type": "string", "description": "Function name to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "function"]
             }),
@@ -846,7 +872,7 @@ lazy_static! {
 
         map.insert("get_function_hotspots", ToolMetadata {
             name: "get_function_hotspots",
-            description: "Find highly connected functions (potential refactoring targets) based on call graph analysis. Requires --call-graph flag.",
+            description: "Find highly connected functions (potential refactoring targets) based on call graph analysis. Counts only edges the graph identified: name-only picks among namesakes (`v.len()` landing on some project `len`) and calls leaving the graph are not connections. Measures coupling, not complexity or churn — see get_complexity and get_hotspots. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["hotspots", "refactoring", "analysis", "complexity"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -857,7 +883,7 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "min_connections": {"type": "integer", "description": "Minimum total connections (incoming + outgoing) to be considered a hotspot (default: 5)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
+                    "exclude_tests": {"type": "boolean", "description": "Leave functions in test files out of the list and out of the caller counts (default: false)"}
                 },
                 "required": ["repo"]
             }),
@@ -932,7 +958,7 @@ lazy_static! {
 
         map.insert("get_hotspots", ToolMetadata {
             name: "get_hotspots",
-            description: "Find code hotspots - files with high churn and complexity. Requires --git flag.",
+            description: "Find code hotspots - files changed most often in the last `days`, with the most complex function of each file when the call graph is enabled (`min_complexity` then keeps files whose most complex function reaches it). History before a rename counts under the current path; deleted files are left out. Requires --git flag; complexity also needs --call-graph.",
             category: ToolCategory::Git,
             tags: ["git", "hotspots", "churn", "complexity", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -1006,6 +1032,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path relative to repository"},
                     "symbol": {"type": "string", "description": "Symbol/function name to track"},
+                    "function": {"type": "string", "description": "Alias for 'symbol'"},
                     "max_commits": {"type": "integer", "description": "Maximum commits to return (default: 10)"}
                 },
                 "required": ["repo", "path", "symbol"]
@@ -1478,7 +1505,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path containing the function"},
-                    "function": {"type": "string", "description": "Function name to analyze"}
+                    "function": {"type": "string", "description": "Function name to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1500,6 +1528,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path to analyze"},
                     "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
@@ -1521,7 +1550,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string"}
+                    "function": {"type": "string"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1542,7 +1572,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string"}
+                    "function": {"type": "string"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1564,6 +1595,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
@@ -1586,6 +1618,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "function": {"type": "string", "description": "Optional: specific function to analyze"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from analysis (default: true)"}
                 },
                 "required": ["repo", "path"]
@@ -1607,7 +1640,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "function": {"type": "string"}
+                    "function": {"type": "string"},
+                    "symbol": {"type": "string", "description": "Alias for 'function'"}
                 },
                 "required": ["repo", "path", "function"]
             }),
@@ -1770,6 +1804,7 @@ lazy_static! {
                     "query": {"type": "string", "description": "SPARQL query to execute"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000, max: 300000)"},
                     "limit": {"type": "integer", "description": "Maximum number of results (default: 1000, max: 10000)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"},
                     "offset": {"type": "integer", "description": "Offset for pagination (default: 0)"},
                     "format": {"type": "string", "enum": ["json", "markdown", "csv"], "description": "Output format (default: json)"}
                 },
@@ -1807,6 +1842,7 @@ lazy_static! {
                     "params": {"type": "object", "description": "Template parameters as key-value pairs"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
                     "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"},
                     "format": {"type": "string", "enum": ["json", "markdown", "csv"], "description": "Output format (default: json)"}
                 },
                 "required": ["template"]
@@ -1956,7 +1992,8 @@ lazy_static! {
                     "repo": {"type": "string", "description": "Repository name"},
                     "query": {"type": "string", "description": "SPARQL query to execute"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
-                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"}
+                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"},
+                    "max_results": {"type": "integer", "description": "Alias for 'limit'"}
                 },
                 "required": ["repo", "query"]
             }),
@@ -2075,6 +2112,72 @@ pub fn search_tools(query: &str) -> Vec<&'static ToolMetadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tool that names a symbol accepts both spellings, and every tool
+    /// that caps results accepts both spellings. The two families drifted
+    /// apart (`function` in call-graph/flow tools, `symbol` in symbol tools,
+    /// `max_results` in search tools, `limit` in the rest), and callers spent
+    /// whole tool calls guessing which one a given tool wanted. Adding a new
+    /// tool without its alias is a regression this test is here to catch.
+    #[test]
+    fn symbol_and_limit_arguments_accept_both_spellings() {
+        const PAIRS: &[(&str, &str)] = &[
+            ("function", "symbol"),
+            ("symbol", "function"),
+            ("max_results", "limit"),
+            ("limit", "max_results"),
+        ];
+
+        let mut missing: Vec<String> = Vec::new();
+        for (name, meta) in TOOL_METADATA.iter() {
+            let Some(props) = meta
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+            for (canonical, alias) in PAIRS {
+                if props.contains_key(*canonical) && !props.contains_key(*alias) {
+                    missing.push(format!("{name}: has '{canonical}' but not '{alias}'"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "tools missing an argument alias:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    /// An alias is only honoured by `validate_tool_args` when its description
+    /// is exactly `Alias for '<canonical>'`, so the spelling is load-bearing.
+    #[test]
+    fn alias_descriptions_name_a_real_property() {
+        for (name, meta) in TOOL_METADATA.iter() {
+            let Some(props) = meta
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+            for (key, prop) in props {
+                let Some(canonical) = prop
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .and_then(|d| d.strip_prefix("Alias for '"))
+                    .and_then(|rest| rest.split('\'').next())
+                else {
+                    continue;
+                };
+                assert!(
+                    props.contains_key(canonical),
+                    "{name}: '{key}' is an alias for '{canonical}', which the schema does not declare"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_tool_metadata_exists() {

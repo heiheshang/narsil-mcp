@@ -1,6 +1,6 @@
 [package]
 name = "narsil-mcp"
-version = "1.9.4"
+version = "1.10.0-dev"
 edition = "2021"
 authors = ["postrv"]
 description = "A blazingly fast MCP server for code intelligence - enumerates repos, data structures, algorithms, and returns relevant code context"
@@ -13,8 +13,8 @@ exclude = ["frontend/", "docs/", ".github/", "*.md", "!README.md"]
 
 [features]
 default = ["native"]
-native = ["dep:notify", "dep:tokio", "dep:async-trait", "dep:reqwest", "dep:octocrab", "dep:lsp-types", "dep:lsp-server", "dep:tempfile", "dep:axum", "dep:tower", "dep:tower-http"]
-graph = ["dep:oxigraph", "dep:flate2"]  # RDF knowledge graph with SPARQL support
+native = ["tantivy/mmap", "dep:notify", "dep:tokio", "dep:async-trait", "dep:reqwest", "dep:octocrab", "dep:lsp-types", "dep:lsp-server", "dep:tempfile", "dep:axum", "dep:tower", "dep:tower-http"]
+graph = ["dep:oxigraph", "dep:flate2", "dep:libc"]  # RDF knowledge graph with SPARQL support
 frontend = ["native", "dep:rust-embed", "dep:mime_guess"]  # Embeds visualization frontend in binary
 neural = ["usearch", "ndarray"]
 neural-onnx = ["neural", "ort", "tokenizers"]
@@ -76,7 +76,7 @@ tree-sitter-swift = "0.6"
 tree-sitter-verilog = "1.0"
 tree-sitter-scala = "0.23"
 tree-sitter-lua = "0.2"
-tree-sitter-haskell = "0.23"
+tree-sitter-haskell = "0.24"
 tree-sitter-elixir = "0.3"
 tree-sitter-clojure-orchard = "0.2"
 tree-sitter-dart-orchard = "0.3"
@@ -99,6 +99,7 @@ glob = "0.3"
 
 # Indexing and search
 tantivy = { version = "0.22", default-features = false, features = ["lz4-compression"] }  # Full-text search engine (no mmap for wasm compat)
+rust-stemmers = "1.2"  # Snowball Russian stemmer for Cyrillic tokens (already pulled in by tantivy)
 memmap2 = "0.9"   # Memory-mapped files for speed
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }   # Binary serialization for index persistence
 regex = "1.10"    # Regular expression support
@@ -119,6 +120,7 @@ lazy_static = "1.5"
 parking_lot = "0.12"
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
+ahash = "0.8"  # Fast non-cryptographic hasher for index-time maps keyed by on-disk data. Not SipHash's DoS resistance: narsil-mcp's own supply-chain/dependency-audit use case means that data can be adversarial (a hostile vendored dependency), so this trades worst-case collision resistance for real speed on the common case — see the longer note above CallGraph's field declarations.
 uuid = { version = "1.0", features = ["v4"] }  # For generating unique streaming tokens
 chrono = "0.4"  # Date/time handling for SBOM generation
 url = "2.5"  # URL parsing and validation
@@ -136,6 +138,8 @@ lsp-server = { version = "0.7", optional = true }  # LSP server utilities
 
 # RDF knowledge graph (optional, for persistent graph storage)
 oxigraph = { version = "0.5", optional = true }
+# fcntl probe of the graph store's RocksDB LOCK before opening it (graph feature)
+libc = { version = "0.2", optional = true }
 
 # Gzip compression for CCG layers (required by graph feature)
 flate2 = { version = "1.0", optional = true }
@@ -175,6 +179,18 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# strip в release стирает символы, и samply показывает адреса вместо имён.
+# Код тот же, что в боевой сборке: LTO, codegen-units и panic наследуются.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
+# bench наследует release, без этого бинари criterion тоже без символов.
+[profile.bench]
+debug = "line-tables-only"
+strip = false
+
 [lib]
 name = "narsil_mcp"
 path = "src/lib.rs"
@@ -186,6 +202,8 @@ crate-type = ["cdylib", "rlib"]
 # что бинарь помечен required-features = ["native"] и под wasm не строится.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = "0.1"  # Global allocator (lower peak RSS than glibc malloc on huge indexes)
+# The same library as mimalloc's, for `mi_option_set` (see `return_freed_memory_at_once`).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [[bin]]
 name = "narsil-mcp"

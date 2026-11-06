@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for get_control_flow tool
 pub struct GetControlFlowHandler;
@@ -18,7 +18,7 @@ impl ToolHandler for GetControlFlowHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         engine.get_control_flow(repo, path, function).await
     }
 }
@@ -35,7 +35,7 @@ impl ToolHandler for FindDeadCodeHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function");
+        let function = args.get_str_any(&["function", "symbol"]);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .find_dead_code(repo, path, function, exclude_tests)
@@ -55,7 +55,7 @@ impl ToolHandler for GetDataFlowHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         engine.get_data_flow(repo, path, function).await
     }
 }
@@ -72,7 +72,7 @@ impl ToolHandler for GetReachingDefinitionsHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         engine.get_reaching_definitions(repo, path, function).await
     }
 }
@@ -89,7 +89,7 @@ impl ToolHandler for FindUninitializedHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function");
+        let function = args.get_str_any(&["function", "symbol"]);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .find_uninitialized(repo, path, function, exclude_tests)
@@ -109,7 +109,7 @@ impl ToolHandler for FindDeadStoresHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function");
+        let function = args.get_str_any(&["function", "symbol"]);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .find_dead_stores(repo, path, function, exclude_tests)
@@ -129,7 +129,7 @@ impl ToolHandler for InferTypesHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         engine.infer_types(repo, path, function).await
     }
 }

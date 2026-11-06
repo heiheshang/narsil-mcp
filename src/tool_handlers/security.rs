@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::{CodeIntelEngine, SecurityScanOptions};
+use crate::engine::{CodeIntelEngine, SecurityScanOptions};
 
 /// Handler for scan_security tool
 ///

@@ -19,6 +19,7 @@ pub struct HybridSearchConfig {
     pub bm25_weight: f64,
     /// Weight for TF-IDF/semantic results (0.0 to 1.0)
     pub tfidf_weight: f64,
+    pub extra_weight: f64,
     /// Boost factor for exact name matches
     pub exact_match_boost: f64,
     /// Boost factor for function/method matches
@@ -33,6 +34,7 @@ impl Default for HybridSearchConfig {
             rrf_k: 60.0,
             bm25_weight: 1.0,
             tfidf_weight: 1.0,
+            extra_weight: 1.0,
             exact_match_boost: 2.0,
             function_boost: 1.5,
             candidate_multiplier: 3,
@@ -45,6 +47,9 @@ impl Default for HybridSearchConfig {
 pub struct HybridResult {
     /// Unique identifier
     pub id: String,
+    /// Empty for transient indexes.
+    #[serde(default)]
+    pub repo: String,
     /// File path
     pub file_path: String,
     /// Content or snippet
@@ -71,6 +76,7 @@ pub struct HybridResult {
 #[derive(Debug, Clone)]
 struct DocumentInfo {
     id: String,
+    repo: String,
     file_path: String,
     content: String,
     start_line: usize,
@@ -116,27 +122,56 @@ impl HybridSearchEngine {
     /// Perform hybrid search combining BM25 and TF-IDF results
     /// Searches are run in parallel for better performance
     pub fn search(&self, query: &str, limit: usize) -> Vec<HybridResult> {
+        self.search_in(query, limit, None)
+    }
+
+    /// Filters before ranking, so `limit` is spent inside `repo`.
+    pub fn search_in(&self, query: &str, limit: usize, repo: Option<&str>) -> Vec<HybridResult> {
+        self.search_in_with(query, limit, repo, &[])
+    }
+
+    /// `extra` items reinforce an index document only if they carry its `(repo, id)`.
+    pub fn search_in_with(
+        &self,
+        query: &str,
+        limit: usize,
+        repo: Option<&str>,
+        extra: &[HybridResult],
+    ) -> Vec<HybridResult> {
         let candidate_limit = limit * self.config.candidate_multiplier;
 
         // Run BM25 and TF-IDF searches in parallel using rayon::join
         let (bm25_results, tfidf_results) = rayon::join(
-            || self.bm25_index.search(query, candidate_limit),
-            || self.tfidf_engine.find_similar_code(query, candidate_limit),
+            || self.bm25_index.search_in(query, candidate_limit, repo),
+            || {
+                self.tfidf_engine
+                    .find_similar_code_in(query, candidate_limit, repo)
+            },
         );
 
         // Combine using RRF
-        self.reciprocal_rank_fusion(bm25_results, tfidf_results, query, limit)
+        self.reciprocal_rank_fusion(bm25_results, tfidf_results, extra, query, limit)
     }
 
     /// Perform BM25-only search
     pub fn search_bm25(&self, query: &str, limit: usize) -> Vec<HybridResult> {
-        let results = self.bm25_index.search(query, limit);
+        self.search_bm25_in(query, limit, None)
+    }
+
+    pub fn search_bm25_in(
+        &self,
+        query: &str,
+        limit: usize,
+        repo: Option<&str>,
+    ) -> Vec<HybridResult> {
+        let results = self.bm25_index.search_in(query, limit, repo);
 
         results
             .into_iter()
             .enumerate()
             .map(|(rank, r)| HybridResult {
                 id: r.document.id.clone(),
+                repo: r.document.repo.to_string(),
                 file_path: r.document.file_path.clone(),
                 content: r.snippet.clone(),
                 start_line: r.document.start_line,
@@ -153,13 +188,23 @@ impl HybridSearchEngine {
 
     /// Perform TF-IDF-only search
     pub fn search_tfidf(&self, query: &str, limit: usize) -> Vec<HybridResult> {
-        let results = self.tfidf_engine.find_similar_code(query, limit);
+        self.search_tfidf_in(query, limit, None)
+    }
+
+    pub fn search_tfidf_in(
+        &self,
+        query: &str,
+        limit: usize,
+        repo: Option<&str>,
+    ) -> Vec<HybridResult> {
+        let results = self.tfidf_engine.find_similar_code_in(query, limit, repo);
 
         results
             .into_iter()
             .enumerate()
             .map(|(rank, r)| HybridResult {
                 id: r.document.id.clone(),
+                repo: r.document.repo.to_string(),
                 file_path: r.document.file_path.clone(),
                 content: r.document.content.clone(),
                 start_line: r.document.start_line,
@@ -179,6 +224,7 @@ impl HybridSearchEngine {
         &self,
         bm25_results: Vec<SearchResult>,
         tfidf_results: Vec<SimilarityResult>,
+        extra: &[HybridResult],
         query: &str,
         limit: usize,
     ) -> Vec<HybridResult> {
@@ -192,6 +238,7 @@ impl HybridSearchEngine {
         // Process BM25 results
         for (rank, result) in bm25_results.iter().enumerate() {
             let id = &result.document.id;
+            let key = fusion_key(&result.document.repo, id);
             let rrf_score = self.config.bm25_weight / (k + rank as f64 + 1.0);
 
             // Apply boosts
@@ -206,11 +253,12 @@ impl HybridSearchEngine {
                 boost *= self.config.function_boost;
             }
 
-            *scores.entry(id.clone()).or_default() += rrf_score * boost;
-            ranks.entry(id.clone()).or_insert((None, None)).0 = Some(rank);
+            *scores.entry(key.clone()).or_default() += rrf_score * boost;
+            ranks.entry(key.clone()).or_insert((None, None)).0 = Some(rank);
 
-            doc_info.entry(id.clone()).or_insert_with(|| DocumentInfo {
+            doc_info.entry(key).or_insert_with(|| DocumentInfo {
                 id: id.clone(),
+                repo: result.document.repo.to_string(),
                 file_path: result.document.file_path.clone(),
                 content: result.snippet.clone(),
                 start_line: result.document.start_line,
@@ -224,6 +272,7 @@ impl HybridSearchEngine {
         // Process TF-IDF results
         for (rank, result) in tfidf_results.iter().enumerate() {
             let id = &result.document.id;
+            let key = fusion_key(&result.document.repo, id);
             let rrf_score = self.config.tfidf_weight / (k + rank as f64 + 1.0);
 
             // Apply boosts
@@ -232,11 +281,12 @@ impl HybridSearchEngine {
                 boost *= self.config.exact_match_boost;
             }
 
-            *scores.entry(id.clone()).or_default() += rrf_score * boost;
-            ranks.entry(id.clone()).or_insert((None, None)).1 = Some(rank);
+            *scores.entry(key.clone()).or_default() += rrf_score * boost;
+            ranks.entry(key.clone()).or_insert((None, None)).1 = Some(rank);
 
-            doc_info.entry(id.clone()).or_insert_with(|| DocumentInfo {
+            doc_info.entry(key).or_insert_with(|| DocumentInfo {
                 id: id.clone(),
+                repo: result.document.repo.to_string(),
                 file_path: result.document.file_path.clone(),
                 content: result.document.content.clone(),
                 start_line: result.document.start_line,
@@ -244,6 +294,29 @@ impl HybridSearchEngine {
                 matched_terms: Vec::new(),
                 symbol_name: None,
                 result_type: "embedding".to_string(),
+            });
+        }
+
+        for (rank, result) in extra.iter().enumerate() {
+            let key = fusion_key(&result.repo, &result.id);
+            let mut boost = 1.0;
+            if result.id.to_lowercase().contains(&query_lower) {
+                boost *= self.config.exact_match_boost;
+            }
+            *scores.entry(key.clone()).or_default() +=
+                self.config.extra_weight / (k + rank as f64 + 1.0) * boost;
+            ranks.entry(key.clone()).or_insert((None, None));
+
+            doc_info.entry(key).or_insert_with(|| DocumentInfo {
+                id: result.id.clone(),
+                repo: result.repo.clone(),
+                file_path: result.file_path.clone(),
+                content: result.content.clone(),
+                start_line: result.start_line,
+                end_line: result.end_line,
+                matched_terms: result.matched_terms.clone(),
+                symbol_name: result.symbol_name.clone(),
+                result_type: result.result_type.clone(),
             });
         }
 
@@ -255,12 +328,13 @@ impl HybridSearchEngine {
         combined
             .into_iter()
             .take(limit)
-            .filter_map(|(id, score)| {
-                let info = doc_info.get(&id)?;
-                let (bm25_rank, tfidf_rank) = ranks.get(&id).copied().unwrap_or((None, None));
+            .filter_map(|(key, score)| {
+                let info = doc_info.get(&key)?;
+                let (bm25_rank, tfidf_rank) = ranks.get(&key).copied().unwrap_or((None, None));
 
                 Some(HybridResult {
                     id: info.id.clone(),
+                    repo: info.repo.clone(),
                     file_path: info.file_path.clone(),
                     content: info.content.clone(),
                     start_line: info.start_line,
@@ -301,7 +375,7 @@ impl HybridSearchEngine {
             term_freq,
         };
 
-        self.bm25_index.inner.write().add_document(search_doc);
+        self.bm25_index.add_document_retaining_text(search_doc);
 
         // Index in TF-IDF
         self.tfidf_engine.index_snippet(
@@ -397,6 +471,12 @@ impl Default for HybridSearchConfigBuilder {
 }
 
 /// Convenience function to create a hybrid search engine with default config
+/// Documents are identified by `file::symbol`, which repeats across
+/// repositories; fuse on the pair so two repos' same-named files stay apart.
+fn fusion_key(repo: &str, id: &str) -> String {
+    format!("{repo}\u{0}{id}")
+}
+
 pub fn create_hybrid_engine(
     bm25_index: Arc<ConcurrentSearchIndex>,
     tfidf_engine: Arc<EmbeddingEngine>,
@@ -412,6 +492,79 @@ mod tests {
         let bm25_index = Arc::new(ConcurrentSearchIndex::new());
         let tfidf_engine = Arc::new(EmbeddingEngine::new(100));
         HybridSearchEngine::new(bm25_index, tfidf_engine)
+    }
+
+    fn chunk(id: &str, content: &str) -> CodeChunk {
+        CodeChunk {
+            id: id.to_string(),
+            content: content.to_string(),
+            file_path: "test.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            language: "rust".to_string(),
+            symbol_context: None,
+            chunk_type: ChunkType::Function,
+            doc_comment: None,
+            imports: Vec::new(),
+        }
+    }
+
+    fn extra(id: &str) -> HybridResult {
+        HybridResult {
+            id: id.to_string(),
+            repo: String::new(),
+            file_path: "test.rs".to_string(),
+            content: String::new(),
+            start_line: 1,
+            end_line: 1,
+            score: 1.0,
+            bm25_rank: None,
+            tfidf_rank: None,
+            matched_terms: Vec::new(),
+            symbol_name: None,
+            result_type: "chunk".to_string(),
+        }
+    }
+
+    #[test]
+    fn extra_list_surfaces_documents_the_indexes_miss() {
+        let engine = create_test_engine();
+        engine.index_chunk(&chunk("a", "fn alpha() { parse_config(); }"));
+
+        let results = engine.search_in_with("parse config", 10, None, &[extra("body_only")]);
+        assert!(results.iter().any(|r| r.id == "body_only"), "{results:?}");
+    }
+
+    #[test]
+    fn extra_list_reinforces_the_same_document() {
+        let engine = create_test_engine();
+        engine.index_chunk(&chunk("a", "fn parse_config() { read_file(); }"));
+        engine.index_chunk(&chunk("b", "fn parse_args() { parse_config_value(); }"));
+
+        let score_of = |results: &[HybridResult], id: &str| {
+            results.iter().find(|r| r.id == id).map(|r| r.score)
+        };
+        let plain = engine.search_in_with("parse", 10, None, &[]);
+        let fused = engine.search_in_with("parse", 10, None, &[extra("b")]);
+        assert!(
+            score_of(&fused, "b") > score_of(&plain, "b"),
+            "{plain:?}\n{fused:?}"
+        );
+        assert_eq!(fused.iter().filter(|r| r.id == "b").count(), 1, "{fused:?}");
+        assert_eq!(fused[0].id, "b", "{fused:?}");
+    }
+
+    #[test]
+    fn same_id_in_different_repos_is_not_fused() {
+        let engine = create_test_engine();
+        let mut other = extra("a");
+        other.repo = "other".to_string();
+        let results = engine.search_in_with("anything", 10, None, &[extra("a"), other]);
+        assert_eq!(
+            results.iter().filter(|r| r.id == "a").count(),
+            2,
+            "{results:?}"
+        );
     }
 
     #[test]
@@ -666,6 +819,7 @@ mod tests {
             rrf_k: 30.0,
             bm25_weight: 0.7,
             tfidf_weight: 0.3,
+            extra_weight: 1.0,
             exact_match_boost: 1.5,
             function_boost: 1.2,
             candidate_multiplier: 2,

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for search_code tool
 pub struct SearchCodeHandler;
@@ -19,7 +19,7 @@ impl ToolHandler for SearchCodeHandler {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
         let file_pattern = args.get_str_any(&["file_pattern", "path"]);
-        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
+        let max_results = args.get_limit_any(&["max_results", "limit"], 10);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .search_code(repo, query, file_pattern, max_results, exclude_tests)
@@ -39,7 +39,7 @@ impl ToolHandler for SemanticSearchHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         let doc_type = args.get_str("doc_type");
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -60,7 +60,7 @@ impl ToolHandler for HybridSearchHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         let mode = args.get_str("mode").unwrap_or("hybrid");
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -81,7 +81,7 @@ impl ToolHandler for NeuralSearchHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         engine.neural_search(repo, query, max_results).await
     }
 }
@@ -99,7 +99,7 @@ impl ToolHandler for SearchChunksHandler {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
         let chunk_type = args.get_str("chunk_type");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .search_chunks(query, repo, chunk_type, max_results, exclude_tests)
@@ -119,7 +119,7 @@ impl ToolHandler for FindSimilarCodeHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
         let query = args.get_str("query").unwrap_or("");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .find_similar_code(repo, query, max_results, exclude_tests)
@@ -138,8 +138,8 @@ impl ToolHandler for FindSimilarToSymbolHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
+        let symbol = args.get_str_any(&["symbol", "function"]).unwrap_or("");
+        let max_results = args.get_u64_any(&["max_results", "limit"]).unwrap_or(10) as usize;
         engine
             .find_similar_to_symbol(repo, symbol, max_results)
             .await
@@ -158,7 +158,7 @@ impl ToolHandler for FindSemanticClonesHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         let threshold = args
             .get("threshold")
             .and_then(|v| v.as_f64())

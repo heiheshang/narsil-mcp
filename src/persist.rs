@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, debug_span, info, warn};
 
 use crate::store::{FileRow, SqliteStore};
 use crate::symbols::Symbol;
@@ -25,6 +25,9 @@ pub struct FileMetadata {
     pub content_hash: String,
     pub modified_time: u64,
     pub size: u64,
+    /// Line count when known; a warm start reads the file otherwise.
+    #[serde(default)]
+    pub lines: Option<u64>,
     pub symbols: Vec<Symbol>,
 }
 
@@ -36,6 +39,40 @@ pub struct PersistedIndex {
     pub updated_at: u64,
     pub repo_root: PathBuf,
     pub files: HashMap<PathBuf, FileMetadata>,
+    /// [`current_index_format`] of the binary that saved it.
+    #[serde(default)]
+    pub index_format: String,
+    /// Written into the call-graph and TF-IDF snapshots saved alongside: a
+    /// snapshot with another stamp is not from the same save.
+    #[serde(default)]
+    pub snapshot_stamp: String,
+}
+
+/// Version of everything an index saves or restores: symbols, search and
+/// substring documents, the knowledge graph, call-graph and TF-IDF snapshots.
+/// Bump it with any change to what indexing produces; a persisted index of
+/// another version is rebuilt instead of reused. `tests/index_format.rs`
+/// fails when the output on the fixtures changes and this does not.
+pub const INDEX_FORMAT_VERSION: u32 = 4;
+
+pub fn current_index_format() -> String {
+    format!(
+        "{INDEX_FORMAT_VERSION}.{}",
+        crate::search::TOKENIZER_VERSION
+    )
+}
+
+/// Pages of a table rewritten on every save end up scattered through the
+/// file, so a cold scan of it reads 4 KiB at a time from all over the disk:
+/// 4 s for 1c-src's symbols on NVMe. One sequential pass beforehand takes
+/// 0.1 s and leaves the scan hitting the page cache.
+fn read_into_page_cache(path: &Path) {
+    let _span = debug_span!("read_into_page_cache").entered();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut buf = vec![0u8; 1 << 20];
+    while matches!(std::io::Read::read(&mut file, &mut buf), Ok(n) if n > 0) {}
 }
 
 impl PersistedIndex {
@@ -53,6 +90,8 @@ impl PersistedIndex {
             updated_at: now,
             repo_root,
             files: HashMap::new(),
+            index_format: String::new(),
+            snapshot_stamp: String::new(),
         }
     }
 
@@ -94,6 +133,7 @@ impl PersistedIndex {
                     .duration_since(SystemTime::UNIX_EPOCH)?
                     .as_secs(),
                 size: metadata.len(),
+                lines: None,
                 symbols,
             },
         );
@@ -180,12 +220,32 @@ impl IndexStore {
         Ok(PersistedIndex::new(repo_root.to_path_buf()))
     }
 
+    /// Content hash, mtime and size of every file recorded for `repo_root`,
+    /// without its symbols.
+    pub fn file_hashes(&self, repo_root: &Path) -> Result<HashMap<PathBuf, (String, u64, u64)>> {
+        let db_path = self.db_path(repo_root);
+        let mut hashes = HashMap::new();
+        if !db_path.exists() {
+            return Ok(hashes);
+        }
+        let store = SqliteStore::open(&db_path)?;
+        store.for_each_file(&Self::repo_key(repo_root), |f| {
+            hashes.insert(
+                PathBuf::from(f.path),
+                (f.content_hash, f.modified_time, f.size),
+            );
+        })?;
+        Ok(hashes)
+    }
+
     /// Rebuild an in-memory `PersistedIndex` from the SQLite store.
     ///
     /// File metadata rows are read first (keyed by absolute path), then symbols
     /// are streamed and attached to their file by `repo_root.join(file_path)`.
     fn load_from_db(&self, repo_root: &Path) -> Result<PersistedIndex> {
-        let store = SqliteStore::open(&self.db_path(repo_root))?;
+        let db_path = self.db_path(repo_root);
+        read_into_page_cache(&db_path);
+        let store = SqliteStore::open(&db_path)?;
         let repo = Self::repo_key(repo_root);
 
         let created_at = store
@@ -196,7 +256,10 @@ impl IndexStore {
             .get_meta("updated_at")?
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
+        let index_format = store.get_meta("index_format")?.unwrap_or_default();
+        let snapshot_stamp = store.get_meta("snapshot_stamp")?.unwrap_or_default();
 
+        let files_span = debug_span!("read_files").entered();
         let mut files: HashMap<PathBuf, FileMetadata> = HashMap::new();
         store.for_each_file(&repo, |f| {
             let abs = PathBuf::from(f.path);
@@ -207,19 +270,42 @@ impl IndexStore {
                     content_hash: f.content_hash,
                     modified_time: f.modified_time,
                     size: f.size,
+                    lines: f.lines,
                     symbols: Vec::new(),
                 },
             );
         })?;
 
+        drop(files_span);
+
+        let _symbols_span = debug_span!("read_symbols").entered();
         let mut dropped = 0usize;
-        store.for_each_symbol(&repo, |sym| {
-            let abs = repo_root.join(&sym.file_path);
-            match files.get_mut(&abs) {
-                Some(meta) => meta.symbols.push(sym),
-                None => dropped += 1,
+        // A file's symbols are stored together, so they are gathered and
+        // looked up once per file: joining and hashing a path per symbol
+        // took a second on 1c-src.
+        let mut file_symbols: Vec<Symbol> = Vec::new();
+        let mut attach = |file_symbols: &mut Vec<Symbol>| {
+            let Some(first) = file_symbols.first() else {
+                return;
+            };
+            match files.get_mut(&repo_root.join(&first.file_path)) {
+                Some(meta) => meta.symbols.append(file_symbols),
+                None => {
+                    dropped += file_symbols.len();
+                    file_symbols.clear();
+                }
             }
+        };
+        store.for_each_symbol(&repo, |sym| {
+            if file_symbols
+                .first()
+                .is_some_and(|first| first.file_path != sym.file_path)
+            {
+                attach(&mut file_symbols);
+            }
+            file_symbols.push(sym);
         })?;
+        attach(&mut file_symbols);
         if dropped > 0 {
             warn!(
                 "Dropped {} symbol(s) with no matching file row for repo {}",
@@ -233,6 +319,8 @@ impl IndexStore {
             updated_at,
             repo_root: repo_root.to_path_buf(),
             files,
+            index_format,
+            snapshot_stamp,
         })
     }
 
@@ -250,6 +338,7 @@ impl IndexStore {
                 content_hash: meta.content_hash.clone(),
                 modified_time: meta.modified_time,
                 size: meta.size,
+                lines: meta.lines,
             });
             symbols.extend(meta.symbols.iter().cloned());
         }
@@ -258,6 +347,8 @@ impl IndexStore {
         store.set_meta("repo_root", &repo)?;
         store.set_meta("created_at", &index.created_at.to_string())?;
         store.set_meta("updated_at", &index.updated_at.to_string())?;
+        store.set_meta("index_format", &index.index_format)?;
+        store.set_meta("snapshot_stamp", &index.snapshot_stamp)?;
         info!("Saved index to {:?}", db_path);
         Ok(())
     }
@@ -282,35 +373,81 @@ impl IndexStore {
         Ok(repos)
     }
 
-    /// Path to call-graph JSON file for a repository
-    fn call_graph_path(&self, repo_root: &Path) -> PathBuf {
+    /// Path of a snapshot file of a repository: `<hash>.<name>`.
+    fn snapshot_path(&self, repo_root: &Path, name: &str) -> PathBuf {
         let hash = {
             let mut hasher = Sha256::new();
             hasher.update(repo_root.to_string_lossy().as_bytes());
             format!("{:x}", hasher.finalize())
         };
-        self.index_dir
-            .join(format!("{}.callgraph.json", &hash[..16]))
+        self.index_dir.join(format!("{}.{name}", &hash[..16]))
     }
 
-    /// Save call-graph to disk
-    pub fn save_call_graph(&self, repo_root: &Path, call_graph_json: &str) -> Result<()> {
-        let path = self.call_graph_path(repo_root);
-        std::fs::write(&path, call_graph_json)?;
+    /// The snapshot mapped rather than read: read, 1c-src's snapshots took
+    /// 0.7 GB of heap at startup, which the allocator returned to the system
+    /// only seconds after they were decoded. Mapped, they are page cache.
+    fn read_snapshot(&self, repo_root: &Path, name: &str) -> Result<Option<memmap2::Mmap>> {
+        let path = self.snapshot_path(repo_root, name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(&path)?;
+        // SAFETY: snapshots are only replaced by renaming a new file over
+        // them (`write_snapshot`), never rewritten in place, so the mapped
+        // file does not change while it is mapped.
+        let content = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
+        debug!("Loaded snapshot from {:?}", path);
+        Ok(Some(content))
+    }
+
+    /// Replace a snapshot by renaming a complete new file over it, which
+    /// keeps a mapping of the old one intact and a crash from leaving half
+    /// a snapshot.
+    fn write_snapshot(&self, repo_root: &Path, name: &str, snapshot: &[u8]) -> Result<PathBuf> {
+        let path = self.snapshot_path(repo_root, name);
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, snapshot)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
+    /// Save a call-graph snapshot to disk
+    pub fn save_call_graph(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
+        let path = self.write_snapshot(repo_root, "callgraph.bin", snapshot)?;
+        // The JSON snapshot of earlier versions; it is never read any more.
+        let legacy = self.snapshot_path(repo_root, "callgraph.json");
+        if legacy.exists() {
+            std::fs::remove_file(&legacy)?;
+        }
         debug!("Saved call-graph to {:?}", path);
         Ok(())
     }
 
-    /// Load call-graph from disk
-    pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<String>> {
-        let path = self.call_graph_path(repo_root);
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            debug!("Loaded call-graph from {:?}", path);
-            Ok(Some(content))
-        } else {
-            Ok(None)
-        }
+    /// Save a TF-IDF snapshot to disk
+    pub fn save_tfidf(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
+        let path = self.write_snapshot(repo_root, "tfidf.bin", snapshot)?;
+        debug!("Saved TF-IDF state to {:?}", path);
+        Ok(())
+    }
+
+    /// Load a TF-IDF snapshot from disk
+    pub fn load_tfidf(&self, repo_root: &Path) -> Result<Option<memmap2::Mmap>> {
+        self.read_snapshot(repo_root, "tfidf.bin")
+    }
+
+    /// Load a call-graph snapshot from disk
+    pub fn load_call_graph(&self, repo_root: &Path) -> Result<Option<memmap2::Mmap>> {
+        self.read_snapshot(repo_root, "callgraph.bin")
+    }
+
+    pub fn save_normalized(&self, repo_root: &Path, snapshot: &[u8]) -> Result<()> {
+        let path = self.write_snapshot(repo_root, "normalized.bin", snapshot)?;
+        debug!("Saved 1C normalized documents to {:?}", path);
+        Ok(())
+    }
+
+    pub fn load_normalized(&self, repo_root: &Path) -> Result<Option<memmap2::Mmap>> {
+        self.read_snapshot(repo_root, "normalized.bin")
     }
 }
 
@@ -539,6 +676,13 @@ impl AsyncFileWatcher {
     }
 }
 
+/// A root to start or stop watching while watch mode runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchCommand {
+    Watch(PathBuf),
+    Unwatch(PathBuf),
+}
+
 /// A detected file change
 #[derive(Debug, Clone)]
 pub struct FileChange {
@@ -716,21 +860,43 @@ impl IncrementalIndexer {
 /// from new call sites; it returns the sender so the caller cannot forget to
 /// keep it alive.
 pub async fn run_watch_mode(
-    engine: Arc<crate::index::CodeIntelEngine>,
+    engine: Arc<crate::engine::CodeIntelEngine>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     info!("Starting async watch mode background task");
 
-    let (_watcher, mut rx) = match engine.create_async_file_watcher() {
+    let (mut watcher, mut rx) = match engine.create_async_file_watcher() {
         Some((w, r)) => (w, r),
         None => {
             warn!("Failed to create async file watcher, watch mode disabled");
             return;
         }
     };
+    // Roots indexed later (git worktrees) are added through this channel.
+    let (_idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut commands = engine.take_watch_commands().unwrap_or(idle_rx);
 
     loop {
         tokio::select! {
+            Some(command) = commands.recv() => {
+                match command {
+                    WatchCommand::Watch(path) => {
+                        if watcher.watched_paths().contains(&path) {
+                            continue;
+                        }
+                        if let Err(e) = watcher.watch(&path) {
+                            warn!("Failed to watch {:?}: {}", path, e);
+                        }
+                    }
+                    WatchCommand::Unwatch(path) => {
+                        if let Err(e) = watcher.unwatch(&path) {
+                            debug!("Failed to unwatch {:?}: {}", path, e);
+                        } else {
+                            info!("Stopped watching {:?}", path);
+                        }
+                    }
+                }
+            }
             // Receive batched file change events
             Some(changes) = rx.recv() => {
                 if !changes.is_empty() {
@@ -768,7 +934,7 @@ pub async fn run_watch_mode(
 #[must_use = "the returned Sender must be held until the watcher should stop; \
               dropping it immediately exits the watcher (issue #26)"]
 pub fn spawn_watch_mode(
-    engine: Arc<crate::index::CodeIntelEngine>,
+    engine: Arc<crate::engine::CodeIntelEngine>,
 ) -> tokio::sync::broadcast::Sender<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     tokio::spawn(async move {
@@ -856,6 +1022,7 @@ mod tests {
                 content_hash: "abc".into(),
                 modified_time: 123,
                 size: 11,
+                lines: Some(1),
                 symbols,
             },
         );
@@ -870,6 +1037,7 @@ mod tests {
         assert_eq!(meta.symbols[0].file_path, "a.rs");
         assert_eq!(meta.content_hash, "abc");
         assert_eq!(meta.modified_time, 123);
+        assert_eq!(meta.lines, Some(1));
         assert_eq!(loaded.repo_root, repo.path().to_path_buf());
 
         // Timestamps must survive the round-trip (they feed `last_indexed`).

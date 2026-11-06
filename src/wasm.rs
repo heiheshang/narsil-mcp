@@ -445,6 +445,7 @@ fn parse_symbol_kind(s: &str) -> Option<SymbolKind> {
         "interface" => Some(SymbolKind::Interface),
         "trait" => Some(SymbolKind::Trait),
         "type" | "typealias" => Some(SymbolKind::TypeAlias),
+        "test" | "testcase" => Some(SymbolKind::TestCase),
         "module" | "mod" => Some(SymbolKind::Module),
         "namespace" => Some(SymbolKind::Namespace),
         "constant" | "const" => Some(SymbolKind::Constant),

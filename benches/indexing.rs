@@ -179,11 +179,131 @@ fn reindex_file(_repo_path: &std::path::Path, file_path: &std::path::Path) -> us
     content.matches("fn ").count()
 }
 
+/// Call-graph construction over a Go corpus shaped like the ones this
+/// resolution work targets: dependency-injected services, methods spread
+/// across a package's files, a shared embedded base struct, package-qualified
+/// calls into both this "repository" and outside it.
+///
+/// Guards the cost of resolution, which reads declarations, follows field
+/// chains and checks interface implementations — none of which shows up in
+/// edge counts, only in wall clock.
+fn bench_call_graph_resolution(c: &mut Criterion) {
+    use narsil_mcp::callgraph::CallGraph;
+    use narsil_mcp::parser::LanguageParser;
+
+    let parser = LanguageParser::new().unwrap();
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for module in 0..24 {
+        sources.push((
+            format!("internal/module/m{module}/usecase/impl/service.go"),
+            format!(
+                r#"
+package impl
+
+type Service{module} struct {{
+	base.SimpleQuery
+	Depend Depend{module}
+	C      solcontext.IContext
+}}
+
+type Depend{module} struct {{
+	RepoFactory repo.Repo{module}Factory
+}}
+
+func (self *Service{module}) Process(id string) error {{
+	item, err := self.Depend.RepoFactory(self.C).FindByUuid(id)
+	if err != nil {{
+		return self.HandleError(err)
+	}}
+	self.C.Logger().SendError(err)
+	svc := NewService{module}()
+	return svc.Finish(item)
+}}
+
+func (self *Service{module}) Finish(item string) error {{
+	return nil
+}}
+
+func NewService{module}() *Service{module} {{
+	return &Service{module}{{}}
+}}
+"#
+            ),
+        ));
+        sources.push((
+            format!("internal/module/m{module}/model/repository/impl/repo.go"),
+            format!(
+                r#"
+package impl
+
+import (
+	"fmt"
+
+	"go-rest-api/internal/config"
+)
+
+type Repo{module} struct {{
+	base.SimpleQuery
+}}
+
+func (self *Repo{module}) FindByUuid(uuid string) (string, error) {{
+	fmt.Println(config.Get())
+	return "", nil
+}}
+"#
+            ),
+        ));
+    }
+    sources.push((
+        "internal/model/base/base.go".to_string(),
+        "package base
+
+type SimpleQuery struct{}
+
+func (self *SimpleQuery) HandleError(err error) error {
+	return err
+}
+"
+        .to_string(),
+    ));
+    sources.push((
+        "internal/config/config.go".to_string(),
+        "package config
+
+func Get() *Config {
+	return nil
+}
+
+type Config struct{}
+"
+        .to_string(),
+    ));
+
+    let files: Vec<_> = sources
+        .into_iter()
+        .map(|(path, code)| {
+            let tree = parser
+                .parse_to_tree(std::path::Path::new(&path), &code)
+                .unwrap();
+            (path, code, tree)
+        })
+        .collect();
+
+    c.bench_function("call_graph_build_50_go_files", |b| {
+        b.iter(|| {
+            let graph = CallGraph::new();
+            graph.build_from_files(&files).unwrap();
+            black_box(graph.node_count())
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_index_repository,
     bench_symbol_extraction,
     bench_incremental_index,
     bench_parallel_indexing,
+    bench_call_graph_resolution,
 );
 criterion_main!(benches);

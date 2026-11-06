@@ -57,6 +57,63 @@ pub struct KnowledgeGraph {
     store: Store,
 }
 
+/// `systemctl restart` starts the new process while the old one still holds
+/// RocksDB's lock: it is released only when the old process's files close.
+const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// RocksDB must never get to report a held lock: oxigraph 0.5.9 frees its
+/// C-`malloc`ed error message with the Rust allocator, which segfaults under
+/// mimalloc.
+#[cfg(unix)]
+fn wait_for_store_lock(path: &Path, timeout: std::time::Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut announced = false;
+    loop {
+        let Some(pid) = store_lock_holder(&path.join("LOCK")) else {
+            return Ok(());
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "knowledge graph store {} is still locked by pid {pid} after {}s",
+                path.display(),
+                timeout.as_secs()
+            ));
+        }
+        if !announced {
+            tracing::info!(
+                "Knowledge graph store {} is locked by pid {pid}; waiting for it to be released",
+                path.display()
+            );
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_store_lock(_path: &Path, _timeout: std::time::Duration) -> Result<()> {
+    Ok(())
+}
+
+/// `F_GETLK` only inspects the lock; it never takes it.
+#[cfg(unix)]
+fn store_lock_holder(lock_path: &Path) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .ok()?;
+    // SAFETY: `flock` is plain old data; all-zero is a valid value.
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as _;
+    probe.l_whence = libc::SEEK_SET as _;
+    // SAFETY: `file` is open for the whole call and `probe` is a valid `flock`.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+    (rc == 0 && i32::from(probe.l_type) != libc::F_UNLCK).then_some(probe.l_pid)
+}
+
 impl std::fmt::Debug for KnowledgeGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KnowledgeGraph")
@@ -83,6 +140,9 @@ impl KnowledgeGraph {
     /// let graph = KnowledgeGraph::open(Path::new("/tmp/narsil-graph")).unwrap();
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
+        wait_for_store_lock(path, STORE_LOCK_WAIT)?;
+        // Any other RocksDB error here still segfaults (see `wait_for_store_lock`).
+        // Needs an oxigraph fix or mimalloc's `override` feature.
         let store = Store::open(path).map_err(|e| anyhow!("Failed to open store: {e}"))?;
         Ok(Self { store })
     }
@@ -241,6 +301,15 @@ impl KnowledgeGraph {
     /// ).unwrap();
     /// ```
     pub fn add_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<()> {
+        self.add(&iri_quad(subject, predicate, object)?)
+    }
+
+    /// Whether the default graph holds this IRI triple.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any IRI is invalid or the store cannot be read.
+    pub fn has_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
         let subject =
             NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
         let predicate = NamedNode::new(predicate)
@@ -250,10 +319,20 @@ impl KnowledgeGraph {
 
         let quad = Quad::new(subject, predicate, object, GraphName::DefaultGraph);
         self.store
-            .insert(&quad)
-            .map_err(|e| anyhow!("Failed to insert quad: {e}"))?;
+            .contains(&quad)
+            .map_err(|e| anyhow!("Failed to read quad: {e}"))
+    }
 
-        Ok(())
+    /// Writes buffered changes to disk. Without it the next open replays the
+    /// write-ahead log, which took 13 s for a 185k-symbol repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be flushed.
+    pub fn flush(&self) -> Result<()> {
+        self.store
+            .flush()
+            .map_err(|e| anyhow!("Failed to flush store: {e}"))
     }
 
     /// Adds a triple with a literal object value to the default graph.
@@ -268,18 +347,7 @@ impl KnowledgeGraph {
     ///
     /// Returns an error if any IRI is invalid or insertion fails.
     pub fn add_triple_literal(&self, subject: &str, predicate: &str, value: &str) -> Result<()> {
-        let subject =
-            NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
-        let predicate = NamedNode::new(predicate)
-            .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
-        let literal = Literal::new_simple_literal(value);
-
-        let quad = Quad::new(subject, predicate, literal, GraphName::DefaultGraph);
-        self.store
-            .insert(&quad)
-            .map_err(|e| anyhow!("Failed to insert quad: {e}"))?;
-
-        Ok(())
+        self.add(&literal_quad(subject, predicate, value)?)
     }
 
     /// Adds a triple with an integer literal object value.
@@ -294,18 +362,30 @@ impl KnowledgeGraph {
     ///
     /// Returns an error if any IRI is invalid or insertion fails.
     pub fn add_triple_int(&self, subject: &str, predicate: &str, value: i64) -> Result<()> {
-        let subject =
-            NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
-        let predicate = NamedNode::new(predicate)
-            .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
-        let literal = Literal::new_typed_literal(value.to_string(), vocab::xsd::INTEGER);
+        self.add(&int_quad(subject, predicate, value)?)
+    }
 
-        let quad = Quad::new(subject, predicate, literal, GraphName::DefaultGraph);
+    /// Inserts one quad in its own transaction.
+    pub fn add(&self, quad: &Quad) -> Result<()> {
         self.store
-            .insert(&quad)
+            .insert(quad)
             .map_err(|e| anyhow!("Failed to insert quad: {e}"))?;
-
         Ok(())
+    }
+
+    /// Writes `quads` with the bulk loader: one commit instead of one
+    /// transaction per quad. The first error stops the load and nothing is
+    /// committed.
+    pub fn bulk_load(&self, quads: impl IntoIterator<Item = Result<Quad>>) -> Result<()> {
+        let mut loader = self
+            .store
+            .bulk_loader()
+            .with_num_threads(BULK_LOAD_THREADS)
+            .with_max_memory_size_in_megabytes(BULK_LOAD_MEMORY_MB);
+        loader.load_ok_quads::<anyhow::Error, anyhow::Error>(quads)?;
+        loader
+            .commit()
+            .map_err(|e| anyhow!("Failed to commit bulk load: {e}"))
     }
 
     /// Adds a quad (triple in a named graph).
@@ -430,7 +510,9 @@ impl KnowledgeGraph {
     /// Returns true if the store is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        // Not `len() == 0`: counting scans every quad, 0.75 s for 1c-src's
+        // 3.9 million on each startup.
+        self.store.is_empty().unwrap_or(true)
     }
 
     /// Exports the graph to Turtle format.
@@ -513,8 +595,95 @@ impl KnowledgeGraph {
     }
 }
 
+/// Threads and memory target of [`KnowledgeGraph::bulk_load`]. The oxigraph
+/// defaults, a thread per core and 2 GB each, do not fit the memory budget of
+/// a server that also holds the index.
+const BULK_LOAD_THREADS: usize = 4;
+const BULK_LOAD_MEMORY_MB: usize = 1024;
+
+/// The quad `subject predicate object` in the default graph.
+pub fn iri_quad(subject: &str, predicate: &str, object: &str) -> Result<Quad> {
+    let object =
+        NamedNode::new(object).map_err(|e| anyhow!("Invalid object IRI '{object}': {e}"))?;
+    default_graph_quad(subject, predicate, object)
+}
+
+/// The quad `subject predicate "value"` in the default graph.
+pub fn literal_quad(subject: &str, predicate: &str, value: &str) -> Result<Quad> {
+    default_graph_quad(subject, predicate, Literal::new_simple_literal(value))
+}
+
+/// The quad `subject predicate value^^xsd:integer` in the default graph.
+pub fn int_quad(subject: &str, predicate: &str, value: i64) -> Result<Quad> {
+    default_graph_quad(
+        subject,
+        predicate,
+        Literal::new_typed_literal(value.to_string(), vocab::xsd::INTEGER),
+    )
+}
+
+fn default_graph_quad(subject: &str, predicate: &str, object: impl Into<Term>) -> Result<Quad> {
+    let subject =
+        NamedNode::new(subject).map_err(|e| anyhow!("Invalid subject IRI '{subject}': {e}"))?;
+    let predicate = NamedNode::new(predicate)
+        .map_err(|e| anyhow!("Invalid predicate IRI '{predicate}': {e}"))?;
+    Ok(Quad::new(
+        subject,
+        predicate,
+        object,
+        GraphName::DefaultGraph,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn open_waits_for_a_store_locked_by_another_process() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("graph");
+        drop(KnowledgeGraph::open(&store).unwrap());
+        let lock_path = store.join("LOCK");
+
+        // fcntl locks are per process: the holder has to be a child.
+        // SAFETY: the child only calls async-signal-safe functions and _exits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path);
+                if let Ok(file) = file {
+                    let mut lock: libc::flock = std::mem::zeroed();
+                    lock.l_type = libc::F_WRLCK as _;
+                    lock.l_whence = libc::SEEK_SET as _;
+                    libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock);
+                    libc::sleep(3);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let started = std::time::Instant::now();
+        while store_lock_holder(&lock_path).is_none() {
+            assert!(started.elapsed().as_secs() < 2, "child never took the lock");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(store_lock_holder(&lock_path), Some(child));
+
+        let err = wait_for_store_lock(&store, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("still locked"), "{err}");
+
+        let graph = KnowledgeGraph::open(&store);
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        assert!(graph.is_ok(), "{:?}", graph.err());
+    }
+
     use super::*;
 
     #[test]

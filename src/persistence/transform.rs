@@ -32,10 +32,12 @@
 //! ```
 
 use anyhow::Result;
-use oxigraph::model::vocab;
+use oxigraph::model::{vocab, Quad};
 
 use crate::callgraph::{CallEdge, CallNode};
-use crate::persistence::graph::{KnowledgeGraph, CODE_BASE_IRI, NARSIL_BASE_IRI};
+use crate::persistence::graph::{
+    int_quad, iri_quad, literal_quad, KnowledgeGraph, CODE_BASE_IRI, NARSIL_BASE_IRI,
+};
 use crate::security_rules::SecurityFinding;
 use crate::symbols::{Symbol, SymbolKind};
 use crate::taint::{Confidence, Severity};
@@ -79,6 +81,19 @@ impl SymbolTransformer {
     /// let iri = SymbolTransformer::transform(&graph, "my-repo", &symbol)?;
     /// ```
     pub fn transform(graph: &KnowledgeGraph, repo: &str, symbol: &Symbol) -> Result<String> {
+        let mut quads = Vec::new();
+        let iri = Self::quads(repo, symbol, &mut quads)?;
+        quads.iter().try_for_each(|q| graph.add(q))?;
+        Ok(iri)
+    }
+
+    /// The triples of [`transform`](Self::transform), appended to `out`
+    /// instead of inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an IRI built from the symbol is invalid.
+    pub fn quads(repo: &str, symbol: &Symbol, out: &mut Vec<Quad>) -> Result<String> {
         // Create a unique IRI for this symbol
         let symbol_path = format!(
             "{}::{}_L{}",
@@ -91,58 +106,70 @@ impl SymbolTransformer {
         let class_iri = format!("{NARSIL_BASE_IRI}{rdf_class}");
 
         // Add type triple
-        graph.add_triple(&subject_iri, vocab::rdf::TYPE.as_str(), &class_iri)?;
+        out.push(iri_quad(
+            &subject_iri,
+            vocab::rdf::TYPE.as_str(),
+            &class_iri,
+        )?);
 
         // Add name property
-        graph.add_triple_literal(
+        out.push(literal_quad(
             &subject_iri,
             &format!("{NARSIL_BASE_IRI}name"),
             &symbol.name,
-        )?;
+        )?);
 
         // Add file path
-        graph.add_triple_literal(
+        out.push(literal_quad(
             &subject_iri,
             &format!("{NARSIL_BASE_IRI}filePath"),
             &symbol.file_path,
-        )?;
+        )?);
 
         // Add line numbers
-        graph.add_triple_int(
+        out.push(int_quad(
             &subject_iri,
             &format!("{NARSIL_BASE_IRI}startLine"),
             symbol.start_line as i64,
-        )?;
-        graph.add_triple_int(
+        )?);
+        out.push(int_quad(
             &subject_iri,
             &format!("{NARSIL_BASE_IRI}endLine"),
             symbol.end_line as i64,
-        )?;
+        )?);
 
         // Add symbol kind as string
-        graph.add_triple_literal(
+        out.push(literal_quad(
             &subject_iri,
             &format!("{NARSIL_BASE_IRI}symbolKind"),
             &format!("{:?}", symbol.kind),
-        )?;
+        )?);
 
         // Add optional signature
         if let Some(ref sig) = symbol.signature {
-            graph.add_triple_literal(&subject_iri, &format!("{NARSIL_BASE_IRI}signature"), sig)?;
+            out.push(literal_quad(
+                &subject_iri,
+                &format!("{NARSIL_BASE_IRI}signature"),
+                sig,
+            )?);
         }
 
         // Add optional doc comment
         if let Some(ref doc) = symbol.doc_comment {
-            graph.add_triple_literal(&subject_iri, &format!("{NARSIL_BASE_IRI}docComment"), doc)?;
+            out.push(literal_quad(
+                &subject_iri,
+                &format!("{NARSIL_BASE_IRI}docComment"),
+                doc,
+            )?);
         }
 
         // Add optional qualified name
         if let Some(ref qname) = symbol.qualified_name {
-            graph.add_triple_literal(
+            out.push(literal_quad(
                 &subject_iri,
                 &format!("{NARSIL_BASE_IRI}qualifiedName"),
                 qname,
-            )?;
+            )?);
         }
 
         // Link to file node
@@ -150,11 +177,11 @@ impl SymbolTransformer {
             "{CODE_BASE_IRI}{repo}/file/{}",
             url_encode(&symbol.file_path)
         );
-        graph.add_triple(
+        out.push(iri_quad(
             &file_iri,
             &format!("{NARSIL_BASE_IRI}definesSymbol"),
             &subject_iri,
-        )?;
+        )?);
 
         Ok(subject_iri)
     }
@@ -520,6 +547,20 @@ impl ImportTransformer {
 pub struct RepositoryTransformer;
 
 impl RepositoryTransformer {
+    /// Whether [`transform`](Self::transform) has run for `repo`, which is the
+    /// last step of transforming a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the graph cannot be read.
+    pub fn is_transformed(graph: &KnowledgeGraph, repo: &str) -> Result<bool> {
+        graph.has_triple(
+            &format!("{CODE_BASE_IRI}{repo}"),
+            vocab::rdf::TYPE.as_str(),
+            &format!("{NARSIL_BASE_IRI}Repository"),
+        )
+    }
+
     /// Transforms repository metadata into RDF triples.
     ///
     /// # Arguments
@@ -540,38 +581,63 @@ impl RepositoryTransformer {
         repo: &str,
         files: impl Iterator<Item = &'a str>,
     ) -> Result<String> {
+        let mut quads = Vec::new();
+        let iri = Self::quads(repo, files, &mut quads)?;
+        quads.iter().try_for_each(|q| graph.add(q))?;
+        Ok(iri)
+    }
+
+    /// The triples of [`transform`](Self::transform), appended to `out`
+    /// instead of inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an IRI built from a file path is invalid.
+    pub fn quads<'a>(
+        repo: &str,
+        files: impl Iterator<Item = &'a str>,
+        out: &mut Vec<Quad>,
+    ) -> Result<String> {
         let repo_iri = format!("{CODE_BASE_IRI}{repo}");
 
         // Add type triple
-        graph.add_triple(
+        out.push(iri_quad(
             &repo_iri,
             vocab::rdf::TYPE.as_str(),
             &format!("{NARSIL_BASE_IRI}Repository"),
-        )?;
+        )?);
 
         // Add name
-        graph.add_triple_literal(&repo_iri, &format!("{NARSIL_BASE_IRI}name"), repo)?;
+        out.push(literal_quad(
+            &repo_iri,
+            &format!("{NARSIL_BASE_IRI}name"),
+            repo,
+        )?);
 
         // Add containsFile relationships
         for file in files {
             let file_iri = format!("{CODE_BASE_IRI}{repo}/file/{}", url_encode(file));
 
             // Mark as File type
-            graph.add_triple(
+            out.push(iri_quad(
                 &file_iri,
                 vocab::rdf::TYPE.as_str(),
                 &format!("{NARSIL_BASE_IRI}File"),
-            )?;
+            )?);
 
             // Add file path
-            graph.add_triple_literal(&file_iri, &format!("{NARSIL_BASE_IRI}filePath"), file)?;
+            out.push(literal_quad(
+                &file_iri,
+                &format!("{NARSIL_BASE_IRI}filePath"),
+                file,
+            )?);
 
             // Add containsFile relationship
-            graph.add_triple(
+            out.push(iri_quad(
                 &repo_iri,
                 &format!("{NARSIL_BASE_IRI}containsFile"),
                 &file_iri,
-            )?;
+            )?);
         }
 
         Ok(repo_iri)
@@ -601,6 +667,7 @@ fn symbol_kind_to_rdf_class(kind: &SymbolKind) -> &'static str {
         SymbolKind::Field => "Variable",
         SymbolKind::Parameter => "Variable",
         SymbolKind::TypeAlias => "Symbol",
+        SymbolKind::TestCase => "Symbol",
         SymbolKind::Implementation => "Symbol",
         SymbolKind::Macro => "Symbol",
         SymbolKind::Unknown => "Symbol",
@@ -825,6 +892,8 @@ mod tests {
                 cognitive: 8,
             },
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -854,8 +923,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "callee".to_string(),
-                file_path: "src/lib.rs".to_string(),
+                target: "callee".into(),
+                file_path: "src/lib.rs".into(),
                 line: 15,
                 column: 5,
                 call_type: CallType::Direct,
@@ -866,6 +935,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let caller_iri = CallGraphTransformer::transform_node(&graph, "test-repo", &node).unwrap();
@@ -889,8 +960,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "src/lib.rs".to_string(),
+                target: "b".into(),
+                file_path: "src/lib.rs".into(),
                 line: 10,
                 column: 5,
                 call_type: CallType::Direct,
@@ -900,6 +971,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -907,8 +980,8 @@ mod tests {
             file_path: "src/lib.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "src/lib.rs".to_string(),
+                target: "c".into(),
+                file_path: "src/lib.rs".into(),
                 line: 20,
                 column: 5,
                 call_type: CallType::Direct,
@@ -918,6 +991,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -927,6 +1002,8 @@ mod tests {
             calls: vec![],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         CallGraphTransformer::transform_node(&graph, "test-repo", &node_a).unwrap();

@@ -11,7 +11,7 @@ use narsil_mcp::config::{
     filter::{ClientInfo, ToolFilter},
     ConfigLoader,
 };
-use narsil_mcp::index::EngineOptions;
+use narsil_mcp::engine::EngineOptions;
 use std::time::Duration;
 
 /// Benchmark config loading from default (embedded)

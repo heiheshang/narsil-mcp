@@ -1,0 +1,60 @@
+# cargo-deny — заменяет cargo-audit и заодно ловит дубли версий и левые источники.
+# Установка: cargo install --locked cargo-deny
+# Прогон:    cargo deny check
+
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+]
+all-features = false
+
+[advisories]
+version = 2
+# Известные и осознанно принятые уязвимости пишутся сюда с комментарием и датой.
+ignore = [
+  # { id = "RUSTSEC-2024-0000", reason = "не достижимо из нашего кода, проверено 2026-08-30" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CDLA-Permissive-2.0",
+  "CC0-1.0",
+]
+# Крейты с нестандартной лицензией — точечные исключения
+exceptions = [
+  # { allow = ["OpenSSL"], crate = "ring" },
+]
+
+[bans]
+# Дубли версий одного крейта — типичный след LLM-правок Cargo.toml
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Крейты, которые не хотим видеть в дереве вообще
+deny = [
+  # { crate = "openssl", reason = "используем rustls" },
+]
+skip = [
+  # { crate = "windows-sys" },
+]
+skip-tree = [
+  # { crate = "criterion", depth = 3 },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -34,6 +34,12 @@ Use **short parameter names**. These are the most common mistakes:
 
 The `repo` parameter expects the **repository name** from `list_repos`, not the full filesystem path.
 
+Repository names belong to **one server**. When more than one narsil server is
+configured (e.g. `narsil-mcp` alongside `narsil-neural`), run `list_repos`
+against each: the same codebase may be `go-rest-api` on one and `internal` /
+`cmd` on another that was pointed at subdirectories. A `Repository not found`
+from one server says nothing about the other.
+
 When several repositories are indexed, every search tool — `search_code`,
 `semantic_search`, `hybrid_search`, `neural_search`, `search_chunks`,
 `find_similar_code` — searches **all** of them unless you pass `repo`. Pass it whenever you mean one codebase:
@@ -80,8 +86,10 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Task | Best Tool | When to Use |
 |------|-----------|-------------|
 | Find files by name | `find_symbols` with `file_pattern` | Know filename pattern |
-| Find function/class definitions | `find_symbols` | Know symbol type |
-| Search by content | `search_code` | Keyword search |
+| Find function/class definitions | `find_symbols` | Know symbol type (`function`, `method`, `struct`, `class`, `interface`, `enum`, `trait`, `type`, `field`, `test`, `constant`, `variable`) |
+| Find named test cases | `find_symbols` with `symbol_type="test"` | Go `t.Run`, goblin/Ginkgo `Describe`/`It`, `It…` wrappers; JS/TS `describe`/`it`/`test`; the symbol spans the whole case block |
+| Search by content | `search_code` | Case-insensitive substring; ranked, and declarations outrank call sites - see the `narsil-search` skill |
+| Where an identifier is used | `find_symbol_usages` / `find_references` | Call sites; do not hunt them with `search_code` |
 | BM25-ranked search | `semantic_search` | Better ranking than search_code; `repo` scopes it to one repository |
 | Semantic code search | `hybrid_search` | Natural language queries (combines BM25 + TF-IDF) |
 | Neural (embedding) search | `neural_search` | Different naming, same meaning; `repo` scopes it to one repository (requires `--neural`) |
@@ -101,7 +109,9 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Read a file | `get_file` |
 | Read specific lines | `get_excerpt` |
 | Get AST chunks for file | `get_chunks` |
-| Get function source | `get_symbol_definition` |
+| Get function source | `get_symbol_definition` (namesakes: pass `receiver` or `file`) |
+| Skim a long function | `get_symbol_definition` with `outline=true` |
+| Find a phrase inside one function | `get_symbol_definition` with `contains="..."` |
 | Find all references | `find_references` |
 | Find all usages (cross-file) | `find_symbol_usages` |
 | See what exports a module has | `get_export_map` |
@@ -242,6 +252,8 @@ CCG layers ship a portable, layered description of a codebase suitable for AI ha
 ### Understand a function
 ```
 1. get_symbol_definition(repo, symbol) → read source
+   (long body: outline=true first, then get_file on the range it shows;
+    same name on several types: receiver="TypeName" or file="pkg/file.go")
 2. get_callers(repo, function, transitive=true) → who calls it
 3. get_callees(repo, function) → what it calls
 4. get_complexity(repo, function) → cyclomatic complexity
@@ -252,15 +264,36 @@ CCG layers ship a portable, layered description of a codebase suitable for AI ha
 
 For large codebases, use pagination and filtering:
 
-- `max_results` parameter limits output size
+- `max_results` parameter limits output size (`limit` is accepted everywhere as
+  its alias, and vice versa - no need to remember which family a tool is in)
 - `file_pattern` filters by glob (e.g., `"*.py"`, `"src/**/*.ts"`)
 - `severity_threshold` filters security findings (critical, high, medium, low)
 
+## Argument Spellings
+
+Two families name their target differently, and both spellings are accepted by
+every tool in either family:
+
+- Call-graph and flow tools declare `function` (`get_callers`, `get_callees`,
+  `get_call_graph`, `get_complexity`, `get_control_flow`, `get_data_flow`,
+  `get_reaching_definitions`, `find_dead_code`, `find_dead_stores`,
+  `find_uninitialized`, `infer_types`, `find_semantic_clones`)
+- Symbol tools declare `symbol` (`get_symbol_definition`, `find_references`,
+  `find_symbol_usages`, `find_similar_to_symbol`, `get_symbol_history`)
+
+Passing `symbol` to `get_callers` or `function` to `find_symbol_usages` works.
+`get_metrics` takes only `format` - it has no `repo` or `path`; per-repository
+figures come from `get_index_status`.
+
 ## Troubleshooting
 
-**"No repository found"** → Run `list_repos` and use exact repo name
+**A narsil server is not connected at all** → Check the session's MCP status before anything else. A `CONNECTION_CLOSED` server offers no tools; that is a configuration fact, not evidence about the code
+
+**"No repository found"** → Run `list_repos` **on that server** and use the exact repo name; names differ between servers
 
 **Results from the wrong codebase** → You omitted `repo`; searches span every indexed repository by default
+
+**`search_code` returned hits but not the one that matters** → It truncates to `max_results` (default 10) after ranking, and its scoring favours definition lines. Use `find_symbol_usages` for call sites, or narrow with `file_pattern`
 
 **Empty results from git tools** → Check `get_index_status` shows git enabled
 

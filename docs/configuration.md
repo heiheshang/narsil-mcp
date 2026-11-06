@@ -1,3 +1,5 @@
+[← Installation Guide](INSTALL.md) · [Back to README](../README.md) · [Integrations →](integrations.md)
+
 # Configuration Guide
 
 narsil-mcp supports flexible configuration through multiple layers, allowing you to customize tool availability, presets, and behavior at different levels.
@@ -9,6 +11,7 @@ narsil-mcp supports flexible configuration through multiple layers, allowing you
 - [Configuration File Format](#configuration-file-format)
 - [Presets](#presets)
 - [Named Repository Profiles](#named-repository-profiles)
+- [Git Worktrees](#git-worktrees)
 - [Environment Variables](#environment-variables)
 - [CLI Commands](#cli-commands)
 - [Categories](#categories)
@@ -98,6 +101,59 @@ narsil-mcp config profiles
 
 CLI flags still win, so `narsil-mcp --profile platform --repos ~/src/one-off`
 uses the explicit `--repos` value while keeping profile feature defaults.
+
+A profile can also set `worktrees: lazy | eager | off` — see
+[Git Worktrees](#git-worktrees).
+
+## Git Worktrees
+
+The linked git worktrees of every repository in `--repos` are found at startup
+with `git worktree list`. Each becomes a repository of its own; nothing has to
+be added to `--repos`, and worktrees created after startup are found when first
+addressed.
+
+| Flag | Env | Default | Meaning |
+|------|-----|---------|---------|
+| `--worktrees <mode>` | `NARSIL_WORKTREES` | `lazy` | `lazy`: registered at startup, indexed on first use. `eager`: indexed in the background after the repositories. `off`: not discovered (behaviour before worktree support). |
+| `--worktree-index-wait-secs <n>` | `NARSIL_WORKTREE_INDEX_WAIT_SECS` | `60` | How long a tool call waits for a worktree to be indexed. Past that the call returns and indexing continues in the background. |
+
+**Addressing a worktree** — any tool's `repo` argument accepts:
+
+| Form | Example | Notes |
+|------|---------|-------|
+| `<repo>@<directory>` | `narsil-mcp@fix-install-fork` | The name shown by `list_repos`. A second worktree with the same directory name gets `~2`. |
+| `<repo>@<branch>` | `app@feature-login` for branch `feature/login` | `/` in the branch is written as `-`. |
+| Absolute path | `/home/me/src/app/.claude/worktrees/x` | A path below the worktree root works too. |
+
+`<repo>` without `@` always means the main checkout, even when the server runs
+inside a worktree.
+
+**Behaviour:**
+
+- The worktree the server process was started in is indexed right away, in the
+  background.
+- A call to a worktree that is not indexed yet indexes it first. If that takes
+  longer than the wait, the call fails with `Worktree '…' is being indexed; retry
+  the request shortly`; progress is in `get_index_status`.
+- A search without `repo` covers only repositories that are indexed, so it does
+  not index every worktree at once.
+- A worktree inside the main repository's tree (for example
+  `.claude/worktrees/x`) is excluded from the main repository's walk and results.
+- With `--persist`, each worktree gets its own index database. With `--watch`,
+  it is watched once indexed, and a worktree created inside a watched tree is
+  registered as soon as its `.git` file appears. A removed worktree is dropped
+  from every index.
+- Search documents of worktrees not indexed in the current run are dropped at
+  startup, so a worktree's first use after a restart rebuilds its search
+  documents (its symbols still come from its index database).
+- When a repository in `--repos` is a subdirectory of its checkout (a package
+  in a monorepo), each worktree is indexed at the same subdirectory, not as a
+  whole.
+- An HTTP server shared by several clients can index a worktree by path only if
+  that path exists on the server's host.
+
+`list_repos` and `get_index_status` list the worktrees with their branch and
+state (`not indexed yet`, `indexing`, `indexed`, `failed`).
 
 ## Configuration Levels
 
@@ -373,6 +429,16 @@ export NARSIL_PROFILE=platform
 narsil-mcp
 ```
 
+### NARSIL_WORKTREES and NARSIL_WORKTREE_INDEX_WAIT_SECS
+
+How git worktrees are handled (`lazy`, `eager`, `off`) and how long a call waits
+for one to be indexed — see [Git Worktrees](#git-worktrees):
+
+```bash
+export NARSIL_WORKTREES=eager
+export NARSIL_WORKTREE_INDEX_WAIT_SECS=120
+```
+
 ### NARSIL_ENABLED_CATEGORIES
 
 Enable only specific categories (comma-separated):
@@ -402,6 +468,17 @@ This will:
 - Keep all other tools enabled
 - Disable only the specified tools
 - Override tool settings from config files
+
+### RUST_LOG and NARSIL_TRACE_SPANS
+
+`RUST_LOG` sets the log filter (stderr). Without it the filter is `info`, or `debug`
+with `--verbose`; an unparsable value is ignored with a warning.
+`NARSIL_TRACE_SPANS=1` adds a `close` event with `time.busy` and `time.idle` for every
+span: indexing phases and tool calls. See [Profiling](profiling.md).
+
+```bash
+NARSIL_TRACE_SPANS=1 RUST_LOG=narsil_mcp=debug narsil-mcp --repos ~/project
+```
 
 ### Combining Environment Variables
 
@@ -1045,9 +1122,157 @@ narsil-mcp --repos . --git
    yamllint ~/.config/narsil-mcp/config.yaml
    ```
 
+
+## Quick Reference: CLI, presets and config commands
+
+**v1.1.0+ introduces optional configuration** for fine-grained control over tools and performance. **All existing usage continues to work** - configuration is completely optional!
+
+#### Quick Start
+
+```bash
+# Generate default config interactively
+narsil-mcp config init
+
+# List available tools
+narsil-mcp tools list
+
+# Apply a preset via CLI
+narsil-mcp --repos ~/project --preset minimal
+```
+
+#### Automatic Editor Detection
+
+narsil-mcp detects your editor and applies an optimal preset automatically:
+
+| Editor | Preset | Tools | Context Tokens | Why |
+|--------|--------|-------|----------------|-----|
+| **Zed** | Minimal | 26 | ~4,686 | Fast startup, minimal context |
+| **VS Code** | Balanced | 51 | ~8,948 | Good feature balance |
+| **Claude Desktop** | Full | 90 | ~12,001 | Maximum capabilities |
+
+**Token Savings:**
+- **Minimal preset:** 61% fewer tokens vs Full
+- **Balanced preset:** 25% fewer tokens vs Full
+
+#### Presets
+
+Choose a preset based on your use case:
+
+```bash
+# Minimal - Fast, lightweight (Zed, Cursor)
+narsil-mcp --repos ~/project --preset minimal
+
+# Balanced - Good defaults (VS Code, IntelliJ)
+narsil-mcp --repos ~/project --preset balanced --git --call-graph
+
+# Full - All features (Claude Desktop, comprehensive analysis)
+narsil-mcp --repos ~/project --preset full --git --call-graph
+
+# Security-focused - Security and supply chain tools
+narsil-mcp --repos ~/project --preset security-focused
+```
+
+#### Configuration Files
+
+**User config** (`~/.config/narsil-mcp/config.yaml`):
+
+```yaml
+version: "1.0"
+preset: "balanced"
+
+tools:
+  # Disable slow tools
+  overrides:
+    neural_search:
+      enabled: false
+      reason: "Too slow for interactive use"
+
+performance:
+  max_tool_count: 50  # Limit total tools
+```
+
+**Project config** (`.narsil.yaml` in repo root):
+
+```yaml
+version: "1.0"
+preset: "security-focused"  # Override user preset
+
+tools:
+  categories:
+    Security:
+      enabled: true
+    SupplyChain:
+      enabled: true
+```
+
+**Named repository profiles** are useful for multi-repo workspaces:
+
+```yaml
+version: "1.0"
+profiles:
+  platform:
+    repos:
+      - ~/src/api
+      - ~/src/web
+    git: true
+    call_graph: true
+    persist: true
+    preset: balanced
+```
+
+```bash
+narsil-mcp --profile platform
+narsil-mcp config profiles
+```
+
+**Priority:** CLI flags > Environment vars > Project config > User config > Defaults
+
+#### Environment Variables
+
+```bash
+# Select repos/profile
+export NARSIL_REPOS=~/src/api,~/src/web
+export NARSIL_PROFILE=platform
+
+# Apply preset
+export NARSIL_PRESET=minimal
+
+# Enable specific categories
+export NARSIL_ENABLED_CATEGORIES=Repository,Symbols,Search
+
+# Disable specific tools
+export NARSIL_DISABLED_TOOLS=neural_search,generate_sbom
+```
+
+#### CLI Commands
+
+```bash
+# View effective config
+narsil-mcp config show
+
+# Validate config file
+narsil-mcp config validate ~/.config/narsil-mcp/config.yaml
+
+# List tools by category
+narsil-mcp tools list --category Search
+
+# Search for tools
+narsil-mcp tools search "git"
+
+# Export config
+narsil-mcp config export > my-config.yaml
+
+# List named repository profiles
+narsil-mcp config profiles
+```
+
+**Learn More:**
+- [Configuration Guide](configuration.md) - Full configuration reference
+- [Installation Guide](INSTALL.md) - Platform-specific installation
+
 ## See Also
 
-- [Migration Guide](./migration.md) - Upgrading from previous versions
+- [Changelog](../CHANGELOG.md) - Upgrading from previous versions
 - [Example Configurations](../examples/configs/README.md) - Ready-to-use config templates
 - [README](../README.md) - Main project documentation
 - [Tool Reference](../README.md#mcp-tools-90-total) - Complete tool documentation

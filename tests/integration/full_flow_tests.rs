@@ -6,7 +6,7 @@ use narsil_mcp::config::schema::{
     CategoryConfig, PerformanceConfig, ToolConfig, ToolOverride, ToolsConfig,
 };
 use narsil_mcp::config::ToolFilter;
-use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 use narsil_mcp::tool_metadata::TOOL_METADATA;
 use std::collections::HashMap;
 use std::path::PathBuf;

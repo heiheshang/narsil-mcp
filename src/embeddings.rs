@@ -7,7 +7,8 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::search::tokenize_code;
@@ -38,6 +39,9 @@ pub trait EmbeddingProvider: Send + Sync {
 pub struct TfIdfEmbedding {
     /// Global term frequencies across all documents
     document_freq: HashMap<String, usize>,
+    /// The terms of `document_freq` in pruning order, best first: by document
+    /// frequency, highest first, then by the term. Pruning drops from the end.
+    ranked: BTreeSet<(Reverse<usize>, String)>,
     /// Total number of documents
     total_docs: usize,
     /// Vector dimensionality, and the modulus of the term-slot hash
@@ -49,6 +53,7 @@ impl TfIdfEmbedding {
     pub fn new(max_vocab_size: usize) -> Self {
         Self {
             document_freq: HashMap::new(),
+            ranked: BTreeSet::new(),
             total_docs: 0,
             max_vocab_size,
         }
@@ -56,11 +61,27 @@ impl TfIdfEmbedding {
 
     /// Add a document to update the IDF statistics
     pub fn add_document(&mut self, text: &str) {
-        let tokens = tokenize_code(text);
-        let unique_tokens: std::collections::HashSet<_> = tokens.into_iter().collect();
+        self.add_document_tokens(&tokenize_code(text));
+    }
+
+    /// [`add_document`](Self::add_document) for text already run through
+    /// [`tokenize_code`].
+    fn add_document_tokens(&mut self, tokens: &[String]) {
+        let unique_tokens: std::collections::HashSet<&String> = tokens.iter().collect();
 
         for token in unique_tokens {
-            *self.document_freq.entry(token).or_insert(0) += 1;
+            let df = match self.document_freq.get_mut(token) {
+                Some(df) => {
+                    self.ranked.remove(&(Reverse(*df), token.clone()));
+                    *df += 1;
+                    *df
+                }
+                None => {
+                    self.document_freq.insert(token.clone(), 1);
+                    1
+                }
+            };
+            self.ranked.insert((Reverse(df), token.clone()));
         }
 
         self.total_docs += 1;
@@ -95,19 +116,15 @@ impl TfIdfEmbedding {
             return;
         }
 
-        let mut ranked: Vec<(&str, usize)> = self
-            .document_freq
-            .iter()
-            .map(|(term, &df)| (term.as_str(), df))
-            .collect();
-        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-
-        let keep: std::collections::HashSet<String> = ranked
-            .iter()
-            .take(limit)
-            .map(|(term, _)| (*term).to_string())
-            .collect();
-        self.document_freq.retain(|term, _| keep.contains(term));
+        // Once the map is full this runs on almost every insert, usually to
+        // drop a single term. `ranked` is kept in order as counts change, so
+        // that is a pop, not a pass over the whole vocabulary.
+        while self.document_freq.len() > limit {
+            let Some((_, term)) = self.ranked.pop_last() else {
+                break;
+            };
+            self.document_freq.remove(&term);
+        }
     }
 
     /// Compute IDF for a term (with smoothing to avoid zero values)
@@ -146,13 +163,24 @@ impl TfIdfEmbedding {
 
 impl EmbeddingProvider for TfIdfEmbedding {
     fn embed(&self, text: &str) -> Vec<f32> {
-        let tokens = tokenize_code(text);
+        self.embed_tokens(&tokenize_code(text))
+    }
+
+    fn dimension(&self) -> usize {
+        self.max_vocab_size
+    }
+}
+
+impl TfIdfEmbedding {
+    /// [`embed`](EmbeddingProvider::embed) for text already run through
+    /// [`tokenize_code`].
+    fn embed_tokens(&self, tokens: &[String]) -> Vec<f32> {
         let total_terms = tokens.len();
 
         // Count term frequencies
-        let mut term_freq: HashMap<String, usize> = HashMap::new();
-        for token in &tokens {
-            *term_freq.entry(token.clone()).or_insert(0) += 1;
+        let mut term_freq: HashMap<&str, usize> = HashMap::new();
+        for token in tokens {
+            *term_freq.entry(token.as_str()).or_insert(0) += 1;
         }
 
         // Build TF-IDF vector
@@ -173,10 +201,6 @@ impl EmbeddingProvider for TfIdfEmbedding {
         normalize_vector(&mut vector);
 
         vector
-    }
-
-    fn dimension(&self) -> usize {
-        self.max_vocab_size
     }
 }
 
@@ -383,6 +407,30 @@ impl VectorStore {
         self.documents.clear();
         self.id_to_idx.clear();
     }
+
+    /// Drop every document of `repo`; returns how many were dropped.
+    pub fn remove_repo(&mut self, repo: &str) -> usize {
+        self.remove_where(|doc| &*doc.repo == repo)
+    }
+
+    /// Drop the documents of `repo` whose file lies under `dir` (relative).
+    pub fn remove_under(&mut self, repo: &str, dir: &std::path::Path) -> usize {
+        self.remove_where(|doc| {
+            &*doc.repo == repo && std::path::Path::new(&doc.file_path).starts_with(dir)
+        })
+    }
+
+    fn remove_where(&mut self, drop: impl Fn(&EmbeddedDocument) -> bool) -> usize {
+        let before = self.documents.len();
+        self.documents.retain(|doc| !drop(doc));
+        self.id_to_idx = self
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(idx, doc)| (crate::search::scoped_doc_id(&doc.repo, &doc.id), idx))
+            .collect();
+        before - self.documents.len()
+    }
 }
 
 impl Default for VectorStore {
@@ -446,11 +494,63 @@ impl ConcurrentVectorStore {
     pub fn clear(&self) {
         self.inner.write().clear();
     }
+
+    pub fn remove_repo(&self, repo: &str) -> usize {
+        self.inner.write().remove_repo(repo)
+    }
+
+    pub fn remove_under(&self, repo: &str, dir: &std::path::Path) -> usize {
+        self.inner.write().remove_under(repo, dir)
+    }
 }
 
 impl Default for ConcurrentVectorStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// What [`EmbeddingEngine::to_snapshot`] writes after the stamp.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    max_vocab_size: usize,
+    total_docs: usize,
+    /// Sorted by term; `ranked` is rebuilt from it.
+    document_freq: Vec<(String, usize)>,
+    /// Repository tags and file paths, stored once.
+    strings: Vec<String>,
+    documents: Vec<SnapshotDocument>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotDocument {
+    /// The id, or only what follows `file::` when `id_after_file`.
+    id: String,
+    id_after_file: bool,
+    repo: u32,
+    file: u32,
+    content: String,
+    start_line: usize,
+    end_line: usize,
+    embedding: Vec<(u32, f32)>,
+}
+
+/// Index of each distinct string, in first-seen order.
+#[derive(Default)]
+struct SnapshotStrings {
+    strings: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl SnapshotStrings {
+    fn id(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.index.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.index.insert(s.to_string(), id);
+        id
     }
 }
 
@@ -508,13 +608,62 @@ impl EmbeddingEngine {
         end_line: usize,
         keep_text: bool,
     ) {
-        // Update IDF statistics
-        self.provider.write().add_document(&content);
-
-        // Generate embedding (dense), then pack it sparse before storing.
-        let embedding = to_sparse(&self.provider.read().embed(&content));
-
+        // Tokenized once: the IDF update and the embedding read the same tokens.
+        let tokens = tokenize_code(&content);
         let stored_text = if keep_text { content } else { String::new() };
+        self.index_tokens_inner(
+            id,
+            repo,
+            file_path,
+            stored_text,
+            &tokens,
+            start_line,
+            end_line,
+        );
+    }
+
+    /// [`index_snippet_embed_only`](Self::index_snippet_embed_only) for a
+    /// snippet already run through [`tokenize_code`].
+    ///
+    /// Tokenizing is pure, so a caller may do it in parallel; the IDF update
+    /// and the embedding are not, and must still arrive in indexing order.
+    pub fn index_tokens_embed_only(
+        &self,
+        id: String,
+        repo: Arc<str>,
+        file_path: String,
+        tokens: &[String],
+        start_line: usize,
+        end_line: usize,
+    ) {
+        self.index_tokens_inner(
+            id,
+            repo,
+            file_path,
+            String::new(),
+            tokens,
+            start_line,
+            end_line,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn index_tokens_inner(
+        &self,
+        id: String,
+        repo: Arc<str>,
+        file_path: String,
+        stored_text: String,
+        tokens: &[String],
+        start_line: usize,
+        end_line: usize,
+    ) {
+        let embedding = {
+            let mut provider = self.provider.write();
+            provider.add_document_tokens(tokens);
+            // Generate embedding (dense), then pack it sparse before storing.
+            to_sparse(&provider.embed_tokens(tokens))
+        };
 
         // Store the embedded document
         self.store.add(EmbeddedDocument {
@@ -583,11 +732,142 @@ impl EmbeddingEngine {
         (docs, content_bytes, embedding_bytes, index_bytes, df_bytes)
     }
 
+    /// Whether nothing has been indexed yet.
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty() && self.provider.read().total_docs == 0
+    }
+
+    /// The whole state as postcard bytes, prefixed by `stamp`: the IDF
+    /// statistics and every document in insertion order. Each document's
+    /// vector was computed against the statistics at its insertion, so only
+    /// the complete state reproduces the engine; the order also decides ties
+    /// between equally similar documents.
+    pub fn to_snapshot(&self, stamp: &str) -> anyhow::Result<Vec<u8>> {
+        let provider = self.provider.read();
+        let mut document_freq: Vec<(String, usize)> = provider
+            .document_freq
+            .iter()
+            .map(|(term, df)| (term.clone(), *df))
+            .collect();
+        document_freq.sort_unstable();
+        let store = self.store.inner.read();
+        let mut strings = SnapshotStrings::default();
+        let documents = store
+            .documents
+            .iter()
+            .map(|doc| {
+                let file = strings.id(&doc.file_path);
+                // Symbol ids are `file::name`; the file is already in `file`.
+                let (id_after_file, id) = match doc
+                    .id
+                    .strip_prefix(doc.file_path.as_str())
+                    .and_then(|rest| rest.strip_prefix("::"))
+                {
+                    Some(rest) => (true, rest.to_string()),
+                    None => (false, doc.id.clone()),
+                };
+                SnapshotDocument {
+                    id,
+                    id_after_file,
+                    repo: strings.id(&doc.repo),
+                    file,
+                    content: doc.content.clone(),
+                    start_line: doc.start_line,
+                    end_line: doc.end_line,
+                    embedding: doc.embedding.clone(),
+                }
+            })
+            .collect();
+        let snapshot = Snapshot {
+            max_vocab_size: provider.max_vocab_size,
+            total_docs: provider.total_docs,
+            document_freq,
+            strings: strings.strings,
+            documents,
+        };
+        let bytes = postcard::to_stdvec(stamp)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize TF-IDF state: {e}"))?;
+        postcard::to_extend(&snapshot, bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize TF-IDF state: {e}"))
+    }
+
+    /// Replace the whole state with the snapshot, provided it carries `stamp`
+    /// and was made with this engine's dimension. Returns whether it was
+    /// loaded; otherwise the engine is left as it was.
+    pub fn from_snapshot(&self, bytes: &[u8], stamp: &str) -> anyhow::Result<bool> {
+        let (saved_stamp, rest) = postcard::take_from_bytes::<String>(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize TF-IDF state: {e}"))?;
+        if saved_stamp != stamp {
+            return Ok(false);
+        }
+        let snapshot: Snapshot = postcard::from_bytes(rest)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize TF-IDF state: {e}"))?;
+        if snapshot.max_vocab_size != self.provider.read().max_vocab_size {
+            return Ok(false);
+        }
+        let strings: Vec<Arc<str>> = snapshot
+            .strings
+            .iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect();
+        let text = |id: u32| {
+            strings.get(id as usize).cloned().ok_or_else(|| {
+                anyhow::anyhow!("TF-IDF snapshot refers to string {id} of {}", strings.len())
+            })
+        };
+        let mut documents = Vec::with_capacity(snapshot.documents.len());
+        for doc in snapshot.documents {
+            let file_path = text(doc.file)?;
+            let id = if doc.id_after_file {
+                format!("{file_path}::{}", doc.id)
+            } else {
+                doc.id
+            };
+            documents.push(EmbeddedDocument {
+                id,
+                repo: text(doc.repo)?,
+                file_path: file_path.to_string(),
+                content: doc.content,
+                start_line: doc.start_line,
+                end_line: doc.end_line,
+                embedding: doc.embedding,
+            });
+        }
+
+        // Decoded in full before anything is replaced.
+        let mut provider = self.provider.write();
+        let mut store = self.store.inner.write();
+        provider.document_freq.clear();
+        provider.ranked.clear();
+        for (term, df) in snapshot.document_freq {
+            provider.ranked.insert((Reverse(df), term.clone()));
+            provider.document_freq.insert(term, df);
+        }
+        provider.total_docs = snapshot.total_docs;
+        store.clear();
+        for doc in documents {
+            store.add(doc);
+        }
+        Ok(true)
+    }
+
+    /// Drop the documents of one repository. Document frequencies keep its
+    /// terms until the next full rebuild.
+    pub fn remove_repo(&self, repo: &str) -> usize {
+        self.store.remove_repo(repo)
+    }
+
+    /// Drop the documents of `repo` whose file lies under `dir` (relative).
+    pub fn remove_under(&self, repo: &str, dir: &std::path::Path) -> usize {
+        self.store.remove_under(repo, dir)
+    }
+
     /// Clear all data
     pub fn clear(&self) {
         self.store.clear();
         let mut provider = self.provider.write();
         provider.document_freq.clear();
+        provider.ranked.clear();
         provider.total_docs = 0;
     }
 }
@@ -595,6 +875,48 @@ impl EmbeddingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot must reproduce the engine exactly: the same documents in the
+    /// same order with the same vectors, and the same statistics for what is
+    /// embedded next.
+    #[test]
+    fn test_snapshot_round_trip_reproduces_engine() {
+        let engine = EmbeddingEngine::new(64);
+        let repo: Arc<str> = Arc::from("r");
+        for (i, text) in ["fn alpha(x: i32)", "fn beta() -> bool", "Процедура Гамма()"]
+            .iter()
+            .enumerate()
+        {
+            engine.index_tokens_embed_only(
+                format!("src/a.rs::f{i}"),
+                Arc::clone(&repo),
+                "src/a.rs".to_string(),
+                &tokenize_code(text),
+                i + 1,
+                i + 2,
+            );
+        }
+        engine.index_snippet_embed_only(
+            "Catalogs.Товары".to_string(),
+            Arc::clone(&repo),
+            "Catalogs/Товары.xml".to_string(),
+            "Справочник Товары".to_string(),
+            1,
+            1,
+        );
+
+        let bytes = engine.to_snapshot("s").unwrap();
+        let loaded = EmbeddingEngine::new(64);
+        assert!(!loaded.from_snapshot(&bytes, "other").unwrap());
+        assert!(loaded.is_empty());
+        assert!(loaded.from_snapshot(&bytes, "s").unwrap());
+        assert_eq!(loaded.to_snapshot("s").unwrap(), bytes);
+        assert_eq!(
+            format!("{:?}", loaded.find_similar_code("fn alpha", 10)),
+            format!("{:?}", engine.find_similar_code("fn alpha", 10))
+        );
+        assert!(!EmbeddingEngine::new(32).from_snapshot(&bytes, "s").unwrap());
+    }
 
     #[test]
     fn test_tfidf_embedding() {
@@ -637,6 +959,41 @@ mod tests {
         // Embedding dimension stays the configured size.
         let embedding = tfidf.embed("fn_42");
         assert_eq!(embedding.len(), tfidf.max_vocab_size);
+    }
+
+    #[test]
+    fn test_document_freq_pruning_keeps_the_top_ranked_terms() {
+        let mut tfidf = TfIdfEmbedding::new(8);
+        let mut reference: HashMap<String, usize> = HashMap::new();
+        let limit = tfidf.max_vocab_size * 2;
+
+        for i in 0..400 {
+            let text = format!("common_{} shared_{} rare_{i} rare_b{i}", i % 3, i % 7);
+            tfidf.add_document(&text);
+
+            let unique: std::collections::HashSet<_> = tokenize_code(&text).into_iter().collect();
+            for token in unique {
+                *reference.entry(token).or_insert(0) += 1;
+            }
+            if reference.len() > limit {
+                let mut ranked: Vec<(String, usize)> =
+                    reference.iter().map(|(t, &df)| (t.clone(), df)).collect();
+                ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(limit);
+                reference = ranked.into_iter().collect();
+            }
+
+            assert_eq!(
+                tfidf.document_freq, reference,
+                "diverged after document {i}"
+            );
+            let ranked: HashMap<String, usize> = tfidf
+                .ranked
+                .iter()
+                .map(|(Reverse(df), term)| (term.clone(), *df))
+                .collect();
+            assert_eq!(ranked, reference, "ranking out of sync after document {i}");
+        }
     }
 
     #[test]

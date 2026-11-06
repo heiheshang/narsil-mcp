@@ -1,3 +1,5 @@
+[← Roadmap](roadmap.md) · [Back to README](../README.md) · [Licensing →](LICENSING.md)
+
 # Code Context Graph (CCG) Specification v0.2
 
 **Version:** 0.2
@@ -697,3 +699,8 @@ https://codecontextgraph.com/schema/v1
 ---
 
 *"The graph is the spec. The spec is the graph."*
+
+## See Also
+
+- [Available Tools](tools.md) — CCG tools
+- [Architecture](architecture.md) — where CCG fits

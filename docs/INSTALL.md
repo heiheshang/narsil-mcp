@@ -1,3 +1,5 @@
+[← Getting Started](getting-started.md) · [Back to README](../README.md) · [Configuration →](configuration.md)
+
 # Installation Guide
 
 narsil-mcp can be installed via multiple package managers depending on your platform.
@@ -216,3 +218,8 @@ cargo uninstall narsil-mcp
 ```bash
 npm uninstall -g narsil-mcp
 ```
+
+## See Also
+
+- [Getting Started](getting-started.md) — quick install and first run
+- [Troubleshooting](troubleshooting.md) — build and runtime problems

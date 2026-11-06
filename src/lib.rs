@@ -1,6 +1,19 @@
 // Library exports for integration tests
 #![recursion_limit = "256"]
 
+/// A `DashMap` hashed with `ahash` instead of the default SipHash-based
+/// `RandomState` — for index-time maps hot enough (one entry per symbol/file,
+/// looked up per call site across a large corpus) that SipHash's DoS
+/// resistance costs real throughput. See the longer note on
+/// `callgraph::CallGraph::nodes` for why that tradeoff is accepted even
+/// though narsil-mcp's own supply-chain-audit use case means these keys can
+/// come from adversarial (vendored, untrusted) source.
+///
+/// One alias instead of five hand-written `DashMap<K, V, ahash::RandomState>`
+/// declarations spread across `callgraph.rs`/`engine/mod.rs`: changing the hasher
+/// choice is then one edit, not five kept in lockstep by hand.
+pub(crate) type FastMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
+
 // Core modules (always available)
 pub mod cache;
 pub mod callgraph;
@@ -24,8 +37,10 @@ pub mod store;
 pub mod supply_chain;
 pub mod symbols;
 pub mod taint;
+pub mod tantivy_index;
 pub mod text;
 pub mod tool_metadata;
+pub mod trigram;
 pub mod type_inference;
 pub mod validation;
 
@@ -38,6 +53,8 @@ pub mod persistence;
 pub mod ccg;
 
 // Native-only modules (require tokio, octocrab, lsp, etc.)
+#[cfg(feature = "native")]
+pub mod engine;
 #[cfg(feature = "native")]
 pub mod git;
 #[cfg(feature = "native")]
@@ -60,6 +77,8 @@ pub mod remote;
 pub mod streaming;
 #[cfg(feature = "native")]
 pub mod tool_handlers;
+#[cfg(feature = "native")]
+pub mod worktree;
 
 // WASM module (only compiled when targeting wasm32)
 #[cfg(feature = "wasm")]

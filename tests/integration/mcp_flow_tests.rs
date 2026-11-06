@@ -6,7 +6,7 @@
 /// 3. Tools list request
 /// 4. Filtered tool response
 use narsil_mcp::config::{ClientInfo, ConfigLoader, ToolFilter};
-use narsil_mcp::index::EngineOptions;
+use narsil_mcp::engine::EngineOptions;
 use narsil_mcp::tool_metadata::TOOL_METADATA;
 
 /// Test that the full MCP flow works correctly with VS Code

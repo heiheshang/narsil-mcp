@@ -1,8 +1,10 @@
+[← CCG Specification](ccg-spec.md) · [Back to README](../README.md) · [Repository Structure →](REPO_STRUCTURE.md)
+
 # Narsil Licensing Strategy: Open Core Model
 
 > **Version:** 1.0
 > **Last Updated:** January 2026
-> **Related Documents:** [NARSIL_BACKEND_MASTER_PLAN.md](./NARSIL_BACKEND_MASTER_PLAN.md), [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md)
+> **Related Documents:** NARSIL_BACKEND_MASTER_PLAN.md (private, not in this repository), [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md)
 
 ---
 
@@ -28,7 +30,7 @@ narsil-mcp/                         # MIT License - PUBLIC on GitHub
 ├── src/
 │   ├── mcp/                        # All 90 MCP tools
 │   ├── parser.rs                   # 32 language parsers
-│   ├── index.rs                    # Local indexing
+│   ├── engine/mod.rs               # Local indexing
 │   ├── cache/                      # Query caching
 │   ├── cfg.rs                      # Control flow analysis
 │   ├── dfg.rs                      # Data flow analysis
@@ -281,7 +283,7 @@ For licensing inquiries, contact: [licensing email]
 
 ### Can I contribute to narsil-mcp?
 
-**Yes, please!** Contributions to the open source repository are welcome under the MIT license. See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines.
+**Yes, please!** Contributions to the open source repository are welcome under the MIT license. See [Development](development.md) for guidelines.
 
 ### Will open source features ever become commercial?
 
@@ -306,3 +308,8 @@ For licensing inquiries, contact: [licensing email]
 - **Open Source Issues:** github.com/[org]/narsil-mcp/issues
 - **Commercial Inquiries:** [sales email]
 - **Security Reports:** [security email]
+
+## See Also
+
+- [Repository Structure](REPO_STRUCTURE.md) — open core separation
+- [Development](development.md) — contributing

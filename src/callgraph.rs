@@ -2,10 +2,15 @@
 //!
 //! This is critical for AI understanding of code flow and impact analysis.
 
+pub mod types;
+
+use crate::FastMap;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 /// A node in the call graph
@@ -27,15 +32,29 @@ pub struct CallNode {
     /// same-named methods apart.
     #[serde(default)]
     pub receiver: Option<String>,
+    /// The type this function returns, as written in its declaration: Go's
+    /// first non-`error` result, a Rust `-> T`, a TS annotation. What lets a
+    /// call on the value a call produced (`accountRepo(ctx).FindByUuid(id)`,
+    /// `svc := build()` then `svc.Run()`) be resolved on a type rather than
+    /// guessed among namesakes.
+    #[serde(default)]
+    pub result_type: Option<String>,
+    /// The method a BSL configuration extension intercepts here:
+    /// `&Перед("Имя")`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`. The
+    /// platform runs this procedure when `Имя` of the extended module is
+    /// called, so nothing in the source calls it by its own name;
+    /// [`CallGraph::link_extensions`] turns this into edges.
+    #[serde(default)]
+    pub intercepts: Option<String>,
 }
 
 /// An edge in the call graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEdge {
     /// Target function name
-    pub target: String,
+    pub target: Arc<str>,
     /// File containing the call
-    pub file_path: String,
+    pub file_path: Arc<str>,
     /// Line of the call site
     pub line: usize,
     /// Column of the call site
@@ -44,7 +63,7 @@ pub struct CallEdge {
     pub call_type: CallType,
     /// Scope qualifier from the call site (e.g. "App" from `App::run()`)
     #[serde(default)]
-    pub scope_hint: Option<String>,
+    pub scope_hint: Option<Arc<str>>,
     /// Whether the target was resolved to a known function in the graph.
     /// False when the callee name had no matching node — `get_callers` must
     /// surface this instead of silently pretending the edge is complete.
@@ -67,15 +86,43 @@ pub enum CallResolution {
     Unique,
     /// The call qualifier named the target's receiver type (`Store::new()`).
     Receiver,
+    /// No receiver type was written at the call site: the call was chained onto
+    /// a factory or constructor call, and the type came from *its* name
+    /// (`SfxOperationUseFactory(c).Pay()` -> type `SfxOperationUse`). Exactly
+    /// one namesake is defined on that type, so this is a strong candidate —
+    /// but the type was inferred from a naming convention, not read. In BSL,
+    /// a `МодульX.Процедура()` call resolved to common module `X`.
+    FactoryReceiver,
+    /// The qualifier named an interface, and exactly one type in the index
+    /// implements it — carries every method the interface declares — so the
+    /// call was resolved on that type. Dispatch is dynamic: another
+    /// implementation could be introduced, or injected from outside the index,
+    /// which is why this is a strong candidate rather than a fact.
+    InterfaceImpl,
     /// The qualifier matched the target's module or file path.
     Scope,
     /// Several namesakes; the one in the caller's own file was taken.
     SameFile,
     /// Several namesakes and nothing to choose between them — the target is a
-    /// deterministic pick, not a fact.
+    /// deterministic pick, not a fact. Also a Rust method call on a value of
+    /// unknown type whose name the standard library defines as well
+    /// (`entry.key()`), where the one project method is only a candidate.
     NameOnly,
-    /// No function of that name is in the graph (third-party, stdlib, macro).
+    /// No function of that name is in the graph, and nothing at the call site
+    /// says where it went: a stdlib or builtin name, a macro, a method on a
+    /// value whose type was never written down. The residual case — the two
+    /// variants below are the ones the call site actually explains.
     Unresolved,
+    /// The call leaves the index, and the source says so: the qualifier named
+    /// an import that resolves to no indexed package (`assert.Len`), or a
+    /// local declared as a type from outside this repository (`wg.Add`).
+    /// Nothing is missing from the graph — the target is not project code.
+    ExternalPackage,
+    /// The qualifier named a package that *is* indexed, which carries no
+    /// function of that name: a method reached through a value, or a file the
+    /// index skipped. Unlike [`ExternalPackage`](Self::ExternalPackage) this
+    /// is a gap in what was read, so it is the count worth acting on.
+    PackageMissing,
 }
 
 impl CallResolution {
@@ -84,19 +131,35 @@ impl CallResolution {
         matches!(self, Self::Unique | Self::Receiver | Self::Scope)
     }
 
+    /// Does this edge point outside the graph — no target function at all,
+    /// whatever the reason? Reports have to group these three together
+    /// wherever they ask "did this call resolve", and equality against a
+    /// single variant silently stopped covering that the moment the reasons
+    /// were split apart.
+    pub fn is_outside_graph(self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved | Self::ExternalPackage | Self::PackageMissing
+        )
+    }
+
     /// Short label for reports; `None` for edges that need no caveat.
     pub fn caveat(self) -> Option<&'static str> {
         match self {
+            Self::FactoryReceiver => Some("receiver inferred from a naming convention"),
+            Self::InterfaceImpl => Some("single implementation of the interface"),
             Self::SameFile => Some("same-file match"),
             Self::NameOnly => Some("name match only"),
             Self::Unresolved => Some("not in graph"),
+            Self::ExternalPackage => Some("not in graph, outside the index"),
+            Self::PackageMissing => Some("not in graph, indexed package has no such function"),
             Self::Unknown => Some("match unrecorded"),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum CallType {
     Direct,       // foo()
     Method,       // obj.foo()
@@ -104,6 +167,8 @@ pub enum CallType {
     Closure,      // let f = foo; f()
     Async,        // foo().await
     Spawn,        // spawn(foo)
+    Callback,     // Новый ОписаниеОповещения("Обработчик", ЭтотОбъект)
+    Extension,    // &Вместо("Метод"): the extended method runs the extension's
     Unknown,
 }
 
@@ -124,16 +189,130 @@ pub struct FunctionMetrics {
     pub cognitive: usize,
 }
 
+/// What [`CallGraph::to_snapshot`] writes after the stamp. The names, paths
+/// and targets that every edge repeats are stored once, in `strings`, and
+/// referred to by index.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    strings: Vec<String>,
+    nodes: Vec<SnapshotNode>,
+    name_index: Vec<(u32, Vec<u32>)>,
+    file_functions: Vec<(u32, Vec<u32>)>,
+    types: types::TypeSnapshot,
+    platform_entries: Vec<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotNode {
+    key: u32,
+    name: u32,
+    file_path: u32,
+    line: usize,
+    calls: Vec<SnapshotEdge>,
+    metrics: FunctionMetrics,
+    receiver: Option<String>,
+    result_type: Option<String>,
+    intercepts: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotEdge {
+    target: u32,
+    /// `None` when the call is in the file of the function making it.
+    file_path: Option<u32>,
+    line: usize,
+    column: usize,
+    call_type: CallType,
+    scope_hint: Option<u32>,
+    resolved: bool,
+    resolution: CallResolution,
+}
+
+/// Index of each distinct string, in first-seen order.
+#[derive(Default)]
+struct StringTable {
+    strings: Vec<String>,
+    index: ahash::AHashMap<String, u32>,
+}
+
+impl StringTable {
+    fn id(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.index.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.index.insert(s.to_string(), id);
+        id
+    }
+
+    fn ids(&mut self, list: &[String]) -> Vec<u32> {
+        list.iter().map(|s| self.id(s)).collect()
+    }
+}
+
+/// BSL module name (lowercased path segment) -> files under it.
+type BslModuleFiles = Arc<HashMap<String, Vec<String>>>;
+
 /// The call graph for a repository
 pub struct CallGraph {
-    /// Function name -> CallNode
-    nodes: DashMap<String, CallNode>,
+    /// Function name -> CallNode. Keys are derived from indexed source
+    /// files, not from network input reaching this process directly — but
+    /// narsil-mcp's own supply-chain/dependency-audit use case means "on
+    /// disk" can still mean "an adversarial vendored dependency the user
+    /// pointed the tool at". `ahash` trades SipHash's resistance to crafted
+    /// collisions for real speed on a map this hot (one entry per symbol,
+    /// looked up per call site across the corpus); the accepted risk is a
+    /// hostile repo degrading its own indexing run toward worst case, not a
+    /// security-boundary break — this is a single local process, not a
+    /// multi-tenant service where one attacker could starve other users.
+    nodes: FastMap<String, CallNode>,
     /// File -> Functions defined in that file
-    file_functions: DashMap<String, Vec<String>>,
+    file_functions: FastMap<String, Vec<String>>,
     /// Bare function name -> qualified keys. Lets `resolve_callee` look up
     /// candidates in O(1) instead of scanning every node per call site
     /// (O(N²) on a 469k-symbol corpus).
-    name_index: DashMap<String, Vec<String>>,
+    name_index: FastMap<String, Vec<String>>,
+    /// Lazily-memoized `file_path.to_lowercase()` per node key, used by
+    /// `resolve_callee`'s scope-hint disambiguation (`scope_matches_file_path`).
+    /// Not persisted: `CallGraph` is always reconstructed via `new()` then
+    /// repopulated (fresh parse or from a persisted snapshot), so recomputing
+    /// this once per key per process lifetime is cheap and needs no
+    /// serde-compat handling for caches written before this field existed.
+    file_path_lower_cache: FastMap<String, Arc<str>>,
+    /// Import path (as written in the source) -> the directory of the indexed
+    /// package it names, or `None` for a package that is not in the index at
+    /// all. Memoized because answering it means scanning the known file paths;
+    /// cleared whenever the set of indexed files changes, since both answers
+    /// depend on it. See [`package_dir_for`](CallGraph::package_dir_for).
+    import_dir_cache: FastMap<String, Option<Arc<str>>>,
+    /// Declared types of the indexed sources: fields, embedded types,
+    /// interface methods. What lets a qualifier naming a field or a value be
+    /// resolved on a type that was written down rather than guessed at.
+    types: types::TypeIndex,
+    /// `interface + \u{1} + type -> does that type carry every method the interface
+    /// declares`. Memoized because the check walks the interface's whole
+    /// method set through `name_index`, and the same handful of interfaces is
+    /// asked about at thousands of call sites. Cleared with the type index,
+    /// since both answers depend on the set of indexed files.
+    implements_cache: FastMap<String, bool>,
+    /// Interface name -> the method names it declares. Read on every
+    /// interface-qualified call site, and `TypeIndex` has to clone the vector
+    /// to hand it out; once per interface is enough.
+    interface_methods_cache: FastMap<String, Arc<Vec<String>>>,
+    /// BSL module name (a lowercased path segment: `общегоназначения`,
+    /// `склады`) -> the files under it. Built on first use, dropped whenever
+    /// functions are added or removed.
+    bsl_module_files: std::sync::RwLock<Option<BslModuleFiles>>,
+    /// `file::procedure` (procedure lowercased) -> why the 1C platform calls
+    /// it, from metadata XML: form handlers, event subscriptions, scheduled
+    /// jobs, services. See [`platform_entry_reason`](Self::platform_entry_reason).
+    platform_entries: DashMap<String, String>,
+    /// One copy of each target, path and hint the edges hold. Millions of
+    /// edges name a few hundred thousand distinct strings; each edge used to
+    /// carry its own copy. Not shrunk when functions are removed: the strings
+    /// of an incrementally re-indexed file stay until the graph is rebuilt.
+    strings: dashmap::DashSet<Arc<str>, ahash::RandomState>,
 }
 
 impl Default for CallGraph {
@@ -142,19 +321,202 @@ impl Default for CallGraph {
     }
 }
 
+/// Per-file constants of a call-site walk: the file being walked, and the
+/// packages its import list binds. A struct because these plus the
+/// enclosing-function state ([`FnScope`]) pushed `walk_for_calls` past a
+/// readable argument count.
+struct FileScope<'a> {
+    path: &'a str,
+    imports: &'a HashMap<String, String>,
+}
+
+/// A call site of a file whose calls are resolved after its tree is gone;
+/// see [`CallGraph::pending_file_calls`].
+pub struct PendingCall {
+    caller: String,
+    edge: CallEdge,
+    scope_inferred: bool,
+    /// An `ОписаниеОповещения` handler rather than a call.
+    callback: bool,
+}
+
+/// What a name in the enclosing function stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalKind {
+    /// Declared as this type.
+    Type(String),
+    /// Declared as something no method of this repository can sit on: a
+    /// builtin, a container, a type from a package outside the index. Recorded
+    /// rather than dropped, because `err.Error()` and `wg.Add(1)` are calls
+    /// into someone else's code, and the honest answer for them is "not in the
+    /// graph" — not this corpus's first `Error` by sort order.
+    Foreign,
+}
+
+/// What the walk knows about the function it is currently inside: its graph
+/// key, the type it is defined on (for `self` call sites), and what the names
+/// in it stand for.
+#[derive(Default)]
+struct FnScope {
+    function: Option<String>,
+    receiver: Option<String>,
+    locals: HashMap<String, LocalKind>,
+}
+
+/// Everything resolution can use about the place a call was written: the file
+/// (a tiebreaker among namesakes), the enclosing method's receiver type (for
+/// `self`), the names declared around it, and the file's imports (to tell a
+/// package qualifier from a variable). Passed as one value because these
+/// travel together through callee description, chained-call typing and local
+/// declaration reading.
+#[derive(Clone, Copy)]
+struct CallCtx<'a> {
+    file: &'a str,
+    self_type: Option<&'a str>,
+    locals: &'a HashMap<String, LocalKind>,
+    /// Declarations at the file's own top level. Kept apart from `locals`
+    /// because those are cleared on entering each function, while a
+    /// package-level `var limiter = ...` is in scope for all of them.
+    file_locals: &'a HashMap<String, LocalKind>,
+    imports: &'a HashMap<String, String>,
+}
+
+impl<'a> CallCtx<'a> {
+    /// The declared type of a name in scope, if it is one that can carry a
+    /// project method.
+    fn local_type(&self, name: &str) -> Option<&'a str> {
+        match self.declared(name) {
+            Some(LocalKind::Type(type_name)) => Some(type_name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_foreign_local(&self, name: &str) -> bool {
+        matches!(self.declared(name), Some(LocalKind::Foreign))
+    }
+
+    /// A function's own declaration shadows the package-level one, as in the
+    /// language itself.
+    fn declared(&self, name: &str) -> Option<&'a LocalKind> {
+        self.locals.get(name).or_else(|| self.file_locals.get(name))
+    }
+}
+
+/// Shared with the symbol parser, which labels methods with the same owner
+/// the call graph resolves calls against.
+pub(crate) fn is_type_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "trait_item"
+            | "class_definition"
+            | "class_declaration"
+            | "class_specifier"
+            | "struct_declaration"
+            | "struct_specifier"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "trait_declaration"
+            | "object_declaration"
+            | "protocol_declaration"
+            | "extension_declaration"
+            // Ruby
+            | "class"
+            | "module"
+    )
+}
+
+/// First type name in a subtree: `*Server` -> `Server`, `Store[T]` ->
+/// `Store`. Falls back to a plain identifier for grammars without a
+/// dedicated type node (Ruby constants, Python class names).
+pub(crate) fn first_type_identifier(node: Node, source: &[u8]) -> Option<String> {
+    fn walk(node: Node, kinds: &[&str], out: &mut Option<String>, source: &[u8]) {
+        if out.is_some() {
+            return;
+        }
+        if kinds.contains(&node.kind()) {
+            *out = node.utf8_text(source).ok().map(|s| s.to_string());
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, kinds, out, source);
+        }
+    }
+
+    let mut found = None;
+    walk(node, &["type_identifier"], &mut found, source);
+    if found.is_none() {
+        walk(
+            node,
+            &["identifier", "constant", "simple_identifier", "name"],
+            &mut found,
+            source,
+        );
+    }
+    found
+}
+
+/// The type a function is defined on, or `None` for a free function.
+///
+/// Go keeps it in the method's `receiver` field; every other supported
+/// language nests the function inside the `impl`/class/trait that owns it.
+pub(crate) fn extract_receiver_type(node: Node, source: &[u8]) -> Option<String> {
+    if let Some(receiver) = node.child_by_field_name("receiver") {
+        if let Some(name) = first_type_identifier(receiver, source) {
+            return Some(name);
+        }
+    }
+
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "impl_item" {
+            // Rust: `impl Foo` and `impl Trait for Foo` both own `Foo`.
+            return current
+                .child_by_field_name("type")
+                .and_then(|owner| first_type_identifier(owner, source));
+        }
+        if is_type_declaration(current.kind()) {
+            if let Some(name) = current
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok().map(|s| s.to_string()))
+            {
+                return Some(name);
+            }
+            // Python's root node is also called `module`; unlike Ruby's it
+            // names no type, so the walk continues past it.
+            if current.kind() != "module" {
+                return first_type_identifier(current, source);
+            }
+        }
+        ancestor = current.parent();
+    }
+    None
+}
+
 impl CallGraph {
     pub fn new() -> Self {
         Self {
-            nodes: DashMap::new(),
-            file_functions: DashMap::new(),
-            name_index: DashMap::new(),
+            nodes: DashMap::default(),
+            file_functions: DashMap::default(),
+            name_index: DashMap::default(),
+            file_path_lower_cache: DashMap::default(),
+            import_dir_cache: DashMap::default(),
+            types: types::TypeIndex::new(),
+            implements_cache: DashMap::default(),
+            interface_methods_cache: DashMap::default(),
+            bsl_module_files: std::sync::RwLock::new(None),
+            platform_entries: DashMap::default(),
+            strings: dashmap::DashSet::default(),
         }
     }
 
     /// Build call graph from parsed files (two passes over the same slice).
     pub fn build_from_files(&self, files: &[(String, String, Tree)]) -> Result<()> {
         self.collect_functions(files)?;
-        self.collect_calls(files)
+        self.collect_calls(files)?;
+        self.link_extensions();
+        Ok(())
     }
 
     /// First pass: collect function definitions from a batch of parsed files.
@@ -163,9 +525,27 @@ impl CallGraph {
     /// can stream files in chunks and drop each batch's parse trees, instead of
     /// holding every tree in memory at once.
     pub fn collect_functions(&self, files: &[(String, String, Tree)]) -> Result<()> {
-        for (path, content, tree) in files {
-            self.extract_functions(path, content, tree)?;
+        // The walk reads nothing but the file's own tree, so it runs in
+        // parallel. Insertion stays sequential and in file order: the order of
+        // `name_index` candidates and of type declarations is what resolution
+        // sees.
+        let walked: Vec<Vec<CallNode>> = files
+            .par_iter()
+            .map(|(path, content, tree)| {
+                let mut functions = Vec::new();
+                self.walk_for_functions(&mut tree.walk(), content.as_bytes(), path, &mut functions);
+                functions
+            })
+            .collect();
+        for ((path, content, tree), functions) in files.iter().zip(walked) {
+            self.insert_functions(path, content, tree, functions);
         }
+        // A "package not in the index" answer cached before this batch may be
+        // wrong now, and a directory answer may have become ambiguous.
+        self.import_dir_cache.clear();
+        self.implements_cache.clear();
+        self.interface_methods_cache.clear();
+        self.drop_bsl_module_files();
         Ok(())
     }
 
@@ -173,18 +553,285 @@ impl CallGraph {
     /// gathered by [`collect_functions`](Self::collect_functions) across all
     /// prior batches.
     pub fn collect_calls(&self, files: &[(String, String, Tree)]) -> Result<()> {
-        for (path, content, tree) in files {
-            self.extract_calls(path, content, tree)?;
+        files
+            .par_iter()
+            .try_for_each(|(path, content, tree)| self.collect_file_calls(path, content, tree))
+    }
+
+    /// [`collect_calls`](Self::collect_calls) for one file, for a caller that
+    /// parses files in parallel and drops each tree right after.
+    ///
+    /// Safe to run for many files at once: a file only appends edges to its
+    /// own functions, every other write is a memo of a value that does not
+    /// change once pass 1 is complete, and no map lock is held while another
+    /// is taken for writing.
+    pub fn collect_file_calls(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
+        self.extract_calls(path, content, tree)
+    }
+
+    /// Whether a file's call sites can be read in pass 1 and resolved in
+    /// pass 2 without its tree: BSL, where neither imports nor the declared
+    /// types of locals take part in resolution.
+    pub fn defers_calls(path: &str) -> bool {
+        path.ends_with(".bsl") || path.ends_with(".os")
+    }
+
+    /// The call sites of a [`defers_calls`](Self::defers_calls) file, read
+    /// while its tree is at hand, for
+    /// [`resolve_pending_calls`](Self::resolve_pending_calls) once every
+    /// function is known. Spares pass 2 parsing the file again.
+    pub fn pending_file_calls(&self, path: &str, content: &str, tree: &Tree) -> Vec<PendingCall> {
+        let file = FileScope {
+            path,
+            imports: &HashMap::new(),
+        };
+        let mut pending = Some(Vec::new());
+        self.walk_for_calls(
+            &mut tree.walk(),
+            content.as_bytes(),
+            &file,
+            &mut FnScope::default(),
+            &mut HashMap::new(),
+            "",
+            &mut pending,
+        );
+        pending.unwrap_or_default()
+    }
+
+    /// Pass 2 for the call sites [`pending_file_calls`](Self::pending_file_calls)
+    /// read from `path`.
+    pub fn resolve_pending_calls(&self, path: &str, calls: Vec<PendingCall>) {
+        let file = FileScope {
+            path,
+            imports: &HashMap::new(),
+        };
+        for call in calls {
+            let (callee_key, resolution) = if call.callback {
+                self.resolve_bsl_callback(&call.edge, path)
+            } else {
+                self.resolve_call_site(&file, &call.edge, call.scope_inferred, None)
+            };
+            self.push_call(&call.caller, call.edge, callee_key, resolution);
         }
-        Ok(())
+    }
+
+    /// Edges for BSL extension procedures, which no source line calls by
+    /// name: from the extended method to each procedure intercepting it
+    /// (`&Перед`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`), and from an
+    /// interceptor that calls `ПродолжитьВызов()` back to the method.
+    ///
+    /// The extended method is the namesake in a file of the same module: the
+    /// longest common path tail, at least `Категория/Объект/Ext/Модуль.bsl`,
+    /// so a dump of the configuration and one of the extension side by side
+    /// line up. Runs after [`collect_calls`](Self::collect_calls), on one
+    /// thread, and replaces the edges a previous run added.
+    pub fn link_extensions(&self) {
+        // The module path tail must at least name the object and the module.
+        const MIN_COMMON_TAIL: usize = 4;
+
+        for mut node in self.nodes.iter_mut() {
+            node.calls
+                .retain(|edge| edge.call_type != CallType::Extension);
+        }
+
+        let mut hooks: Vec<(String, String, usize, String, bool)> = self
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let method = node.intercepts.clone()?;
+                let proceeds = node.calls.iter().any(|edge| {
+                    let name = edge.target.rsplit("::").next().unwrap_or(&edge.target);
+                    name.eq_ignore_ascii_case("ProceedWithCall")
+                        || name.to_lowercase() == "продолжитьвызов"
+                });
+                Some((
+                    node.key().clone(),
+                    node.file_path.clone(),
+                    node.line,
+                    method,
+                    proceeds,
+                ))
+            })
+            .collect();
+        hooks.sort();
+
+        let tail =
+            |path: &str| -> Vec<String> { path.rsplit('/').map(str::to_lowercase).collect() };
+        for (hook_key, hook_file, hook_line, method, proceeds) in hooks {
+            let hook_tail = tail(&hook_file);
+            // BSL names are case-insensitive; the scan is only for an
+            // annotation spelled differently from the definition.
+            let candidates = self
+                .name_index
+                .get(&method)
+                .map(|entry| entry.clone())
+                .or_else(|| {
+                    let lower = method.to_lowercase();
+                    self.name_index
+                        .iter()
+                        .find(|entry| entry.key().to_lowercase() == lower)
+                        .map(|entry| entry.value().clone())
+                });
+            let Some(candidates) = candidates else {
+                continue;
+            };
+            let mut best = 0;
+            let mut targets: Vec<String> = Vec::new();
+            for candidate in candidates {
+                let Some(file) = self.nodes.get(&candidate).map(|n| n.file_path.clone()) else {
+                    continue;
+                };
+                if file == hook_file {
+                    continue;
+                }
+                let common = hook_tail
+                    .iter()
+                    .zip(tail(&file))
+                    .take_while(|(a, b)| *a == b)
+                    .count();
+                if common < MIN_COMMON_TAIL || common < best {
+                    continue;
+                }
+                if common > best {
+                    best = common;
+                    targets.clear();
+                }
+                targets.push(candidate);
+            }
+            targets.sort();
+            let resolution = if targets.len() == 1 {
+                CallResolution::Scope
+            } else {
+                CallResolution::NameOnly
+            };
+            for target in targets {
+                let edge = |to: &str| CallEdge {
+                    target: self.intern(to),
+                    file_path: self.intern(&hook_file),
+                    line: hook_line,
+                    column: 0,
+                    call_type: CallType::Extension,
+                    scope_hint: None,
+                    resolved: true,
+                    resolution,
+                };
+                if let Some(mut base) = self.nodes.get_mut(&target) {
+                    base.calls.push(edge(&hook_key));
+                }
+                if proceeds {
+                    if let Some(mut hook) = self.nodes.get_mut(&hook_key) {
+                        hook.calls.push(edge(&target));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shared copy of `s`.
+    pub fn intern(&self, s: &str) -> Arc<str> {
+        if let Some(held) = self.strings.get(s) {
+            return Arc::clone(&held);
+        }
+        let held: Arc<str> = Arc::from(s);
+        // Another thread may have interned it meanwhile; either copy is fine,
+        // but keep the set holding one.
+        if !self.strings.insert(Arc::clone(&held)) {
+            if let Some(winner) = self.strings.get(s) {
+                return Arc::clone(&winner);
+            }
+        }
+        held
+    }
+
+    /// Record that the 1C platform calls `procedure` of the module at
+    /// `module_path` by itself, and why.
+    pub fn add_platform_entry(&self, module_path: &str, procedure: &str, reason: String) {
+        self.platform_entries.insert(
+            format!("{module_path}::{}", procedure.to_lowercase()),
+            reason,
+        );
+    }
+
+    /// Why a BSL function has callers the source does not show: the platform
+    /// calls it (an event of its module, a handler named in metadata XML), or
+    /// it is an extension procedure the platform runs in place of, before or
+    /// after the method it intercepts.
+    pub fn platform_entry_reason(&self, key: &str) -> Option<String> {
+        let node = self.nodes.get(key)?;
+        if let Some(method) = &node.intercepts {
+            return Some(format!("extension procedure intercepting `{method}`"));
+        }
+        let procedure = node.name.to_lowercase();
+        if let Some(reason) = self
+            .platform_entries
+            .get(&format!("{}::{procedure}", node.file_path))
+        {
+            return Some(reason.clone());
+        }
+        bsl_module_event(&node.file_path, &procedure)
+            .map(|module| format!("{module} event {}", node.name))
+    }
+
+    /// The keys of the functions defined in `path`.
+    pub fn function_keys_in_file(&self, path: &str) -> Vec<String> {
+        self.file_functions
+            .get(path)
+            .map(|keys| keys.clone())
+            .unwrap_or_default()
+    }
+
+    /// Files with a call to one of `names`, resolved or not. An edge is
+    /// resolved once, when its file is read, so these are the files whose
+    /// edges a change to the functions of that name can make wrong.
+    pub fn files_calling(&self, names: &HashSet<String>) -> HashSet<String> {
+        if names.is_empty() {
+            return HashSet::new();
+        }
+        // The last segment of a key (`file::Type::name`) or of an unresolved
+        // target (`pkg.Func`). Not `bare_name`, which validates the name
+        // character by character: over the million edges of УТ that took
+        // a second and a half per saved file.
+        fn last_segment(target: &str) -> &str {
+            let after_path = target.rsplit("::").next().unwrap_or(target);
+            after_path.rsplit('.').next().unwrap_or(after_path)
+        }
+        self.nodes
+            .iter()
+            .filter(|node| {
+                node.calls
+                    .iter()
+                    .any(|edge| names.contains(last_segment(&edge.target)))
+            })
+            .map(|node| node.file_path.clone())
+            .collect()
+    }
+
+    /// Drop the calls made by the functions of `path`, keeping the functions:
+    /// what [`collect_calls`](Self::collect_calls) of an unchanged file needs
+    /// first, since it only appends.
+    pub fn clear_calls_for_file(&self, path: &str) {
+        for key in self.function_keys_in_file(path) {
+            if let Some(mut node) = self.nodes.get_mut(&key) {
+                node.calls.clear();
+            }
+        }
     }
 
     /// Remove all functions defined in a file from the call graph.
     /// Call this before re-indexing a file to clean up stale function definitions.
     pub fn remove_functions_for_file(&self, path: &str) -> Result<()> {
+        self.drop_bsl_module_files();
+        self.import_dir_cache.clear();
+        self.implements_cache.clear();
+        self.interface_methods_cache.clear();
+        self.types.remove_file(path);
         if let Some((_, function_keys)) = self.file_functions.remove(path) {
             for key in function_keys {
                 self.nodes.remove(&key);
+                // Otherwise this grows for the life of the process under
+                // `--watch`: every reindex of a changed file adds fresh
+                // entries but never reclaims the ones for keys removed here.
+                self.file_path_lower_cache.remove(&key);
 
                 if let Some(bare_name) = key.split("::").last() {
                     let emptied = match self.name_index.get_mut(bare_name) {
@@ -238,12 +885,14 @@ impl CallGraph {
         }
     }
 
-    fn extract_functions(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
-        let source = content.as_bytes();
-        let mut cursor = tree.walk();
-        let mut functions = Vec::new();
-
-        self.walk_for_functions(&mut cursor, source, path, &mut functions);
+    /// Record a file's declared types and the functions
+    /// [`walk_for_functions`](Self::walk_for_functions) found in it.
+    fn insert_functions(&self, path: &str, content: &str, tree: &Tree, functions: Vec<CallNode>) {
+        // Declarations first: a re-indexed file must not leave the old ones
+        // behind.
+        self.types.remove_file(path);
+        self.types
+            .ingest_file(path, tree.root_node(), content.as_bytes());
 
         for func in &functions {
             let key = Self::definition_key(path, func.receiver.as_deref(), &func.name);
@@ -255,8 +904,6 @@ impl CallGraph {
             .map(|f| Self::definition_key(path, f.receiver.as_deref(), &f.name))
             .collect();
         self.file_functions.insert(path.to_string(), names);
-
-        Ok(())
     }
 
     fn walk_for_functions(
@@ -286,96 +933,6 @@ impl CallGraph {
     }
 
     /// Kinds that declare a type whose body holds methods.
-    fn is_type_declaration(kind: &str) -> bool {
-        matches!(
-            kind,
-            "trait_item"
-                | "class_definition"
-                | "class_declaration"
-                | "class_specifier"
-                | "struct_declaration"
-                | "struct_specifier"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "trait_declaration"
-                | "object_declaration"
-                | "protocol_declaration"
-                | "extension_declaration"
-                // Ruby
-                | "class"
-                | "module"
-        )
-    }
-
-    /// First type name in a subtree: `*Server` -> `Server`, `Store[T]` ->
-    /// `Store`. Falls back to a plain identifier for grammars without a
-    /// dedicated type node (Ruby constants, Python class names).
-    fn first_type_identifier(node: Node, source: &[u8]) -> Option<String> {
-        fn walk(node: Node, kinds: &[&str], out: &mut Option<String>, source: &[u8]) {
-            if out.is_some() {
-                return;
-            }
-            if kinds.contains(&node.kind()) {
-                *out = node.utf8_text(source).ok().map(|s| s.to_string());
-                return;
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk(child, kinds, out, source);
-            }
-        }
-
-        let mut found = None;
-        walk(node, &["type_identifier"], &mut found, source);
-        if found.is_none() {
-            walk(
-                node,
-                &["identifier", "constant", "simple_identifier", "name"],
-                &mut found,
-                source,
-            );
-        }
-        found
-    }
-
-    /// The type a function is defined on, or `None` for a free function.
-    ///
-    /// Go keeps it in the method's `receiver` field; every other supported
-    /// language nests the function inside the `impl`/class/trait that owns it.
-    fn extract_receiver_type(node: Node, source: &[u8]) -> Option<String> {
-        if let Some(receiver) = node.child_by_field_name("receiver") {
-            if let Some(name) = Self::first_type_identifier(receiver, source) {
-                return Some(name);
-            }
-        }
-
-        let mut ancestor = node.parent();
-        while let Some(current) = ancestor {
-            if current.kind() == "impl_item" {
-                // Rust: `impl Foo` and `impl Trait for Foo` both own `Foo`.
-                return current
-                    .child_by_field_name("type")
-                    .and_then(|owner| Self::first_type_identifier(owner, source));
-            }
-            if Self::is_type_declaration(current.kind()) {
-                if let Some(name) = current
-                    .child_by_field_name("name")
-                    .and_then(|name| name.utf8_text(source).ok().map(|s| s.to_string()))
-                {
-                    return Some(name);
-                }
-                // Python's root node is also called `module`; unlike Ruby's it
-                // names no type, so the walk continues past it.
-                if current.kind() != "module" {
-                    return Self::first_type_identifier(current, source);
-                }
-            }
-            ancestor = current.parent();
-        }
-        None
-    }
-
     fn try_extract_function(&self, node: Node, source: &[u8], path: &str) -> Option<CallNode> {
         let kind = node.kind();
 
@@ -410,8 +967,461 @@ impl CallGraph {
             line: node.start_position().row + 1,
             calls: Vec::new(),
             metrics,
-            receiver: Self::extract_receiver_type(node, source),
+            receiver: extract_receiver_type(node, source),
+            result_type: Self::extract_result_type(node, source),
+            intercepts: Self::bsl_extension_target(node, source, path),
         })
+    }
+
+    /// The base method named by an extension annotation on a BSL procedure:
+    /// `ЗаполнитьПоЗаказу` for `&Вместо("ЗаполнитьПоЗаказу")`. The grammar
+    /// puts each `&...` line in a `preprocessor` node just before the
+    /// definition, holding an `annotation` and, for these, a `string`.
+    fn bsl_extension_target(node: Node, source: &[u8], path: &str) -> Option<String> {
+        if !(path.ends_with(".bsl") || path.ends_with(".os")) {
+            return None;
+        }
+        let mut previous = node.prev_named_sibling();
+        while let Some(preprocessor) = previous.filter(|p| p.kind() == "preprocessor") {
+            let mut cursor = preprocessor.walk();
+            let mut annotation = None;
+            let mut argument = None;
+            for child in preprocessor.named_children(&mut cursor) {
+                match child.kind() {
+                    "annotation" => annotation = child.utf8_text(source).ok(),
+                    "string" => {
+                        argument = child
+                            .named_child(0)
+                            .filter(|content| content.kind() == "string_content")
+                            .and_then(|content| content.utf8_text(source).ok())
+                    }
+                    _ => {}
+                }
+            }
+            let intercepting = annotation
+                .map(|a| a.trim_start_matches('&').to_lowercase())
+                .is_some_and(|a| {
+                    matches!(
+                        a.as_str(),
+                        "перед"
+                            | "после"
+                            | "вместо"
+                            | "изменениеиконтроль"
+                            | "before"
+                            | "after"
+                            | "around"
+                            | "changeandvalidate"
+                    )
+                });
+            if let (true, Some(method)) = (intercepting, argument) {
+                let method = method.trim();
+                if !method.is_empty() {
+                    return Some(method.to_string());
+                }
+            }
+            previous = preprocessor.prev_named_sibling();
+        }
+        None
+    }
+
+    /// The declared return type of a function, reduced to the identifier a
+    /// receiver is compared against.
+    ///
+    /// Go writes results in a `result` field — one type, or a `parameter_list`
+    /// for `(T, error)`, where the first non-`error` entry is the value a
+    /// caller chains onto. Rust and TypeScript name the field `return_type`.
+    /// Anything else (a tuple of two meaningful values, a container) yields
+    /// `None` rather than a type the call site never had.
+    fn extract_result_type(node: Node, source: &[u8]) -> Option<String> {
+        let result = node
+            .child_by_field_name("result")
+            .or_else(|| node.child_by_field_name("return_type"))?;
+        if result.kind() != "parameter_list" {
+            return types::type_name_of(result, source);
+        }
+        let mut cursor = result.walk();
+        let declarations: Vec<Node> = result
+            .children(&mut cursor)
+            .filter(|child| child.kind() == "parameter_declaration")
+            .collect();
+        declarations.into_iter().find_map(|declaration| {
+            declaration
+                .child_by_field_name("type")
+                .and_then(|declared| types::type_name_of(declared, source))
+        })
+    }
+
+    /// The type a call produces: resolve the callee, then read its declared
+    /// result type.
+    ///
+    /// Only a target the graph actually identified is trusted here. Reading
+    /// the result type off a name match would compound one guess into another
+    /// — the wrong namesake's return type, applied with the confidence of
+    /// something that was read.
+    fn call_result_type(
+        &self,
+        described: &(String, CallType, Option<String>, bool),
+        ctx: CallCtx,
+    ) -> Option<String> {
+        let (name, call_type, scope_hint, scope_inferred) = described;
+        // Resolution is the expensive half; a callee that is not in the graph
+        // (stdlib, third party, a type conversion) can be dismissed on an
+        // O(1) name lookup instead.
+        if !self.name_index.contains_key(name) {
+            return None;
+        }
+        let (key, resolution) = self.refine_by_call_syntax(
+            ctx.file,
+            name,
+            *call_type,
+            scope_hint.as_deref(),
+            *scope_inferred,
+            self.resolve_scoped_callee(name, ctx.file, scope_hint.as_deref(), *scope_inferred),
+        );
+        if resolution.is_certain() || resolution == CallResolution::FactoryReceiver {
+            return self
+                .nodes
+                .get(key.as_str())
+                .and_then(|node| node.result_type.clone());
+        }
+        // The target is one namesake out of several, so its result type cannot
+        // be read off — unless every namesake declares the same one. A corpus
+        // full of per-package test helpers named `accountRepo` is exactly that
+        // case: whichever one the call meant, the type it hands back is the
+        // same.
+        let candidates = self.name_index.get(name)?;
+        // Consensus is for a handful of per-package helpers of one name. Past
+        // that the scan costs more than the answer is worth, and a name shared
+        // by dozens of functions is not one helper written repeatedly.
+        if candidates.len() > 8 {
+            return None;
+        }
+        let mut agreed: Option<String> = None;
+        for candidate in candidates.iter() {
+            let declared = self
+                .nodes
+                .get(candidate.as_str())
+                .and_then(|node| node.result_type.clone())?;
+            match &agreed {
+                Some(held) if held != &declared => return None,
+                Some(_) => {}
+                None => agreed = Some(declared),
+            }
+        }
+        agreed
+    }
+
+    /// Variable name -> declared type, for the parameters and local variables
+    /// of one function.
+    ///
+    /// The largest remaining group of guessed edges is a call on a name that
+    /// stands for a value: `batchService.Create(dto)`, `lineRepo.FindByUuid(id)`,
+    /// `svc.Run()`. The qualifier is the variable, not the type, so resolution
+    /// had nothing to match a receiver against — but the type is written a few
+    /// lines up, in the parameter list or in the declaration that produced the
+    /// value. This is a deliberately shallow reading of it (no flow analysis,
+    /// no shadowing, last declaration of a name wins), which is why the type it
+    /// yields is only ever *offered* to `resolve_scoped_callee`: it is used
+    /// when a namesake is actually defined on that type, and dropped otherwise.
+    fn note_local_types(
+        &self,
+        current: Node,
+        source: &[u8],
+        ctx: CallCtx,
+        locals: &mut HashMap<String, LocalKind>,
+    ) {
+        {
+            match current.kind() {
+                // `func f(svc sfx_use.SfxOperationUse)`, and Go's `var x T`.
+                "parameter_declaration" | "var_spec" | "const_spec" => {
+                    if let Some(declared) = current.child_by_field_name("type") {
+                        // A parameter typed `error`, `[]byte` or
+                        // `sync.WaitGroup` is worth recording as foreign: it
+                        // says a call on that name is not a call into this
+                        // repository at all.
+                        let kind = match types::classify_type(declared, source) {
+                            types::TypeRef::Named { name, package } => {
+                                if self.package_is_indexed(package.as_deref(), ctx) {
+                                    LocalKind::Type(name)
+                                } else {
+                                    LocalKind::Foreign
+                                }
+                            }
+                            types::TypeRef::Foreign => LocalKind::Foreign,
+                            types::TypeRef::Unknown => return,
+                        };
+                        for name in Self::declared_names(current, source) {
+                            locals.insert(name, kind.clone());
+                        }
+                    }
+                }
+                // `svc := NewSfxOperationUse(c)`, `dto := &PayoutDto{}`.
+                "short_var_declaration" | "assignment_statement" => {
+                    let names = current
+                        .child_by_field_name("left")
+                        .map(|left| Self::declared_names(left, source))
+                        .unwrap_or_default();
+                    let values: Vec<Node> = current
+                        .child_by_field_name("right")
+                        .map(|right| {
+                            let mut walker = right.walk();
+                            right
+                                .children(&mut walker)
+                                .filter(|child| child.is_named())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // One call on the right, and either one name or the Go
+                    // idiom `value, err := f()` — where the extra names are
+                    // the error and the discards, so the declared result type
+                    // belongs to the first. Any other multi-value shape says
+                    // nothing about which value is which.
+                    // `self.field = f()` binds no plain identifier, so the
+                    // name list can be empty — check that before slicing it.
+                    let single_meaningful_name = !names.is_empty()
+                        && names[1..]
+                            .iter()
+                            .all(|name| matches!(name.as_str(), "err" | "ok" | "_"));
+                    if values.len() == 1 && single_meaningful_name {
+                        if let Some(type_name) = self.expression_type_hint(values[0], source, ctx) {
+                            locals.insert(names[0].clone(), LocalKind::Type(type_name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The identifiers a declaration or assignment target binds.
+    fn declared_names(node: Node, source: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        if matches!(node.kind(), "identifier" | "field_identifier") {
+            if let Ok(text) = node.utf8_text(source) {
+                names.push(text.to_string());
+            }
+            return names;
+        }
+        // A declaration names one or more identifiers before its type; an
+        // `expression_list` on the left of `:=` holds them directly.
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "identifier" => {
+                    if let Ok(text) = child.utf8_text(source) {
+                        names.push(text.to_string());
+                    }
+                }
+                "expression_list" | "identifier_list" => {
+                    names.extend(Self::declared_names(child, source));
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// The type an initialiser expression produces, as far as it can be read
+    /// off the syntax: a composite literal names it outright, a factory or
+    /// constructor call names it through
+    /// [`factory_type_hint`](Self::factory_type_hint).
+    fn expression_type_hint(&self, node: Node, source: &[u8], ctx: CallCtx) -> Option<String> {
+        match node.kind() {
+            "composite_literal" => node
+                .child_by_field_name("type")
+                .and_then(|node| types::type_name_of(node, source)),
+            // `&T{}`, `*p`, `(expr)`.
+            "unary_expression" | "parenthesized_expression" | "pointer_expression" => {
+                let inner = node
+                    .child_by_field_name("operand")
+                    .or_else(|| node.child_by_field_name("argument"))
+                    .or_else(|| node.named_child(0))?;
+                self.expression_type_hint(inner, source, ctx)
+            }
+            kind if Self::is_call_kind(kind) => {
+                let (callee, _) = Self::callee_slot(node)?;
+                let described = self.describe_callee_in(callee, source, ctx)?;
+                if let Some(declared) = self.call_result_type(&described, ctx) {
+                    return Some(declared);
+                }
+                Self::factory_type_hint(&described.0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Package name (or alias) -> import path, for the file's imports.
+    ///
+    /// Go's `assert.Len(t, x, 3)` and `config.Get()` look identical to the
+    /// resolver: a qualifier that names neither a receiver type nor a local
+    /// variable. The import list is what tells them apart — one is a third
+    /// party the index has never seen, the other is a package of this very
+    /// repository — and [`resolve_package_qualified`](Self::resolve_package_qualified)
+    /// turns that into either an honest `Unresolved` or a target narrowed to
+    /// the right directory.
+    ///
+    /// Go-shaped `import_spec` only. Python's `from x import y` and JS's
+    /// namespace imports bind names differently and would need their own
+    /// handling rather than sharing this one.
+    fn collect_imports(tree: &Tree, source: &[u8]) -> HashMap<String, String> {
+        let mut imports = HashMap::new();
+        let mut cursor = tree.walk();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "import_spec" {
+                let Some(path) = node
+                    .child_by_field_name("path")
+                    .and_then(|path| path.utf8_text(source).ok())
+                    .map(|path| path.trim_matches(['"', '`', '\''].as_slice()).to_string())
+                else {
+                    continue;
+                };
+                let alias = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                    .map(|name| name.to_string());
+                let name = match alias.as_deref() {
+                    // `_ "pkg"` imports for side effects and `. "pkg"` dumps
+                    // the package into the file scope: neither binds a
+                    // qualifier a call site can carry.
+                    Some("_") | Some(".") => continue,
+                    Some(alias) => alias.to_string(),
+                    None => path.rsplit('/').next().unwrap_or(&path).to_string(),
+                };
+                imports.insert(name, path);
+                continue;
+            }
+            for child in node.children(&mut cursor) {
+                // Imports sit at the top of a file; no need to walk into
+                // function bodies looking for them.
+                if child.is_named() && !child.kind().contains("function") {
+                    stack.push(child);
+                }
+            }
+        }
+        imports
+    }
+
+    /// The directory of the indexed package an import path names, or `None`
+    /// when no indexed file lives there — meaning the package is third-party,
+    /// standard library, or simply not part of this index.
+    ///
+    /// Matched on the trailing path segments rather than the full import path,
+    /// because the import path carries the module prefix
+    /// (`github.com/org/repo/internal/config`) while indexed paths are
+    /// repository-relative (`internal/config/config.go`).
+    fn package_dir_for(&self, import_path: &str) -> Option<Arc<str>> {
+        if let Some(cached) = self.import_dir_cache.get(import_path) {
+            return cached.clone();
+        }
+        let needle = format!("{}/", import_path.trim_end_matches('/'));
+        // Either string may carry a prefix the other lacks — the import path
+        // its module prefix (`github.com/org/repo/`), the indexed path a
+        // checkout subdirectory (`go-rest-api/`) — so the shorter one has to
+        // be a trailing part of the longer. Two segments minimum, or a
+        // third-party `.../model` would be answered with this repo's `model/`.
+        let matches_dir = |dir: &str| {
+            let (short, long) = if dir.len() <= needle.len() {
+                (dir, needle.as_str())
+            } else {
+                (needle.as_str(), dir)
+            };
+            short.matches('/').count() >= 2 && long.ends_with(short)
+        };
+        let mut found: Option<Arc<str>> = None;
+        for entry in self.file_functions.iter() {
+            let file_path = entry.key();
+            let Some(dir_end) = file_path.rfind('/') else {
+                continue;
+            };
+            let dir = &file_path[..=dir_end];
+            if matches_dir(dir) {
+                found = Some(Arc::from(dir));
+                break;
+            }
+        }
+        self.import_dir_cache
+            .insert(import_path.to_string(), found.clone());
+        found
+    }
+
+    /// Is the package a written type came from part of this index?
+    ///
+    /// `sync.WaitGroup` and `gorm.DB` name types no method of this repository
+    /// sits on, and the import list is what says so. A type written without a
+    /// package is local to the file's own package, hence indexed by
+    /// definition.
+    fn package_is_indexed(&self, package: Option<&str>, ctx: CallCtx) -> bool {
+        let Some(package) = package else {
+            return true;
+        };
+        match ctx.imports.get(package) {
+            Some(import_path) => self.package_dir_for(import_path).is_some(),
+            // Not an import at all: a package name that came from somewhere
+            // this reading does not model. Left alone rather than declared
+            // foreign.
+            None => true,
+        }
+    }
+
+    /// Resolve `pkg.Func()` using the file's import of `pkg`.
+    ///
+    /// Two outcomes, both better than the name match this replaces: a package
+    /// outside the index resolves to nothing at all (a call to
+    /// `assert.Len(t, x, 3)` must not be reported as a call to some `Len`
+    /// method of this repository), and a package inside it narrows the
+    /// namesakes to that one directory.
+    fn resolve_package_qualified(
+        &self,
+        bare_name: &str,
+        import_path: &str,
+    ) -> Option<(String, CallResolution)> {
+        let Some(dir) = self.package_dir_for(import_path) else {
+            // The import names a package this index does not contain: the
+            // call is third-party, not a gap in what was read.
+            return Some((bare_name.to_string(), CallResolution::ExternalPackage));
+        };
+        // The package is indexed and the graph has never heard the name: the
+        // same gap as the `0` arm below, reached one step earlier. Falling
+        // through to the general resolution would only relabel it as the
+        // residual `Unresolved`, losing the one thing the call site said.
+        let Some(candidates) = self.name_index.get(bare_name) else {
+            return Some((bare_name.to_string(), CallResolution::PackageMissing));
+        };
+        let in_package: Vec<&String> = candidates
+            .iter()
+            .filter(|key| {
+                // A Go package is exactly one directory: a subdirectory is a
+                // different package, so `config.Get()` must not see the `Get`
+                // of `internal/config/settings/repository`. And `pkg.Name()`
+                // names a package-level function, never a method — a method
+                // needs a value in front of it.
+                self.nodes
+                    .get(key.as_str())
+                    .map(|node| {
+                        node.receiver.is_none()
+                            && node
+                                .file_path
+                                .rfind('/')
+                                .map(|end| &node.file_path[..=end] == dir.as_ref())
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        match in_package.len() {
+            // The package is indexed but carries no such function: a method on
+            // one of its types reached through a value, or an unindexed file.
+            0 => Some((bare_name.to_string(), CallResolution::PackageMissing)),
+            1 => Some((in_package[0].clone(), CallResolution::Scope)),
+            // Two package-level functions of one name cannot both exist in Go,
+            // so this means the package directory was matched loosely (a
+            // vendored copy, say). The pick is at least from one package.
+            _ => Some((
+                in_package.iter().min().map(|key| (*key).clone())?,
+                CallResolution::NameOnly,
+            )),
+        }
     }
 
     fn extract_calls(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
@@ -419,19 +1429,42 @@ impl CallGraph {
         let mut cursor = tree.walk();
 
         // Track current function scope
-        let mut current_function: Option<String> = None;
-        self.walk_for_calls(&mut cursor, source, path, &mut current_function, "");
+        let imports = Self::collect_imports(tree, source);
+        let file = FileScope {
+            path,
+            imports: &imports,
+        };
+        let mut scope = FnScope::default();
+        let mut package_locals = HashMap::new();
+        self.walk_for_calls(
+            &mut cursor,
+            source,
+            &file,
+            &mut scope,
+            &mut package_locals,
+            "",
+            &mut None,
+        );
 
         Ok(())
     }
 
+    /// `scope` carries what the enclosing function contributes to resolution:
+    /// its receiver type for `self` call sites and the declared types of its
+    /// parameters and locals (see [`scope_hint_from`](Self::scope_hint_from)
+    /// and [`collect_local_types`](Self::collect_local_types)).
+    ///
+    /// With `pending` the call sites are collected there instead of resolved.
+    #[allow(clippy::too_many_arguments)]
     fn walk_for_calls(
         &self,
         cursor: &mut tree_sitter::TreeCursor,
         source: &[u8],
-        path: &str,
-        current_function: &mut Option<String>,
+        file: &FileScope,
+        scope: &mut FnScope,
+        package_locals: &mut HashMap<String, LocalKind>,
         parent_kind: &str,
+        pending: &mut Option<Vec<PendingCall>>,
     ) {
         loop {
             let node = cursor.node();
@@ -451,11 +1484,49 @@ impl CallGraph {
                     | "singleton_method"
             ) {
                 if let Some(name) = extract_function_name(node, source) {
-                    let receiver = Self::extract_receiver_type(node, source);
-                    *current_function =
-                        Some(Self::definition_key(path, receiver.as_deref(), &name));
+                    let receiver = extract_receiver_type(node, source);
+                    scope.function =
+                        Some(Self::definition_key(file.path, receiver.as_deref(), &name));
+                    scope.receiver = receiver;
+                    scope.locals.clear();
                 }
             }
+
+            // Declarations are noted as the walk passes them, in the same
+            // pass as the calls rather than in a sweep of each function's
+            // subtree — which doubled the work over every function body. The
+            // walk is in source order, so a declaration is seen before the
+            // calls below it, which is also the only place its type can apply.
+            // Noted into a separate map first: reading a declaration may
+            // itself consult what is already in scope, and the borrow checker
+            // will not have the table read and written at once.
+            let noted = {
+                let ctx = CallCtx {
+                    file: file.path,
+                    self_type: scope.receiver.as_deref(),
+                    locals: &scope.locals,
+                    file_locals: package_locals,
+                    imports: file.imports,
+                };
+                let mut noted = HashMap::new();
+                self.note_local_types(node, source, ctx, &mut noted);
+                noted
+            };
+            // Outside any function the declaration belongs to the package and
+            // stays in scope for every function in the file.
+            if scope.function.is_none() {
+                package_locals.extend(noted);
+            } else {
+                scope.locals.extend(noted);
+            }
+
+            let ctx = CallCtx {
+                file: file.path,
+                self_type: scope.receiver.as_deref(),
+                locals: &scope.locals,
+                file_locals: package_locals,
+                imports: file.imports,
+            };
 
             // Check for call expressions. BSL `method_call` is a simple call
             // (`Func()`); the one nested inside a `call_expression` (qualified
@@ -474,37 +1545,80 @@ impl CallGraph {
                     | "scoped_call_expression"
             ) || (kind == "method_call" && parent_kind != "call_expression");
             if is_call {
-                if let Some(ref caller_key) = current_function {
-                    if let Some(edge) = self.extract_call_edge(node, source, path) {
-                        // Resolve callee with scope hint for disambiguation
-                        let (callee_key, resolution) =
-                            self.resolve_callee(&edge.target, path, edge.scope_hint.as_deref());
+                if let Some(ref caller_key) = scope.function {
+                    if let Some((edge, scope_inferred)) = self.extract_call_edge(node, source, ctx)
+                    {
+                        if let Some(pending) = pending.as_mut() {
+                            pending.push(PendingCall {
+                                caller: caller_key.clone(),
+                                edge,
+                                scope_inferred,
+                                callback: false,
+                            });
+                        } else {
+                            // A qualifier naming a local variable or parameter
+                            // carries its declared type a few lines up. Taken only
+                            // when a namesake really is defined on that type — the
+                            // reading of the declaration is shallow (see
+                            // `collect_local_types`), so a miss must cost nothing.
+                            let hint = edge.scope_hint.as_deref();
+                            let by_local = hint
+                                .and_then(|hint| ctx.local_type(hint))
+                                .map(|declared| {
+                                    self.resolve_scoped_callee(
+                                        &edge.target,
+                                        ctx.file,
+                                        Some(declared),
+                                        false,
+                                    )
+                                })
+                                .filter(|(_, resolution)| *resolution == CallResolution::Receiver)
+                                // A name declared as something outside this
+                                // repository answers the question by itself: the
+                                // call leaves the graph.
+                                .or_else(|| {
+                                    hint.filter(|hint| ctx.is_foreign_local(hint)).map(|_| {
+                                        (edge.target.to_string(), CallResolution::ExternalPackage)
+                                    })
+                                });
 
-                        // Add to caller's outgoing calls (with resolved key as target)
-                        // Compute `resolved` *before* taking the caller's write
-                        // lock: `contains_key` takes a read lock on the callee's
-                        // shard, and a self-call (caller == callee) would
-                        // otherwise deadlock (read-under-write on one shard).
-                        let resolved = self.nodes.contains_key(&callee_key);
-                        if let Some(mut caller_node) = self.nodes.get_mut(caller_key.as_str()) {
-                            let mut resolved_edge = edge.clone();
-                            resolved_edge.target = callee_key.clone();
-                            resolved_edge.resolved = resolved;
-                            resolved_edge.resolution = resolution;
-                            caller_node.calls.push(resolved_edge);
+                            let (callee_key, resolution) =
+                                self.resolve_call_site(file, &edge, scope_inferred, by_local);
+                            self.push_call(caller_key, edge, callee_key, resolution);
                         }
+                    }
+                }
+            }
+
+            if kind == "new_expression"
+                && (file.path.ends_with(".bsl") || file.path.ends_with(".os"))
+            {
+                if let Some(ref caller_key) = scope.function {
+                    for edge in Self::bsl_notify_description_edges(node, source, ctx) {
+                        if let Some(pending) = pending.as_mut() {
+                            pending.push(PendingCall {
+                                caller: caller_key.clone(),
+                                edge,
+                                scope_inferred: false,
+                                callback: true,
+                            });
+                            continue;
+                        }
+                        let (callee_key, resolution) = self.resolve_bsl_callback(&edge, file.path);
+                        self.push_call(caller_key, edge, callee_key, resolution);
                     }
                 }
             }
 
             // Handle macro invocations (opaque token trees in tree-sitter)
             // Extract call patterns from macro body text
-            if kind == "macro_invocation" {
-                if let Some(ref caller_key) = current_function {
+            // Rust only, so never in a file whose calls are pending.
+            if kind == "macro_invocation" && pending.is_none() {
+                if let Some(ref caller_key) = scope.function {
                     if let Ok(macro_text) = node.utf8_text(source) {
                         let macro_line = node.start_position().row + 1;
                         self.extract_calls_from_macro_text(
-                            macro_text, caller_key, path, macro_line,
+                            macro_text, caller_key, file.path, macro_line,
                         );
                     }
                 }
@@ -512,13 +1626,182 @@ impl CallGraph {
 
             // Recurse
             if cursor.goto_first_child() {
-                self.walk_for_calls(cursor, source, path, current_function, node.kind());
+                self.walk_for_calls(
+                    cursor,
+                    source,
+                    file,
+                    scope,
+                    package_locals,
+                    node.kind(),
+                    pending,
+                );
                 cursor.goto_parent();
             }
 
             if !cursor.goto_next_sibling() {
                 break;
             }
+        }
+    }
+
+    /// Resolve a call site after the local-variable step (`by_local`), which
+    /// needs the scope of the walk.
+    fn resolve_call_site(
+        &self,
+        file: &FileScope,
+        edge: &CallEdge,
+        scope_inferred: bool,
+        by_local: Option<(String, CallResolution)>,
+    ) -> (String, CallResolution) {
+        // A qualifier that is not a shadowing local names an
+        // imported package: `config.Get()` is a call into this
+        // repository's `internal/config`, and `assert.Len(...)`
+        // is a call into testify — which the graph must report
+        // as absent rather than as some `Len` of this
+        // repository. This runs *before* the general
+        // resolution, not as a fallback for its weak answers:
+        // a package-qualified name with a single namesake in
+        // the index would otherwise be answered `Unique`,
+        // which is the same wrong target stated as a fact.
+        let by_package = by_local.is_none().then_some(()).and_then(|_| {
+            let import_path = edge
+                .scope_hint
+                .as_deref()
+                .and_then(|hint| file.imports.get(hint))?;
+            self.resolve_package_qualified(&edge.target, import_path)
+        });
+
+        let by_module = (by_local.is_none() && by_package.is_none())
+            .then(|| {
+                self.resolve_bsl_module_variable(edge, file.path)
+                    .or_else(|| self.resolve_bsl_module_qualified(edge, file.path))
+            })
+            .flatten();
+
+        // Resolve callee with scope hint for disambiguation
+        match by_local.or(by_package).or(by_module) {
+            Some(resolved) => resolved,
+            None => self.refine_by_call_syntax(
+                file.path,
+                &edge.target,
+                edge.call_type,
+                edge.scope_hint.as_deref(),
+                scope_inferred,
+                self.resolve_scoped_callee(
+                    &edge.target,
+                    file.path,
+                    edge.scope_hint.as_deref(),
+                    scope_inferred,
+                ),
+            ),
+        }
+    }
+
+    fn push_call(
+        &self,
+        caller_key: &str,
+        mut edge: CallEdge,
+        callee_key: String,
+        resolution: CallResolution,
+    ) {
+        // Compute `resolved` *before* taking the caller's write lock:
+        // `contains_key` takes a read lock on the callee's shard, and a
+        // self-call (caller == callee) would otherwise deadlock
+        // (read-under-write on one shard).
+        let resolved = self.nodes.contains_key(&callee_key);
+        // Edges built without the graph at hand hold their own strings.
+        edge.target = self.intern(&callee_key);
+        edge.file_path = self.intern(&edge.file_path);
+        edge.scope_hint = edge.scope_hint.as_deref().map(|hint| self.intern(hint));
+        if let Some(mut caller_node) = self.nodes.get_mut(caller_key) {
+            edge.resolved = resolved;
+            edge.resolution = resolution;
+            caller_node.calls.push(edge);
+        }
+    }
+
+    /// `Новый ОписаниеОповещения("Обработчик", Модуль, Параметры,
+    /// "ОбработчикОшибки", МодульОшибки)`: the platform calls the named
+    /// procedures of the named modules later, so the procedure that builds
+    /// the description is where the call comes from. One edge per handler;
+    /// the receiver is the module argument, as in `Модуль.Обработчик()`.
+    fn bsl_notify_description_edges(node: Node, source: &[u8], ctx: CallCtx) -> Vec<CallEdge> {
+        let is_notify_description = node
+            .child_by_field_name("type")
+            .and_then(|t| t.utf8_text(source).ok())
+            .is_some_and(|t| {
+                t.eq_ignore_ascii_case("NotifyDescription")
+                    || t.to_lowercase() == "описаниеоповещения"
+            });
+        let Some(arguments) = node
+            .child_by_field_name("arguments")
+            .filter(|_| is_notify_description)
+        else {
+            return Vec::new();
+        };
+        let mut cursor = arguments.walk();
+        let args: Vec<Node> = arguments.named_children(&mut cursor).collect();
+        let procedure_name = |arg: &Node| {
+            let mut node = *arg;
+            while node.kind() != "string_content" {
+                node = node.named_child(0)?;
+            }
+            let name = node.utf8_text(source).ok()?.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        };
+        let module_name = |arg: &Node| {
+            let inner = arg.named_child(0)?;
+            Self::bsl_receiver_name(inner, source)
+        };
+        [(0, 1), (3, 4)]
+            .into_iter()
+            .filter_map(|(name_at, module_at)| {
+                let name_arg = args.get(name_at)?;
+                Some(CallEdge {
+                    target: procedure_name(name_arg)?.into(),
+                    file_path: ctx.file.into(),
+                    line: name_arg.start_position().row + 1,
+                    column: name_arg.start_position().column + 1,
+                    call_type: CallType::Callback,
+                    scope_hint: args.get(module_at).and_then(module_name).map(Into::into),
+                    resolved: false,
+                    resolution: CallResolution::Unknown,
+                })
+            })
+            .collect()
+    }
+
+    /// Where the handler of an `ОписаниеОповещения` lives. `ЭтотОбъект` and
+    /// `ЭтаФорма` name the module that builds the description — a module
+    /// stated at the call site, not a same-file guess — and a handler missing
+    /// from it is a dangling name; a common module name or `МодульX`
+    /// resolves as `Модуль.Обработчик()` would. Any other module argument is
+    /// a variable holding some form or object, so a namesake elsewhere is
+    /// only a name match.
+    fn resolve_bsl_callback(&self, edge: &CallEdge, caller_file: &str) -> (String, CallResolution) {
+        let receiver = edge.scope_hint.as_deref().map(str::to_lowercase);
+        if matches!(
+            receiver.as_deref(),
+            Some("этотобъект" | "этаформа" | "thisobject" | "thisform")
+        ) {
+            let key = Self::qualified_key(caller_file, &edge.target);
+            return if self.nodes.contains_key(&key) {
+                (key, CallResolution::Scope)
+            } else {
+                (edge.target.to_string(), CallResolution::Unresolved)
+            };
+        }
+        if let Some(found) = self
+            .resolve_bsl_module_variable(edge, caller_file)
+            .or_else(|| self.resolve_bsl_module_qualified(edge, caller_file))
+        {
+            return found;
+        }
+        match self.resolve_scoped_callee(&edge.target, caller_file, None, false) {
+            (key, CallResolution::Unique | CallResolution::SameFile) => {
+                (key, CallResolution::NameOnly)
+            }
+            other => other,
         }
     }
 
@@ -584,23 +1867,34 @@ impl CallGraph {
                     continue;
                 }
 
-                let (callee_key, resolution) = self.resolve_callee(ident, caller_file, None);
+                let (call_type, scope) = Self::macro_call_shape(&text[..start]);
+                let (callee_key, resolution) = self.refine_by_call_syntax(
+                    caller_file,
+                    ident,
+                    call_type,
+                    scope,
+                    false,
+                    self.resolve_callee(ident, caller_file, scope),
+                );
 
                 // Add to caller's outgoing calls
                 // Compute `resolved` *before* taking the caller's write lock
                 // (see walk_for_calls — read-under-write on one shard deadlocks
                 // when caller and callee hash to the same shard).
                 let resolved = self.nodes.contains_key(&callee_key);
+                let target = self.intern(&callee_key);
+                let file_path = self.intern(caller_file);
+                let scope_hint = scope.map(|hint| self.intern(hint));
                 if let Some(mut caller_node) = self.nodes.get_mut(caller_key) {
                     // Avoid duplicate edges
-                    if !caller_node.calls.iter().any(|c| c.target == callee_key) {
+                    if !caller_node.calls.iter().any(|c| c.target == target) {
                         caller_node.calls.push(CallEdge {
-                            target: callee_key.clone(),
-                            file_path: caller_file.to_string(),
+                            target,
+                            file_path,
                             line,
                             column: 0,
-                            call_type: CallType::Direct,
-                            scope_hint: None,
+                            call_type,
+                            scope_hint,
                             resolved,
                             resolution,
                         });
@@ -612,10 +1906,53 @@ impl CallGraph {
         }
     }
 
+    /// What precedes a call found in macro text: `x.f(` is a method call,
+    /// `a::b::f(` a call qualified by `a::b`, anything else a plain call.
+    fn macro_call_shape(before: &str) -> (CallType, Option<&str>) {
+        let before = before.trim_end();
+        if before.ends_with('.') {
+            return (CallType::Method, None);
+        }
+        let Some(path) = before.strip_suffix("::") else {
+            return (CallType::Direct, None);
+        };
+        let start = path
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let qualifier = path[start..].trim_start_matches(':');
+        if qualifier.is_empty() {
+            (CallType::Direct, None)
+        } else {
+            (CallType::StaticMethod, Some(qualifier))
+        }
+    }
+
     /// The file a key belongs to, read from the node rather than parsed out of
     /// the key: a method key carries an extra `::Type` segment.
     fn key_file_path(&self, key: &str) -> Option<String> {
         self.nodes.get(key).map(|node| node.file_path.clone())
+    }
+
+    /// Lowercased file path for `key`, memoized in `file_path_lower_cache`.
+    ///
+    /// `scope_matches_file_path` used to call `file_path.to_lowercase()` on
+    /// every namesake candidate on every ambiguous call site — a Unicode
+    /// case-fold recomputed from scratch for the same handful of file paths
+    /// across the whole corpus. Profiling a real 49k-file index showed this
+    /// (plus the matching `scope.to_lowercase()`, hoisted in `resolve_callee`
+    /// instead) as ~5-6% of total indexing CPU. Caching it here means each
+    /// distinct file path is lowercased once per process lifetime, not once
+    /// per candidate per call site.
+    fn key_file_path_lower(&self, key: &str) -> Option<Arc<str>> {
+        if let Some(cached) = self.file_path_lower_cache.get(key) {
+            return Some(cached.clone());
+        }
+        let file_path = self.nodes.get(key).map(|node| node.file_path.clone())?;
+        let lower: Arc<str> = Arc::from(file_path.to_lowercase());
+        self.file_path_lower_cache
+            .insert(key.to_string(), lower.clone());
+        Some(lower)
     }
 
     /// Does the node behind `key` belong to the type named `qualifier`?
@@ -642,6 +1979,98 @@ impl CallGraph {
         }
     }
 
+    /// Among `candidates` (the namesakes of one method), the one whose
+    /// receiver type implements `interface_name` — provided exactly one does.
+    ///
+    /// "Implements" is Go's own rule read off the index: the type carries a
+    /// method of every name the interface declares. Signatures are not
+    /// compared, so a type could satisfy this by coincidence; requiring a
+    /// single match across the whole namesake set is what keeps that from
+    /// mattering in practice.
+    fn only_implementor_among(
+        &self,
+        interface_name: &str,
+        candidates: &[String],
+    ) -> Option<String> {
+        let required = match self.interface_methods_cache.get(interface_name) {
+            Some(cached) => cached.clone(),
+            None => {
+                let methods = Arc::new(self.types.interface_methods(interface_name, None));
+                self.interface_methods_cache
+                    .insert(interface_name.to_string(), methods.clone());
+                methods
+            }
+        };
+        // An interface with one common method (`Error`, `String`) is satisfied
+        // by half a corpus; there is nothing to narrow with.
+        if required.len() < 2 {
+            return None;
+        }
+        let implementors: Vec<&String> = candidates
+            .iter()
+            .filter(|key| {
+                self.nodes
+                    .get(key.as_str())
+                    .and_then(|node| node.receiver.clone())
+                    .map(|receiver| self.type_implements(interface_name, &receiver, &required))
+                    .unwrap_or(false)
+            })
+            .collect();
+        match implementors.len() {
+            0 => None,
+            1 => Some(implementors[0].clone()),
+            // A mock in the test tree implements the same interface as the
+            // real thing. Production code is what a caller outside the tests
+            // reaches, so it wins — and if the remaining choice is still not
+            // single, nothing here can make it.
+            _ => {
+                let mut production = implementors.iter().filter(|key| !Self::is_test_path(key));
+                let first = production.next()?;
+                production.next().is_none().then(|| (*first).clone())
+            }
+        }
+    }
+
+    /// Is this graph key from test or mock code? Read off the path, which is
+    /// where every language convention for it shows up.
+    fn is_test_path(key: &str) -> bool {
+        let lower = key.to_lowercase();
+        lower.contains("/test/")
+            || lower.contains("/tests/")
+            || lower.contains("/mock/")
+            || lower.contains("/mocks/")
+            || lower.contains("_test.")
+            || lower.contains("test_helper")
+            || lower.starts_with("test/")
+    }
+
+    /// Does a type carry a method of every one of these names? Memoized per
+    /// `interface + type` pair: the walk below touches every namesake of every
+    /// method the interface declares, and the same pairs recur across a corpus.
+    fn type_implements(&self, interface_name: &str, type_name: &str, methods: &[String]) -> bool {
+        let cache_key = format!("{interface_name}\u{1}{type_name}");
+        if let Some(cached) = self.implements_cache.get(&cache_key) {
+            return *cached;
+        }
+        let answer = self.type_has_all_methods(type_name, methods);
+        self.implements_cache.insert(cache_key, answer);
+        answer
+    }
+
+    /// Does a type carry a method of every one of these names?
+    fn type_has_all_methods(&self, type_name: &str, methods: &[String]) -> bool {
+        methods.iter().all(|method| {
+            self.name_index
+                .get(method)
+                .map(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|key| self.receiver_matches(key, type_name, true))
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Resolve a callee name to a qualified key.
     /// Prefers a receiver-type match on the scope qualifier, then the caller's
     /// own file, then a scope hint matching the file path, and finally a
@@ -651,6 +2080,492 @@ impl CallGraph {
         bare_name: &str,
         caller_file: &str,
         scope_hint: Option<&str>,
+    ) -> (String, CallResolution) {
+        self.resolve_scoped_callee(bare_name, caller_file, scope_hint, false)
+    }
+
+    /// Rust method names that the standard library defines on its own types.
+    /// A call `x.key()` on a value of unknown type is as likely to be
+    /// `Entry::key` as the one project method of that name.
+    const RUST_STD_METHOD_NAMES: &'static [&'static str] = &[
+        "all",
+        "and_then",
+        "any",
+        "append",
+        "as_bytes",
+        "as_mut",
+        "as_path",
+        "as_ref",
+        "as_str",
+        "borrow",
+        "borrow_mut",
+        "bytes",
+        "canonicalize",
+        "chain",
+        "chars",
+        "chunks",
+        "clear",
+        "clone",
+        "cloned",
+        "cmp",
+        "collect",
+        "components",
+        "contains",
+        "contains_key",
+        "copied",
+        "count",
+        "dedup",
+        "deref",
+        "drain",
+        "ends_with",
+        "entry",
+        "enumerate",
+        "eq",
+        "exists",
+        "extend",
+        "extension",
+        "file_name",
+        "file_stem",
+        "filter",
+        "filter_map",
+        "find",
+        "first",
+        "flat_map",
+        "flush",
+        "fmt",
+        "fold",
+        "get",
+        "get_mut",
+        "hash",
+        "insert",
+        "into_iter",
+        "is_dir",
+        "is_empty",
+        "is_err",
+        "is_file",
+        "is_none",
+        "is_ok",
+        "is_some",
+        "iter",
+        "iter_mut",
+        "join",
+        "key",
+        "keys",
+        "last",
+        "len",
+        "lines",
+        "lock",
+        "map",
+        "matches",
+        "max",
+        "metadata",
+        "min",
+        "next",
+        "nth",
+        "ok",
+        "parent",
+        "parse",
+        "partial_cmp",
+        "peekable",
+        "pop",
+        "position",
+        "push",
+        "push_str",
+        "read",
+        "read_to_string",
+        "recv",
+        "remove",
+        "replace",
+        "retain",
+        "rev",
+        "reverse",
+        "send",
+        "skip",
+        "sort",
+        "sort_by",
+        "sort_by_key",
+        "split",
+        "split_once",
+        "starts_with",
+        "success",
+        "strip_prefix",
+        "sum",
+        "swap",
+        "take",
+        "to_lowercase",
+        "to_owned",
+        "to_str",
+        "to_string",
+        "to_string_lossy",
+        "to_uppercase",
+        "trim",
+        "truncate",
+        "unwrap",
+        "unwrap_or",
+        "value",
+        "values",
+        "windows",
+        "write",
+        "write_all",
+        "zip",
+    ];
+
+    const RUST_PRIMITIVE_TYPES: &'static [&'static str] = &[
+        "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8",
+        "u16", "u32", "u64", "u128", "usize",
+    ];
+
+    fn drop_bsl_module_files(&self) {
+        *self
+            .bsl_module_files
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn bsl_module_files(&self) -> BslModuleFiles {
+        if let Some(map) = self
+            .bsl_module_files
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return map.clone();
+        }
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in self.file_functions.iter() {
+            let file = entry.key();
+            if !(file.ends_with(".bsl") || file.ends_with(".os")) {
+                continue;
+            }
+            let dirs = file.rsplit_once('/').map_or("", |(dirs, _)| dirs);
+            for segment in dirs.split('/').filter(|s| !s.is_empty()) {
+                map.entry(segment.to_lowercase())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+        let map = Arc::new(map);
+        *self
+            .bsl_module_files
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
+        map
+    }
+
+    /// `Модуль.Процедура()` and `Справочники.Склады.Процедура()`: the
+    /// procedure in the module named by the receiver, looked up through that
+    /// module's files rather than by scanning every namesake — a form event
+    /// such as `ПриСозданииНаСервере` has thousands of them.
+    fn resolve_bsl_module_qualified(
+        &self,
+        edge: &CallEdge,
+        caller_file: &str,
+    ) -> Option<(String, CallResolution)> {
+        if !(caller_file.ends_with(".bsl") || caller_file.ends_with(".os")) {
+            return None;
+        }
+        let module = edge.scope_hint.as_deref()?.to_lowercase();
+        let modules = self.bsl_module_files();
+        let mut found = modules
+            .get(&module)?
+            .iter()
+            .map(|file| Self::qualified_key(file, &edge.target))
+            .filter(|key| self.nodes.contains_key(key));
+        let first = found.next()?;
+        found
+            .next()
+            .is_none()
+            .then_some((first, CallResolution::Scope))
+    }
+
+    /// `МодульX.Процедура()`: by the convention of the 1C standard subsystems
+    /// library, `МодульX` holds `ОбщегоНазначения.ОбщийМодуль("X")`, so the
+    /// call goes to common module `X` — when that module has the procedure.
+    /// Before this, such a call went to a namesake in the caller's own module.
+    fn resolve_bsl_module_variable(
+        &self,
+        edge: &CallEdge,
+        caller_file: &str,
+    ) -> Option<(String, CallResolution)> {
+        if !(caller_file.ends_with(".bsl") || caller_file.ends_with(".os")) {
+            return None;
+        }
+        let receiver = edge.scope_hint.as_deref()?.to_lowercase();
+        let module = receiver
+            .strip_prefix("модуль")
+            .filter(|module| !module.is_empty())?;
+        let candidates = self.name_index.get(&*edge.target)?;
+        let mut in_module = candidates.iter().filter(|key| {
+            self.key_file_path_lower(key).is_some_and(|path| {
+                path.contains("commonmodules/") && path.split('/').any(|segment| segment == module)
+            })
+        });
+        let first = in_module.next()?;
+        in_module
+            .next()
+            .is_none()
+            .then(|| (first.clone(), CallResolution::FactoryReceiver))
+    }
+
+    /// Correct a `Unique` answer — "one function in the graph has this name" —
+    /// with what the call site's syntax rules out, for the languages where
+    /// that is known (Rust, BSL).
+    fn refine_by_call_syntax(
+        &self,
+        caller_file: &str,
+        bare_name: &str,
+        call_type: CallType,
+        scope_hint: Option<&str>,
+        scope_inferred: bool,
+        resolved: (String, CallResolution),
+    ) -> (String, CallResolution) {
+        if resolved.1 != CallResolution::Unique {
+            return resolved;
+        }
+        if caller_file.ends_with(".rs") {
+            self.refine_rust_resolution(bare_name, call_type, scope_hint, scope_inferred, resolved)
+        } else if caller_file.ends_with(".bsl") || caller_file.ends_with(".os") {
+            self.refine_bsl_resolution(caller_file, bare_name, call_type, scope_hint, resolved)
+        } else {
+            resolved
+        }
+    }
+
+    /// Methods of 1C platform objects (`Структура`, `Массив`, `ТаблицаЗначений`,
+    /// `Запрос`, metadata, form items). `Параметры.Вставить(...)` is the
+    /// platform's, whatever procedure of that name the configuration has.
+    const BSL_PLATFORM_METHOD_NAMES: &'static [&'static str] = &[
+        "вставить",
+        "добавить",
+        "удалить",
+        "очистить",
+        "количество",
+        "получить",
+        "установить",
+        "найти",
+        "найтистроки",
+        "свойство",
+        "выгрузитьколонку",
+        "загрузитьколонку",
+        "выгрузить",
+        "загрузить",
+        "сортировать",
+        "свернуть",
+        "итог",
+        "скопировать",
+        "скопироватьколонки",
+        "индекс",
+        "сдвинуть",
+        "заполнитьзначения",
+        "заполнитьсвойствазначения",
+        "получитьэлементы",
+        "получитьродителя",
+        "получитьидентификатор",
+        "найтипоидентификатору",
+        "найтиподанным",
+        "полноеимя",
+        "имя",
+        "представление",
+        "синоним",
+        "содержит",
+        "получитьобъект",
+        "записать",
+        "прочитать",
+        "заблокировать",
+        "разблокировать",
+        "модифицированность",
+        "выполнить",
+        "выполнитьпакет",
+        "выполнитьпакетспромежуточнымиданными",
+        "установитьпараметр",
+        "выбрать",
+        "следующий",
+        "пустой",
+        "пустая",
+        "ссылка",
+        "получитьмакет",
+        "получитьформу",
+        "получитьобласть",
+        "вывести",
+        "присоединить",
+        "новаястрока",
+        "текущиеданные",
+        "получитьтекст",
+        "установитьтекст",
+        "добавитьстроку",
+        "получитьстроку",
+        "вставитьстроку",
+        "удалитьстроку",
+        "заменитьстроку",
+        "количествострок",
+        "отбор",
+        "отменитьизменения",
+        "insert",
+        "add",
+        "delete",
+        "clear",
+        "count",
+        "get",
+        "set",
+        "find",
+        "findrows",
+        "property",
+        "unloadcolumn",
+        "loadcolumn",
+        "unload",
+        "load",
+        "sort",
+        "groupby",
+        "total",
+        "copy",
+        "getitems",
+        "getparent",
+        "fullname",
+        "name",
+        "write",
+        "read",
+        "lock",
+        "execute",
+        "executebatch",
+        "setparameter",
+        "select",
+        "next",
+        "isempty",
+        "ref",
+        "gettemplate",
+        "getform",
+        "getarea",
+        "put",
+        "join",
+        "currentdata",
+    ];
+
+    /// Correct a `Unique` answer for a BSL call site. A call on a receiver —
+    /// `Структура.Вставить()`, `Таблица.ВыгрузитьКолонку()`, a link of a chain
+    /// — reaches a procedure of a common or manager module only through that
+    /// module's name, and one of a form or object module only through an
+    /// object of that form or object; when the receiver names neither, the
+    /// one procedure of that name is not shown to be the target: the call
+    /// leaves the graph if the platform defines the method, and is a name
+    /// match otherwise. A plain `Процедура()` cannot reach a form, object or
+    /// manager module other than its own (common modules can be global).
+    ///
+    /// Without this the 152 891 `.Вставить(` calls of a УТ 11 dump were exact
+    /// calls of one form's `Вставить` procedure.
+    fn refine_bsl_resolution(
+        &self,
+        caller_file: &str,
+        bare_name: &str,
+        call_type: CallType,
+        scope_hint: Option<&str>,
+        resolved: (String, CallResolution),
+    ) -> (String, CallResolution) {
+        let Some(target_file) = self.key_file_path(&resolved.0) else {
+            return resolved;
+        };
+        let same_file = target_file == caller_file;
+        if call_type != CallType::Method {
+            let common = target_file.contains("CommonModules/");
+            return if same_file || common {
+                resolved
+            } else {
+                (bare_name.to_string(), CallResolution::Unresolved)
+            };
+        }
+        let receiver = scope_hint.map(str::to_lowercase);
+        if same_file
+            && matches!(
+                receiver.as_deref(),
+                Some("этотобъект" | "этаформа" | "thisobject" | "thisform")
+            )
+        {
+            return resolved;
+        }
+        let named_by_receiver = receiver.as_deref().is_some_and(|receiver| {
+            target_file
+                .trim_end_matches(".bsl")
+                .split('/')
+                .any(|segment| segment.to_lowercase() == receiver)
+        });
+        if named_by_receiver {
+            resolved
+        } else if Self::BSL_PLATFORM_METHOD_NAMES.contains(&bare_name.to_lowercase().as_str()) {
+            (bare_name.to_string(), CallResolution::Unresolved)
+        } else {
+            (resolved.0, CallResolution::NameOnly)
+        }
+    }
+
+    /// Correct a `Unique` answer for a Rust call site, where the syntax says
+    /// more than "one function in the graph has this name":
+    ///
+    /// - `x.f()` is a method call and cannot reach a free function `f`;
+    /// - `T::f()` and `std::…::f()` name where `f` lives, and a namesake that
+    ///   is neither on that type nor in that module is not it (`PathBuf::from`,
+    ///   `std::fs::write`);
+    /// - `x.len()` on a value of unknown type is a name match when the
+    ///   standard library defines the method too.
+    ///
+    /// Without this `node.walk()` (tree-sitter) became 115 calls of
+    /// `callgraph::walk`, and `entry.key()` 115 calls of `EmbeddingCache::key`,
+    /// all reported as exact.
+    fn refine_rust_resolution(
+        &self,
+        bare_name: &str,
+        call_type: CallType,
+        scope_hint: Option<&str>,
+        scope_inferred: bool,
+        resolved: (String, CallResolution),
+    ) -> (String, CallResolution) {
+        let (key, _) = &resolved;
+        let is_method_target = Self::key_receiver(key).is_some();
+        if call_type == CallType::Method {
+            if !is_method_target {
+                return (bare_name.to_string(), CallResolution::Unresolved);
+            }
+            if Self::RUST_STD_METHOD_NAMES.contains(&bare_name) {
+                return (key.clone(), CallResolution::NameOnly);
+            }
+            return resolved;
+        }
+        let Some(scope) = scope_hint.filter(|_| !scope_inferred) else {
+            return resolved;
+        };
+        // A lowercase module path may be an inline `mod` that no file path
+        // shows (`templates::all()` inside `sparql.rs`), so only a standard
+        // library path or a type names a place the namesake demonstrably is not.
+        let tail = scope.rsplit("::").next().unwrap_or(scope);
+        let names_type = tail != "Self" && tail.starts_with(|c: char| c.is_ascii_uppercase())
+            || Self::RUST_PRIMITIVE_TYPES.contains(&tail);
+        let std_path = ["std", "core", "alloc"]
+            .iter()
+            .any(|root| scope == *root || scope.starts_with(&format!("{root}::")));
+        if !names_type && !std_path {
+            return resolved;
+        }
+        let in_scope_module = self
+            .key_file_path_lower(key)
+            .map(|path| {
+                Self::path_fragment_matches(&Self::scope_path_fragment(scope), &format!("/{path}"))
+            })
+            .unwrap_or(false);
+        if in_scope_module || self.receiver_matches(key, scope, true) {
+            resolved
+        } else {
+            (bare_name.to_string(), CallResolution::ExternalPackage)
+        }
+    }
+
+    /// [`resolve_callee`](Self::resolve_callee) with the provenance of the
+    /// hint. `scope_inferred` marks a hint guessed from a factory name rather
+    /// than written at the call site: a receiver match on it is reported as
+    /// [`CallResolution::FactoryReceiver`], not as a read qualifier.
+    fn resolve_scoped_callee(
+        &self,
+        bare_name: &str,
+        caller_file: &str,
+        scope_hint: Option<&str>,
+        scope_inferred: bool,
     ) -> (String, CallResolution) {
         // 0. A scope qualifier naming a receiver type is harder evidence than
         //    the caller's own file: `Store::new()` means `Store`, wherever it
@@ -662,7 +2577,53 @@ impl CallGraph {
                     .filter(|key| self.receiver_matches(key, scope, true));
                 if let Some(first) = by_receiver.next() {
                     if by_receiver.next().is_none() {
-                        return (first.clone(), CallResolution::Receiver);
+                        let resolution = if scope_inferred {
+                            CallResolution::FactoryReceiver
+                        } else {
+                            CallResolution::Receiver
+                        };
+                        return (first.clone(), resolution);
+                    }
+                }
+
+                // 0c. The qualifier names an interface: dispatch is dynamic,
+                //     but if exactly one type in the index carries every
+                //     method the interface declares, that is where the call
+                //     goes. Checked against the namesakes rather than against
+                //     every struct — there are a handful of those and
+                //     thousands of these.
+                if self
+                    .types
+                    .is_interface(scope, Some(types::directory_of(caller_file)))
+                {
+                    if let Some(key) = self.only_implementor_among(scope, &candidates) {
+                        return (key, CallResolution::InterfaceImpl);
+                    }
+                }
+
+                // 0b. Go promotes the methods of an embedded type onto the
+                //     outer one, so `self.HandleError(err)` inside a method of
+                //     `CustomerRepo { BaseRepo }` is `BaseRepo::HandleError`.
+                //     The receiver type is right, the method just lives one
+                //     level in — a rule of the language, not a guess, hence
+                //     the same resolution as a direct receiver match.
+                let prefer_dir = types::directory_of(caller_file);
+                for embedded in self.types.embedded_chain(scope, Some(prefer_dir)) {
+                    let mut promoted = candidates
+                        .iter()
+                        .filter(|key| self.receiver_matches(key, &embedded, true));
+                    if let Some(first) = promoted.next() {
+                        // Two embedded types carrying the same method is a
+                        // compile error in Go, so an ambiguity here means the
+                        // reading is off; leave it to the steps below.
+                        if promoted.next().is_none() {
+                            let resolution = if scope_inferred {
+                                CallResolution::FactoryReceiver
+                            } else {
+                                CallResolution::Receiver
+                            };
+                            return (first.clone(), resolution);
+                        }
                     }
                 }
             }
@@ -710,11 +2671,22 @@ impl CallGraph {
                     return (key.clone(), CallResolution::SameFile);
                 }
 
-                // 4. If scope_hint present, try to narrow down
-                if let Some(scope) = scope_hint {
+                // 4. If scope_hint present, try to narrow down. `scope` is the
+                // same string for every candidate here, so its path-fragment
+                // form is computed once rather than per candidate (this loop
+                // used to re-lowercase `scope` — a Unicode case-fold — on
+                // every namesake; with "hundreds of candidates" per the O(1)
+                // lookup comment above, that was pure waste).
+                // An inferred hint is a type name, not a module path: feeding
+                // `SfxOperationUse` to the path filter would match whatever
+                // file happens to sit under a similarly named directory.
+                if let Some(scope) = scope_hint.filter(|_| !scope_inferred) {
+                    let scope_path = Self::scope_path_fragment(scope);
                     let mut scope_matches = candidates.iter().filter(|key| {
-                        self.key_file_path(key)
-                            .map(|file_path| Self::scope_matches_file_path(scope, &file_path))
+                        self.key_file_path_lower(key)
+                            .map(|file_path_lower| {
+                                Self::path_fragment_matches(&scope_path, &file_path_lower)
+                            })
                             .unwrap_or(false)
                     });
 
@@ -751,31 +2723,59 @@ impl CallGraph {
         }
     }
 
-    /// Check if a scope qualifier plausibly matches a file path.
-    /// Lowercases scope, strips `crate::`/`self::`/`super::` prefix,
-    /// converts `::` to `/`, and checks if `file_path` contains `/{scope}/` or `/{scope}.`.
-    fn scope_matches_file_path(scope: &str, file_path: &str) -> bool {
+    /// Lowercases `scope`, strips a `crate::`/`self::`/`super::` prefix, and
+    /// converts `::` to `/` — the path-fragment form `path_fragment_matches`
+    /// checks a file path against. Split out of the old single-shot
+    /// `scope_matches_file_path` so a caller checking many candidates against
+    /// the same scope (`resolve_callee`'s namesake filter) computes this once
+    /// instead of once per candidate.
+    fn scope_path_fragment(scope: &str) -> String {
         let scope_lower = scope.to_lowercase();
-        // Strip common Rust path prefixes
         let stripped = scope_lower
             .strip_prefix("crate::")
             .or_else(|| scope_lower.strip_prefix("self::"))
             .or_else(|| scope_lower.strip_prefix("super::"))
             .unwrap_or(&scope_lower);
-        // Convert :: to / for path matching
-        let as_path = stripped.replace("::", "/");
-        let path_lower = file_path.to_lowercase();
-        // Check if file_path contains /{scope}/ or /{scope}.
-        let with_slash = format!("/{}/", as_path);
-        let with_dot = format!("/{}.", as_path);
-        path_lower.contains(&with_slash) || path_lower.contains(&with_dot)
+        stripped.replace("::", "/")
+    }
+
+    /// Does an already-lowercased file path contain `/{scope_path}/` or
+    /// `/{scope_path}.`? `scope_path` comes from [`scope_path_fragment`] and
+    /// `file_path_lower` from [`key_file_path_lower`] — both precomputed so
+    /// this call itself does no case-folding.
+    /// It runs once per namesake of a qualified call, so it allocates nothing:
+    /// `ПодключаемыеКоманды.ПриСозданииНаСервере()` alone has 4 163 namesakes.
+    fn path_fragment_matches(scope_path: &str, file_path_lower: &str) -> bool {
+        file_path_lower.match_indices(scope_path).any(|(at, _)| {
+            file_path_lower[..at].ends_with('/')
+                && matches!(
+                    file_path_lower[at + scope_path.len()..].chars().next(),
+                    Some('/' | '.')
+                )
+        })
+    }
+
+    /// Single-shot convenience combining [`scope_path_fragment`] and
+    /// [`path_fragment_matches`] for callers checking one scope against one
+    /// file path (not a per-candidate loop, where computing the fragment
+    /// once outside the loop is what actually matters).
+    #[cfg(test)]
+    fn scope_matches_file_path(scope: &str, file_path: &str) -> bool {
+        Self::path_fragment_matches(&Self::scope_path_fragment(scope), &file_path.to_lowercase())
     }
 
     /// Text of a receiver/qualifier node, when it can plausibly narrow a
-    /// callee down to a file. `self`/`this` receivers carry no such
-    /// information, so they are dropped instead of being fed to
-    /// [`resolve_callee`](Self::resolve_callee).
-    fn scope_hint_from(node: Node, source: &[u8]) -> Option<String> {
+    /// callee down to a file.
+    ///
+    /// A `self`/`this` receiver names no type at the call site, but the
+    /// enclosing method does: inside `func (self *BaseApplication) Start()`,
+    /// `self.Logger()` means `BaseApplication::Logger`. `self_type` carries
+    /// that type down from [`walk_for_calls`](Self::walk_for_calls), so such a
+    /// call resolves on the receiver instead of falling through to a name
+    /// match among namesakes — which, for a method name as common as `Logger`,
+    /// picked an unrelated type. Without a known enclosing type the receiver
+    /// is dropped as before.
+    fn scope_hint_from(node: Node, source: &[u8], self_type: Option<&str>) -> Option<String> {
         let usable = matches!(
             node.kind(),
             "identifier"
@@ -792,13 +2792,221 @@ impl CallGraph {
             return None;
         }
         let text = node.utf8_text(source).ok()?.trim_start_matches('$');
-        if text.is_empty() || matches!(text, "self" | "Self" | "this") {
+        if text.is_empty() {
             return None;
+        }
+        if matches!(text, "self" | "Self" | "this") {
+            return self_type.map(|owner| owner.to_string());
         }
         Some(text.to_string())
     }
 
-    /// Describe the callee slot of a call: `(name, call type, scope hint)`.
+    /// Call shapes whose callee slot [`callee_slot`](Self::callee_slot) knows.
+    fn is_call_kind(kind: &str) -> bool {
+        matches!(
+            kind,
+            "call_expression"
+                | "call"
+                | "method_call_expression"
+                | "invocation_expression"
+                | "method_invocation"
+                | "function_call_expression"
+                | "member_call_expression"
+                | "scoped_call_expression"
+        )
+    }
+
+    /// A type name guessed from a factory or constructor function name.
+    ///
+    /// Needed because a call chained onto a factory names no receiver type at
+    /// the call site: `self.Depend.SfxOperationUseFactory(self.C).PayOperation()`
+    /// carries nothing to tell `PayOperation` on `SfxOperationUse` apart from
+    /// the same method on five other types — yet the factory's own name says
+    /// which one. Same for a constructor: `NewStore().get()` -> `Store`.
+    ///
+    /// Only names carrying one of the conventions produce a hint, so a plain
+    /// `lookup(id).run()` stays a name match instead of inventing a type. The
+    /// hint is a hypothesis either way: [`resolve_callee`](Self::resolve_callee)
+    /// keeps it only if a namesake is actually defined on a type of that name.
+    fn factory_type_hint(name: &str) -> Option<String> {
+        const CAMEL_SUFFIXES: [&str; 3] = ["Factory", "Provider", "Builder"];
+        const SNAKE_SUFFIXES: [&str; 3] = ["_factory", "_provider", "_builder"];
+        const CAMEL_PREFIXES: [&str; 2] = ["New", "Make"];
+        const SNAKE_PREFIXES: [&str; 2] = ["new_", "make_"];
+
+        let stem = CAMEL_SUFFIXES
+            .iter()
+            .chain(SNAKE_SUFFIXES.iter())
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .or_else(|| {
+                // `NewsFeed` must not be read as `New` + `sFeed`: after a
+                // CamelCase prefix the type name starts with a capital.
+                CAMEL_PREFIXES.iter().find_map(|prefix| {
+                    name.strip_prefix(prefix)
+                        .filter(|rest| rest.starts_with(char::is_uppercase))
+                })
+            })
+            .or_else(|| {
+                SNAKE_PREFIXES
+                    .iter()
+                    .find_map(|prefix| name.strip_prefix(prefix))
+            })?;
+
+        let stem = stem.trim_matches('_');
+        if stem.len() < 2 {
+            return None;
+        }
+        Some(Self::to_upper_camel(stem))
+    }
+
+    /// `store` -> `Store`, `sfx_operation` -> `SfxOperation`, `SfxOp` -> `SfxOp`.
+    /// Receiver types are CamelCase in every language where the factory
+    /// convention above appears, while function names may be snake_case.
+    fn to_upper_camel(name: &str) -> String {
+        if !name.contains('_') {
+            let mut chars = name.chars();
+            return match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+        }
+        name.split('_')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| {
+                let mut chars = segment.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// Scope hint for a call chained onto another call — the DI-factory and
+    /// constructor shape `factory(args).method()`, where the receiver is an
+    /// expression rather than a name and [`scope_hint_from`](Self::scope_hint_from)
+    /// has nothing to offer. Falls back to the callee name of the inner call,
+    /// turned into a type name by [`factory_type_hint`](Self::factory_type_hint).
+    /// The type of a selector chain used as a receiver: `self.C`,
+    /// `self.Depend.CustomerDocumentExtService`, `svc.Repo`.
+    ///
+    /// The base is either `self` — whose type the enclosing method declares —
+    /// or a name in scope, and each step after it is a field whose type the
+    /// struct declaration names. This is the shape behind
+    /// `self.C.Logger().SendError(err)`: nothing at the call site says what
+    /// `self.C` is, but the struct says `C ctx.Ctx` and the interface says
+    /// `Logger() *Logger`.
+    ///
+    /// Bounded at four links: a longer chain is not worth a walk on every call
+    /// site of a large corpus, and does not occur in practice.
+    fn selector_chain_type(&self, node: Node, source: &[u8], ctx: CallCtx) -> Option<String> {
+        let mut steps: Vec<String> = Vec::new();
+        let mut current = node;
+        loop {
+            match current.kind() {
+                "selector_expression" | "field_expression" | "member_expression" => {
+                    if steps.len() >= 4 {
+                        return None;
+                    }
+                    let field = current
+                        .child_by_field_name("field")
+                        .or_else(|| current.child_by_field_name("property"))
+                        .or_else(|| current.child_by_field_name("name"))?;
+                    steps.push(field.utf8_text(source).ok()?.to_string());
+                    current = current
+                        .child_by_field_name("operand")
+                        .or_else(|| current.child_by_field_name("object"))
+                        .or_else(|| current.child_by_field_name("argument"))?;
+                }
+                // The base of the chain.
+                "identifier" | "field_identifier" => {
+                    let base = current.utf8_text(source).ok()?;
+                    let mut type_name = match base {
+                        "self" | "this" | "Self" => ctx.self_type?.to_string(),
+                        name => ctx.local_type(name)?.to_string(),
+                    };
+                    // Walked outermost-first, so the fields apply in reverse.
+                    for field in steps.iter().rev() {
+                        type_name = self.types.field_type(
+                            &type_name,
+                            field,
+                            Some(types::directory_of(ctx.file)),
+                        )?;
+                    }
+                    return Some(type_name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The type a method call on `receiver_type` produces, for the middle of a
+    /// chain: the graph's own node when the type is a struct, and the
+    /// interface's declaration when it is an interface — an interface method
+    /// has no body and therefore no node, but it does state its result type.
+    fn method_result_type(
+        &self,
+        receiver_type: &str,
+        method: &str,
+        prefer_dir: Option<&str>,
+    ) -> Option<String> {
+        if let Some(declared) =
+            self.types
+                .interface_method_result(receiver_type, method, prefer_dir)
+        {
+            return Some(declared);
+        }
+        let candidates = self.name_index.get(method)?;
+        let mut on_receiver = candidates
+            .iter()
+            .filter(|key| self.receiver_matches(key, receiver_type, true));
+        let first = on_receiver.next()?;
+        if on_receiver.next().is_some() {
+            return None;
+        }
+        self.nodes
+            .get(first.as_str())
+            .and_then(|node| node.result_type.clone())
+    }
+
+    fn chained_call_scope_hint(
+        &self,
+        operand: Node,
+        source: &[u8],
+        ctx: CallCtx,
+    ) -> Option<(String, bool)> {
+        if !Self::is_call_kind(operand.kind()) {
+            return None;
+        }
+        // What the inner call declares it returns beats what its name
+        // suggests: `accountRepo(ctx)` is an ordinary helper whose name says
+        // nothing, while its result list says everything. The naming
+        // convention stays as the answer for calls the graph cannot identify
+        // — a factory held in a struct field, most of this corpus.
+        let (callee, _) = Self::callee_slot(operand)?;
+        let described = self.describe_callee_in(callee, source, ctx)?;
+        // A declared result type was read; a factory name was only inferred.
+        // The flag is what keeps the two apart in the reported resolution.
+        if let Some(declared) = self.call_result_type(&described, ctx) {
+            return Some((declared, false));
+        }
+        // The inner call sits on a typed receiver of its own
+        // (`self.C.Logger()`), so its result can be read off that type's
+        // declaration even when the method itself is not a graph node.
+        if let Some(receiver_type) = described.2.as_deref() {
+            if let Some(declared) = self.method_result_type(
+                receiver_type,
+                &described.0,
+                Some(types::directory_of(ctx.file)),
+            ) {
+                return Some((declared, false));
+            }
+        }
+        Self::factory_type_hint(&described.0).map(|inferred| (inferred, true))
+    }
+
+    /// Describe the callee slot of a call:
+    /// `(name, call type, scope hint, hint was inferred)`.
     ///
     /// Each language spells a method callee differently, and the name always
     /// lives in a named field: Go `selector_expression.field`, Python
@@ -806,11 +3014,15 @@ impl CallGraph {
     /// `member_access_expression.name`, Kotlin/Swift `navigation_expression`'s
     /// trailing `navigation_suffix`, Rust/C `field_expression.field`.
     /// Returns `None` for shapes it does not know so the caller can fall back.
-    fn describe_callee(
+    /// The last element is set when the scope hint was inferred from a factory
+    /// name rather than read off the call site (see
+    /// [`chained_call_scope_hint`](Self::chained_call_scope_hint)).
+    fn describe_callee_in(
         &self,
         node: Node,
         source: &[u8],
-    ) -> Option<(String, CallType, Option<String>)> {
+        ctx: CallCtx,
+    ) -> Option<(String, CallType, Option<String>, bool)> {
         let kind = node.kind();
         let text_of = |n: Node| n.utf8_text(source).ok().map(|s| s.to_string());
 
@@ -820,7 +3032,7 @@ impl CallGraph {
             | "property_identifier"
             | "simple_identifier"
             | "name"
-            | "constant" => Some((text_of(node)?, CallType::Direct, None)),
+            | "constant" => Some((text_of(node)?, CallType::Direct, None, false)),
 
             "selector_expression"
             | "attribute"
@@ -837,14 +3049,29 @@ impl CallGraph {
                     .child_by_field_name(name_field)
                     .and_then(text_of)
                     .or_else(|| self.get_last_identifier(node, source))?;
-                let scope = node
+                let receiver = node
                     .child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("operand"))
                     .or_else(|| node.child_by_field_name("expression"))
                     .or_else(|| node.child_by_field_name("value"))
-                    .or_else(|| node.child_by_field_name("argument"))
-                    .and_then(|receiver| Self::scope_hint_from(receiver, source));
-                Some((name, CallType::Method, scope))
+                    .or_else(|| node.child_by_field_name("argument"));
+                let scope =
+                    receiver.and_then(|node| Self::scope_hint_from(node, source, ctx.self_type));
+                if scope.is_none() {
+                    if let Some((chained, inferred)) =
+                        receiver.and_then(|node| self.chained_call_scope_hint(node, source, ctx))
+                    {
+                        return Some((name, CallType::Method, Some(chained), inferred));
+                    }
+                    // `self.Depend.X.M()`: the receiver is a chain of fields,
+                    // and every link's type is declared somewhere.
+                    if let Some(declared) =
+                        receiver.and_then(|node| self.selector_chain_type(node, source, ctx))
+                    {
+                        return Some((name, CallType::Method, Some(declared), false));
+                    }
+                }
+                Some((name, CallType::Method, scope, false))
             }
 
             // Kotlin/Swift: `target . (navigation_suffix suffix)`. The suffix is
@@ -856,11 +3083,19 @@ impl CallGraph {
                     .filter(|child| child.kind() == "navigation_suffix")
                     .last()?;
                 let name = self.get_last_identifier(suffix, source)?;
-                let scope = node
+                let target = node
                     .child_by_field_name("target")
-                    .or_else(|| node.named_child(0))
-                    .and_then(|target| Self::scope_hint_from(target, source));
-                Some((name, CallType::Method, scope))
+                    .or_else(|| node.named_child(0));
+                let scope =
+                    target.and_then(|node| Self::scope_hint_from(node, source, ctx.self_type));
+                if scope.is_none() {
+                    if let Some((chained, inferred)) =
+                        target.and_then(|node| self.chained_call_scope_hint(node, source, ctx))
+                    {
+                        return Some((name, CallType::Method, Some(chained), inferred));
+                    }
+                }
+                Some((name, CallType::Method, scope, false))
             }
 
             "scoped_identifier" | "qualified_identifier" => {
@@ -869,7 +3104,7 @@ impl CallGraph {
                     .child_by_field_name("name")
                     .and_then(text_of)
                     .or_else(|| self.get_last_identifier(node, source))?;
-                Some((name, CallType::StaticMethod, scope))
+                Some((name, CallType::StaticMethod, scope, false))
             }
 
             _ => None,
@@ -880,23 +3115,21 @@ impl CallGraph {
     /// and turn it into an edge. Returns `None` for call shapes without a known
     /// callee field (BSL among them) so [`extract_call_edge`](Self::extract_call_edge)
     /// can fall back to its sibling scan.
-    fn extract_call_edge_by_fields(
-        &self,
-        node: Node,
-        source: &[u8],
-        path: &str,
-    ) -> Option<CallEdge> {
-        let kind = node.kind();
-
-        // `receiver` is set only for shapes where the callee node itself does
-        // not carry the receiver (Ruby `call`, Java/PHP method invocations).
-        let (callee, receiver) = match kind {
-            "call_expression" | "call" | "invocation_expression" | "function_call_expression" => {
+    /// The callee node of a call, plus a separate receiver node for the shapes
+    /// where the callee itself does not carry one (Ruby `call`, Java/PHP method
+    /// invocations). `None` for call shapes without a known callee field.
+    fn callee_slot(node: Node) -> Option<(Node, Option<Node>)> {
+        match node.kind() {
+            "call_expression"
+            | "call"
+            | "method_call_expression"
+            | "invocation_expression"
+            | "function_call_expression" => {
                 if let Some(function) = node.child_by_field_name("function") {
-                    (function, None)
+                    Some((function, None))
                 } else if let Some(method) = node.child_by_field_name("method") {
                     // Ruby: `(call receiver: (identifier) method: (identifier))`
-                    (method, node.child_by_field_name("receiver"))
+                    Some((method, node.child_by_field_name("receiver")))
                 } else {
                     // Kotlin/Swift: callee and `call_suffix` are unnamed children.
                     let mut walker = node.walk();
@@ -905,19 +3138,32 @@ impl CallGraph {
                             && !child.kind().contains("argument")
                             && child.kind() != "call_suffix"
                     })?;
-                    (callee, None)
+                    Some((callee, None))
                 }
             }
             // Java `obj.m()`, PHP `$obj->m()` and `Obj::m()`.
-            "method_invocation" | "member_call_expression" | "scoped_call_expression" => (
+            "method_invocation" | "member_call_expression" | "scoped_call_expression" => Some((
                 node.child_by_field_name("name")?,
                 node.child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("scope")),
-            ),
-            _ => return None,
-        };
+            )),
+            _ => None,
+        }
+    }
 
-        let (target, mut call_type, mut scope_hint) = self.describe_callee(callee, source)?;
+    /// The edge plus whether its scope hint was inferred rather than read; see
+    /// [`extract_call_edge`](Self::extract_call_edge).
+    fn extract_call_edge_by_fields(
+        &self,
+        node: Node,
+        source: &[u8],
+        ctx: CallCtx,
+    ) -> Option<(CallEdge, bool)> {
+        let kind = node.kind();
+        let (callee, receiver) = Self::callee_slot(node)?;
+
+        let (target, mut call_type, mut scope_hint, mut scope_inferred) =
+            self.describe_callee_in(callee, source, ctx)?;
 
         if let Some(receiver) = receiver {
             call_type = if kind == "scoped_call_expression" {
@@ -925,24 +3171,47 @@ impl CallGraph {
             } else {
                 CallType::Method
             };
-            scope_hint = Self::scope_hint_from(receiver, source);
+            scope_hint = Self::scope_hint_from(receiver, source, ctx.self_type);
+            scope_inferred = false;
+            if scope_hint.is_none() {
+                if let Some((chained, inferred)) =
+                    self.chained_call_scope_hint(receiver, source, ctx)
+                {
+                    scope_hint = Some(chained);
+                    scope_inferred = inferred;
+                }
+            }
         }
 
-        Some(CallEdge {
-            target,
-            file_path: path.to_string(),
-            line: node.start_position().row + 1,
-            column: node.start_position().column + 1,
-            call_type,
-            scope_hint,
-            resolved: false,
-            resolution: CallResolution::Unknown,
-        })
+        Some((
+            CallEdge {
+                target: target.into(),
+                file_path: ctx.file.into(),
+                line: node.start_position().row + 1,
+                column: node.start_position().column + 1,
+                call_type,
+                scope_hint: scope_hint.map(Into::into),
+                resolved: false,
+                resolution: CallResolution::Unknown,
+            },
+            scope_inferred,
+        ))
     }
 
-    fn extract_call_edge(&self, node: Node, source: &[u8], path: &str) -> Option<CallEdge> {
-        if let Some(edge) = self.extract_call_edge_by_fields(node, source, path) {
-            return Some(edge);
+    /// The edge for a call site, plus whether its `scope_hint` was inferred
+    /// from a factory name instead of read off the call site — the flag
+    /// `resolve_callee` needs to label the match honestly.
+    fn extract_call_edge(
+        &self,
+        node: Node,
+        source: &[u8],
+        ctx: CallCtx,
+    ) -> Option<(CallEdge, bool)> {
+        if let Some(found) = self.extract_call_edge_by_fields(node, source, ctx) {
+            return Some(found);
+        }
+        if node.kind() == "method_call" {
+            return Self::bsl_method_call_edge(node, source, ctx);
         }
 
         let mut cursor = node.walk();
@@ -977,12 +3246,13 @@ impl CallGraph {
                 }
                 "access" => {
                     // BSL qualified call `Module.Func()`: `access` holds the
-                    // module name, used as the scope hint for resolution.
-                    scope_hint = self.get_last_identifier(child, source);
+                    // receiver, used as the scope hint for resolution.
+                    scope_hint = Self::bsl_receiver_name(child, source);
                 }
                 "method_call" => {
-                    // BSL `name: (identifier)` inside a `call_expression`.
-                    if let Some(method) = self.get_last_identifier(child, source) {
+                    // BSL `name: (identifier)` inside a `call_expression`; the
+                    // arguments are identifiers too, so only the name field.
+                    if let Some(method) = Self::bsl_method_name(child, source) {
                         target = Some(method);
                         call_type = CallType::Method;
                     }
@@ -995,16 +3265,69 @@ impl CallGraph {
             }
         }
 
-        target.map(|name| CallEdge {
-            target: name,
-            file_path: path.to_string(),
-            line: node.start_position().row + 1,
-            column: node.start_position().column + 1,
-            call_type,
-            scope_hint,
-            resolved: false,
-            resolution: CallResolution::Unknown,
+        target.map(|name| {
+            (
+                CallEdge {
+                    target: name.into(),
+                    file_path: ctx.file.into(),
+                    line: node.start_position().row + 1,
+                    column: node.start_position().column + 1,
+                    call_type,
+                    scope_hint: scope_hint.map(Into::into),
+                    resolved: false,
+                    resolution: CallResolution::Unknown,
+                },
+                false,
+            )
         })
+    }
+
+    fn bsl_method_name(method_call: Node, source: &[u8]) -> Option<String> {
+        let name = method_call.child_by_field_name("name")?;
+        name.utf8_text(source).ok().map(str::to_string)
+    }
+
+    /// The name a BSL receiver ends in: `Модуль` for `Модуль.Ф()`, `Склады`
+    /// for `Справочники.Склады.Ф()`. `None` when the receiver is itself a call
+    /// result (`Х.Элементы().Ф()`) — then no name says what it is.
+    fn bsl_receiver_name(receiver: Node, source: &[u8]) -> Option<String> {
+        match receiver.kind() {
+            "identifier" | "property" => receiver.utf8_text(source).ok().map(str::to_string),
+            "access" | "property_access" => {
+                let mut cursor = receiver.walk();
+                let last = receiver.named_children(&mut cursor).last()?;
+                Self::bsl_receiver_name(last, source)
+            }
+            _ => None,
+        }
+    }
+
+    /// A BSL `method_call` on its own: a plain call `Процедура()`, or a link
+    /// of a chain `Х.Метод().Другой()` whose receiver is the node before it
+    /// inside the parent `access`.
+    fn bsl_method_call_edge(node: Node, source: &[u8], ctx: CallCtx) -> Option<(CallEdge, bool)> {
+        let target = Self::bsl_method_name(node, source)?;
+        let (call_type, scope_hint) = match node.parent().filter(|p| p.kind() == "access") {
+            Some(_) => (
+                CallType::Method,
+                node.prev_named_sibling()
+                    .and_then(|receiver| Self::bsl_receiver_name(receiver, source)),
+            ),
+            None => (CallType::Direct, None),
+        };
+        Some((
+            CallEdge {
+                target: target.into(),
+                file_path: ctx.file.into(),
+                line: node.start_position().row + 1,
+                column: node.start_position().column + 1,
+                call_type,
+                scope_hint: scope_hint.map(Into::into),
+                resolved: false,
+                resolution: CallResolution::Unknown,
+            },
+            false,
+        ))
     }
 
     fn get_last_identifier(&self, node: Node, source: &[u8]) -> Option<String> {
@@ -1283,11 +3606,17 @@ impl CallGraph {
                 if let Some(key) = by_receiver {
                     return Some(key.clone());
                 }
+                let qualifier_path = Self::scope_path_fragment(qualifier);
                 let by_path = matches.iter().find(|key| {
-                    self.key_file_path(key)
-                        .map(|file_path| {
-                            file_path.ends_with(qualifier)
-                                || Self::scope_matches_file_path(qualifier, &file_path)
+                    let Some(file_path) = self.key_file_path(key) else {
+                        return false;
+                    };
+                    if file_path.ends_with(qualifier) {
+                        return true;
+                    }
+                    self.key_file_path_lower(key)
+                        .map(|file_path_lower| {
+                            Self::path_fragment_matches(&qualifier_path, &file_path_lower)
                         })
                         .unwrap_or(false)
                 });
@@ -1379,17 +3708,17 @@ impl CallGraph {
     /// Build the reverse adjacency (callee key -> caller edges) on demand.
     /// `called_by` is no longer stored (halves edge memory); reverse queries
     /// scan the forward `calls` once. O(E), transient.
-    pub fn reverse_edges(&self) -> HashMap<String, Vec<CallEdge>> {
-        let mut rev: HashMap<String, Vec<CallEdge>> = HashMap::new();
+    pub fn reverse_edges(&self) -> HashMap<Arc<str>, Vec<CallEdge>> {
+        let mut rev: HashMap<Arc<str>, Vec<CallEdge>> = HashMap::new();
         for entry in self.nodes.iter() {
-            let caller = entry.key();
+            let caller: Arc<str> = Arc::from(entry.key().as_str());
             for e in &entry.value().calls {
                 rev.entry(e.target.clone()).or_default().push(CallEdge {
                     target: caller.clone(),
                     file_path: e.file_path.clone(),
                     line: e.line,
                     column: e.column,
-                    call_type: e.call_type.clone(),
+                    call_type: e.call_type,
                     scope_hint: None,
                     resolved: true,
                     // How the *forward* edge was matched is what a reader of
@@ -1402,10 +3731,62 @@ impl CallGraph {
     }
 
     /// Build incoming call counts (callee key -> number of callers) on demand.
-    fn incoming_counts(&self) -> HashMap<String, usize> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+    fn incoming_counts(&self) -> HashMap<Arc<str>, usize> {
+        let mut counts: HashMap<Arc<str>, usize> = HashMap::new();
         for entry in self.nodes.iter() {
             for e in &entry.value().calls {
+                *counts.entry(e.target.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// Does this edge of `caller` count as a connection when ranking functions?
+    ///
+    /// A name-only pick is a guess among namesakes: every `v.len()` on a `Vec`
+    /// lands on whichever project `len` was picked, which made a three-line
+    /// cache accessor the most-called function in narsil itself. A same-file
+    /// pick on a value (`v.len()` next to some `fn len`) is a guess too,
+    /// unless caller and callee are methods of one type — `self.add_edge()`
+    /// inside `CfgBuilder` — and a plain `helper()` goes, by scoping, to the
+    /// function in its own file.
+    fn counts_as_connection(caller: &str, edge: &CallEdge) -> bool {
+        match edge.resolution {
+            CallResolution::NameOnly => false,
+            CallResolution::SameFile if edge.call_type == CallType::Method => {
+                let receiver = Self::key_receiver(caller);
+                receiver.is_some() && receiver == Self::key_receiver(&edge.target)
+            }
+            resolution => !resolution.is_outside_graph(),
+        }
+    }
+
+    /// The type of a method key `file::Type::name`; `None` for `file::name`.
+    fn key_receiver(key: &str) -> Option<&str> {
+        let mut parts = key.rsplitn(3, "::");
+        let _name = parts.next()?;
+        let receiver = parts.next()?;
+        parts.next().map(|_| receiver)
+    }
+
+    /// Incoming connection counts (callee key -> callers), over edges that
+    /// [`counts_as_connection`](Self::counts_as_connection) and whose caller
+    /// passes `include_caller`.
+    fn connection_counts(
+        &self,
+        include_caller: impl Fn(&CallNode) -> bool,
+    ) -> HashMap<Arc<str>, usize> {
+        let mut counts: HashMap<Arc<str>, usize> = HashMap::new();
+        for entry in self.nodes.iter() {
+            if !include_caller(entry.value()) {
+                continue;
+            }
+            for e in entry
+                .value()
+                .calls
+                .iter()
+                .filter(|e| Self::counts_as_connection(entry.key(), e))
+            {
                 *counts.entry(e.target.clone()).or_default() += 1;
             }
         }
@@ -1423,7 +3804,7 @@ impl CallGraph {
     /// reverse adjacency.
     ///
     /// [`reverse_edges`](Self::reverse_edges) allocates a `CallEdge` with two
-    /// cloned `String`s for every edge in the graph — 24k of them on narsil's
+    /// cloned strings for every edge in the graph — 24k of them on narsil's
     /// own `src/`, 14.66 ms — and then discards all but one bucket. The scan
     /// is still O(E), but only the edges actually returned are cloned.
     fn callers_of(&self, callee: &str) -> Vec<CallEdge> {
@@ -1431,15 +3812,15 @@ impl CallGraph {
         for entry in self.nodes.iter() {
             let caller = entry.key();
             for e in &entry.value().calls {
-                if e.target != callee {
+                if &*e.target != callee {
                     continue;
                 }
                 callers.push(CallEdge {
-                    target: caller.clone(),
+                    target: Arc::from(caller.as_str()),
                     file_path: e.file_path.clone(),
                     line: e.line,
                     column: e.column,
-                    call_type: e.call_type.clone(),
+                    call_type: e.call_type,
                     scope_hint: None,
                     resolved: true,
                     // How the *forward* edge was matched is what a reader of
@@ -1482,11 +3863,11 @@ impl CallGraph {
             }
 
             if depth < max_depth {
-                if let Some(callers) = rev.get(&func) {
+                if let Some(callers) = rev.get(func.as_str()) {
                     for caller in callers {
-                        if !visited.contains(&caller.target) {
-                            visited.insert(caller.target.clone());
-                            queue.push_back((caller.target.clone(), depth + 1));
+                        if !visited.contains(&*caller.target) {
+                            visited.insert(caller.target.to_string());
+                            queue.push_back((caller.target.to_string(), depth + 1));
                         }
                     }
                 }
@@ -1516,9 +3897,9 @@ impl CallGraph {
             if depth < max_depth {
                 if let Some(node) = self.nodes.get(&func) {
                     for callee in &node.calls {
-                        if !visited.contains(&callee.target) {
-                            visited.insert(callee.target.clone());
-                            queue.push_back((callee.target.clone(), depth + 1));
+                        if !visited.contains(&*callee.target) {
+                            visited.insert(callee.target.to_string());
+                            queue.push_back((callee.target.to_string(), depth + 1));
                         }
                     }
                 }
@@ -1555,10 +3936,10 @@ impl CallGraph {
 
             if let Some(node) = self.nodes.get(&current) {
                 for callee in &node.calls {
-                    if !visited.contains(&callee.target) {
-                        visited.insert(callee.target.clone());
-                        predecessors.insert(callee.target.clone(), current.clone());
-                        queue.push_back(callee.target.clone());
+                    if !visited.contains(&*callee.target) {
+                        visited.insert(callee.target.to_string());
+                        predecessors.insert(callee.target.to_string(), current.clone());
+                        queue.push_back(callee.target.to_string());
                     }
                 }
             }
@@ -1607,30 +3988,42 @@ impl CallGraph {
         }
     }
 
-    /// Get highly connected functions (potential refactoring targets).
-    /// Filters out generic trait methods and limits output.
-    pub fn get_hotspots(&self, min_connections: usize) -> Vec<(String, usize, usize)> {
+    /// Get highly connected functions (potential refactoring targets) as
+    /// `(key, incoming, outgoing)`, most connected first. Generic trait
+    /// methods are skipped and only edges that
+    /// [`count as connections`](Self::counts_as_connection) are counted.
+    /// With `exclude_tests`, functions in test files are neither listed nor
+    /// counted as callers.
+    pub fn get_hotspots(
+        &self,
+        min_connections: usize,
+        exclude_tests: bool,
+    ) -> Vec<(String, usize, usize)> {
+        use crate::security_rules::is_test_file;
+
+        let keep = |node: &CallNode| !exclude_tests || !is_test_file(&node.file_path);
+        let counts = self.connection_counts(keep);
         let mut hotspots = Vec::new();
-        let counts = self.incoming_counts();
 
         for entry in self.nodes.iter() {
             let key = entry.key();
-
-            // Skip generic trait method implementations
-            if Self::is_trait_method(key) {
+            if Self::is_trait_method(key) || !keep(entry.value()) {
                 continue;
             }
 
-            let incoming = counts.get(key).copied().unwrap_or(0);
-            let outgoing = entry.calls.len();
-            let total = incoming + outgoing;
+            let incoming = counts.get(key.as_str()).copied().unwrap_or(0);
+            let outgoing = entry
+                .calls
+                .iter()
+                .filter(|e| Self::counts_as_connection(key, e))
+                .count();
 
-            if total >= min_connections {
+            if incoming + outgoing >= min_connections {
                 hotspots.push((key.clone(), incoming, outgoing));
             }
         }
 
-        hotspots.sort_by_key(|hotspot| std::cmp::Reverse(hotspot.1 + hotspot.2));
+        hotspots.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
         hotspots
     }
 
@@ -1638,9 +4031,10 @@ impl CallGraph {
     pub fn get_hotspots_limited(
         &self,
         min_connections: usize,
+        exclude_tests: bool,
         limit: usize,
     ) -> Vec<(String, usize, usize)> {
-        let mut hotspots = self.get_hotspots(min_connections);
+        let mut hotspots = self.get_hotspots(min_connections, exclude_tests);
         hotspots.truncate(limit);
         hotspots
     }
@@ -1745,11 +4139,14 @@ impl CallGraph {
 
                 // Top callers
                 md.push_str("## Most Called Functions\n\n");
-                let counts = self.incoming_counts();
+                let counts = self.connection_counts(|_| true);
                 let mut by_callers: Vec<_> = self
                     .nodes
                     .iter()
-                    .map(|e| (e.key().clone(), counts.get(e.key()).copied().unwrap_or(0)))
+                    .map(|e| {
+                        let count = counts.get(e.key().as_str()).copied().unwrap_or(0);
+                        (e.key().clone(), count)
+                    })
                     .collect();
                 by_callers.sort_by_key(|caller| std::cmp::Reverse(caller.1));
 
@@ -1791,7 +4188,7 @@ impl CallGraph {
 
         let counts = self.incoming_counts();
         for entry in self.nodes.iter() {
-            if counts.get(entry.key()).copied().unwrap_or(0) == 0 {
+            if counts.get(entry.key().as_str()).copied().unwrap_or(0) == 0 {
                 entry_points.push(entry.key().clone());
             } else {
                 others.push(entry.key().clone());
@@ -1812,6 +4209,53 @@ impl CallGraph {
     }
 
     /// Get the number of nodes in the call graph
+    /// How many edges were resolved each way, most certain first.
+    ///
+    /// Resolution quality is otherwise invisible: a corpus whose calls stop
+    /// resolving (a grammar change, a naming convention this reading does not
+    /// cover) produces exactly the same number of edges, pointing at worse
+    /// targets. This is what makes that visible in `get_index_status`.
+    ///
+    /// The three "not in graph" rows are reported apart because one lumped
+    /// figure could not be acted on. Half the edges of a Go corpus leaving
+    /// the graph is normal — those are calls into the standard library and
+    /// into dependencies nobody indexed — while an *indexed* package with no
+    /// such function is a gap in what was read, and a name declared nowhere
+    /// at all sits between the two. Read together they were indistinguishable,
+    /// so a healthy 47% looked like half a lost graph.
+    pub fn resolution_stats(&self) -> Vec<(&'static str, usize)> {
+        let mut counts = [0usize; 10];
+        for node in self.nodes.iter() {
+            for edge in &node.calls {
+                let slot = match edge.resolution {
+                    CallResolution::Unique => 0,
+                    CallResolution::Receiver => 1,
+                    CallResolution::Scope => 2,
+                    CallResolution::InterfaceImpl => 3,
+                    CallResolution::FactoryReceiver => 4,
+                    CallResolution::SameFile => 5,
+                    CallResolution::NameOnly => 6,
+                    CallResolution::ExternalPackage => 7,
+                    CallResolution::PackageMissing => 8,
+                    CallResolution::Unresolved | CallResolution::Unknown => 9,
+                };
+                counts[slot] += 1;
+            }
+        }
+        vec![
+            ("unique name", counts[0]),
+            ("receiver type read", counts[1]),
+            ("package or module scope", counts[2]),
+            ("single interface implementation", counts[3]),
+            ("receiver inferred from a naming convention", counts[4]),
+            ("same file as caller", counts[5]),
+            ("name match only", counts[6]),
+            ("not in graph: outside the index", counts[7]),
+            ("not in graph: indexed package, no such function", counts[8]),
+            ("not in graph: name not declared anywhere", counts[9]),
+        ]
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -1822,14 +4266,15 @@ impl CallGraph {
         let mut bytes = 0usize;
         for node in self.nodes.iter() {
             bytes += node.name.len() + node.file_path.len();
-            for e in node.calls.iter() {
-                edges += 1;
-                bytes += e.target.len()
-                    + e.file_path.len()
-                    + e.scope_hint.as_deref().map_or(0, str::len)
-                    + 24;
-            }
+            edges += node.calls.len();
+            bytes += node.calls.capacity() * std::mem::size_of::<CallEdge>();
         }
+        // The strings of the edges, each counted once with its `Arc` header.
+        bytes += self
+            .strings
+            .iter()
+            .map(|held| held.len() + 2 * std::mem::size_of::<usize>())
+            .sum::<usize>();
         for e in self.name_index.iter() {
             bytes += e.key().len() + e.value().iter().map(|s| s.len() + 24).sum::<usize>();
         }
@@ -1839,46 +4284,220 @@ impl CallGraph {
         (self.nodes.len(), edges, bytes)
     }
 
-    /// Serialize call graph to JSON
-    pub fn to_json(&self) -> Result<String> {
-        let nodes: Vec<(String, CallNode)> = self
-            .nodes
-            .iter()
-            .map(|ref_multi| (ref_multi.key().clone(), ref_multi.value().clone()))
-            .collect();
-        serde_json::to_string(&nodes).map_err(|e| anyhow!("Failed to serialize call-graph: {}", e))
+    /// The graph as postcard bytes, carrying `stamp` to tie it to the index
+    /// saved with it. Keys are sorted so that equal graphs give equal bytes;
+    /// every list keeps its order, `name_index` included, which decides
+    /// between namesakes.
+    pub fn to_snapshot(&self, stamp: &str) -> Result<Vec<u8>> {
+        fn sorted_keys<V>(map: &FastMap<String, V>) -> Vec<String> {
+            let mut keys: Vec<String> = map.iter().map(|e| e.key().clone()).collect();
+            keys.sort_unstable();
+            keys
+        }
+        let mut table = StringTable::default();
+
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for key in sorted_keys(&self.nodes) {
+            let Some(node) = self.nodes.get(&key) else {
+                continue;
+            };
+            let CallNode {
+                name,
+                file_path,
+                line,
+                calls,
+                metrics,
+                receiver,
+                result_type,
+                intercepts,
+            } = &*node;
+            let calls = calls
+                .iter()
+                .map(|edge| {
+                    let CallEdge {
+                        target,
+                        file_path: edge_file,
+                        line,
+                        column,
+                        call_type,
+                        scope_hint,
+                        resolved,
+                        resolution,
+                    } = edge;
+                    SnapshotEdge {
+                        target: table.id(target),
+                        file_path: (**edge_file != **file_path).then(|| table.id(edge_file)),
+                        line: *line,
+                        column: *column,
+                        call_type: *call_type,
+                        scope_hint: scope_hint.as_deref().map(|hint| table.id(hint)),
+                        resolved: *resolved,
+                        resolution: *resolution,
+                    }
+                })
+                .collect();
+            nodes.push(SnapshotNode {
+                key: table.id(&key),
+                name: table.id(name),
+                file_path: table.id(file_path),
+                line: *line,
+                calls,
+                metrics: metrics.clone(),
+                receiver: receiver.clone(),
+                result_type: result_type.clone(),
+                intercepts: intercepts.clone(),
+            });
+        }
+        let mut lists = |map: &FastMap<String, Vec<String>>| -> Vec<(u32, Vec<u32>)> {
+            sorted_keys(map)
+                .into_iter()
+                .filter_map(|key| {
+                    let list = map.get(&key)?;
+                    Some((table.id(&key), table.ids(&list)))
+                })
+                .collect()
+        };
+        let name_index = lists(&self.name_index);
+        let file_functions = lists(&self.file_functions);
+
+        let snapshot = Snapshot {
+            strings: table.strings,
+            nodes,
+            name_index,
+            file_functions,
+            types: self.types.to_snapshot(),
+            platform_entries: self.platform_entries(),
+        };
+        // The stamp first, so a snapshot of another save is rejected without
+        // decoding the rest.
+        let bytes = postcard::to_stdvec(stamp)
+            .map_err(|e| anyhow!("Failed to serialize call-graph: {e}"))?;
+        postcard::to_extend(&snapshot, bytes)
+            .map_err(|e| anyhow!("Failed to serialize call-graph: {e}"))
     }
 
-    /// Replace this graph's contents with the serialized one.
+    /// Replace this graph's contents with the snapshot, provided it carries
+    /// `stamp` (any snapshot when `None`). Returns whether it was loaded; a
+    /// snapshot with another stamp leaves the graph untouched.
     ///
     /// Replacement, not a merge. Merging into a graph that was just built from
     /// source can only contribute staleness: a function deleted from the code
-    /// comes back from the snapshot, outlives `find_symbols`, and `to_json`
-    /// writes it out again on the next save, so the phantom is self-sustaining.
+    /// comes back from the snapshot, outlives `find_symbols`, and the next
+    /// save writes it out again, so the phantom is self-sustaining.
     ///
-    /// `file_functions` is rebuilt from the loaded nodes as well. Without it
-    /// the incremental re-index cannot evict anything that arrived this way —
+    /// `file_functions` comes back as well. Without it the incremental
+    /// re-index cannot evict anything that arrived this way —
     /// `remove_functions_for_file` looks the file up there and finds nothing.
-    pub fn from_json(&self, json: &str) -> Result<()> {
-        let nodes: Vec<(String, CallNode)> = serde_json::from_str(json)
-            .map_err(|e| anyhow!("Failed to deserialize call-graph: {}", e))?;
+    pub fn from_snapshot(&self, bytes: &[u8], stamp: Option<&str>) -> Result<bool> {
+        let (saved_stamp, rest) = postcard::take_from_bytes::<String>(bytes)
+            .map_err(|e| anyhow!("Failed to deserialize call-graph: {e}"))?;
+        if stamp.is_some_and(|wanted| wanted != saved_stamp) {
+            return Ok(false);
+        }
+        let snapshot: Snapshot = postcard::from_bytes(rest)
+            .map_err(|e| anyhow!("Failed to deserialize call-graph: {e}"))?;
+        let strings = &snapshot.strings;
+        let missing = |id: u32| {
+            anyhow!(
+                "Call-graph snapshot refers to string {id} of {}",
+                strings.len()
+            )
+        };
+        let text = |id: u32| -> Result<String> {
+            strings.get(id as usize).cloned().ok_or_else(|| missing(id))
+        };
+        let texts =
+            |ids: &[u32]| -> Result<Vec<String>> { ids.iter().map(|&id| text(id)).collect() };
+        // Edges share one copy of each string, made on first use.
+        let mut shared: Vec<Option<Arc<str>>> = vec![None; strings.len()];
+        let mut share = |id: u32| -> Result<Arc<str>> {
+            let slot = shared.get_mut(id as usize).ok_or_else(|| missing(id))?;
+            Ok(Arc::clone(slot.get_or_insert_with(|| {
+                Arc::from(strings[id as usize].as_str())
+            })))
+        };
+
+        // Decoded in full before anything is replaced: a bad snapshot leaves
+        // the graph as it was.
+        let mut nodes = Vec::with_capacity(snapshot.nodes.len());
+        for node in &snapshot.nodes {
+            let file_path = text(node.file_path)?;
+            let mut calls = Vec::with_capacity(node.calls.len());
+            for edge in &node.calls {
+                calls.push(CallEdge {
+                    target: share(edge.target)?,
+                    file_path: share(edge.file_path.unwrap_or(node.file_path))?,
+                    line: edge.line,
+                    column: edge.column,
+                    call_type: edge.call_type,
+                    scope_hint: edge.scope_hint.map(&mut share).transpose()?,
+                    resolved: edge.resolved,
+                    resolution: edge.resolution,
+                });
+            }
+            nodes.push((
+                text(node.key)?,
+                CallNode {
+                    name: text(node.name)?,
+                    file_path,
+                    line: node.line,
+                    calls,
+                    metrics: node.metrics.clone(),
+                    receiver: node.receiver.clone(),
+                    result_type: node.result_type.clone(),
+                    intercepts: node.intercepts.clone(),
+                },
+            ));
+        }
+        let lists = |lists: &[(u32, Vec<u32>)]| -> Result<Vec<(String, Vec<String>)>> {
+            lists
+                .iter()
+                .map(|(key, list)| Ok((text(*key)?, texts(list)?)))
+                .collect()
+        };
+        let name_index = lists(&snapshot.name_index)?;
+        let file_functions = lists(&snapshot.file_functions)?;
 
         self.nodes.clear();
         self.name_index.clear();
         self.file_functions.clear();
-
-        let mut per_file: HashMap<String, Vec<String>> = HashMap::new();
-        for (key, node) in nodes {
-            per_file
-                .entry(node.file_path.clone())
-                .or_default()
-                .push(key.clone());
-            self.insert_node(key, node);
+        self.strings.clear();
+        for held in shared.into_iter().flatten() {
+            self.strings.insert(held);
         }
-        for (path, keys) in per_file {
+        self.file_path_lower_cache.clear();
+        self.import_dir_cache.clear();
+        self.implements_cache.clear();
+        self.interface_methods_cache.clear();
+        self.drop_bsl_module_files();
+
+        for (key, node) in nodes {
+            self.nodes.insert(key, node);
+        }
+        for (name, keys) in name_index {
+            self.name_index.insert(name, keys);
+        }
+        for (path, keys) in file_functions {
             self.file_functions.insert(path, keys);
         }
-        Ok(())
+        self.types.load_snapshot(snapshot.types);
+        self.platform_entries.clear();
+        for (key, reason) in snapshot.platform_entries {
+            self.platform_entries.insert(key, reason);
+        }
+        Ok(true)
+    }
+
+    /// `module::procedure` keys of the procedures the platform calls, with
+    /// the reason, sorted by key.
+    pub fn platform_entries(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .platform_entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        entries.sort_unstable();
+        entries
     }
 
     /// Get all nodes (for iteration)
@@ -1925,6 +4544,117 @@ fn extract_function_name(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// The events the platform raises on the module a file holds, by the file's
+/// name: (module kind, events), each event in Russian and English.
+/// An event's procedure name, lowercased: (Russian, English).
+type BslEventName = (&'static str, &'static str);
+
+const BSL_MODULE_EVENTS: &[(&str, &str, &[BslEventName])] = &[
+    (
+        "ObjectModule.bsl",
+        "object module",
+        &[
+            ("передзаписью", "beforewrite"),
+            ("призаписи", "onwrite"),
+            ("передудалением", "beforedelete"),
+            ("обработказаполнения", "filling"),
+            ("обработкапроверкизаполнения", "fillcheckprocessing"),
+            ("прикопировании", "oncopy"),
+            ("обработкапроведения", "posting"),
+            ("обработкаудаленияпроведения", "undoposting"),
+            ("приустановкеновогономера", "onsetnewnumber"),
+            ("приустановкеновогокода", "onsetnewcode"),
+        ],
+    ),
+    (
+        "ManagerModule.bsl",
+        "manager module",
+        &[
+            ("обработкаполученияданныхвыбора", "choicedatagetprocessing"),
+            (
+                "обработкаполученияпредставления",
+                "presentationgetprocessing",
+            ),
+            (
+                "обработкаполученияполейпредставления",
+                "presentationfieldsgetprocessing",
+            ),
+            ("обработкаполученияформы", "formgetprocessing"),
+        ],
+    ),
+    (
+        "RecordSetModule.bsl",
+        "record set module",
+        &[
+            ("передзаписью", "beforewrite"),
+            ("призаписи", "onwrite"),
+            ("обработкапроверкизаполнения", "fillcheckprocessing"),
+        ],
+    ),
+    (
+        "ValueManagerModule.bsl",
+        "constant value manager module",
+        &[
+            ("передзаписью", "beforewrite"),
+            ("призаписи", "onwrite"),
+            ("обработкапроверкизаполнения", "fillcheckprocessing"),
+        ],
+    ),
+    (
+        "CommandModule.bsl",
+        "command module",
+        &[("обработкакоманды", "commandprocessing")],
+    ),
+    (
+        "SessionModule.bsl",
+        "session module",
+        &[("установкапараметровсеанса", "sessionparameterssetting")],
+    ),
+    (
+        "ManagedApplicationModule.bsl",
+        "application module",
+        &[
+            ("передначаломработысистемы", "beforestart"),
+            ("приначалеработысистемы", "onstart"),
+            ("передзавершениемработысистемы", "beforeexit"),
+            ("призавершенииработысистемы", "onexit"),
+            ("обработкавнешнегособытия", "externaleventprocessing"),
+        ],
+    ),
+    (
+        "OrdinaryApplicationModule.bsl",
+        "application module",
+        &[
+            ("передначаломработысистемы", "beforestart"),
+            ("приначалеработысистемы", "onstart"),
+            ("передзавершениемработысистемы", "beforeexit"),
+            ("призавершенииработысистемы", "onexit"),
+            ("обработкавнешнегособытия", "externaleventprocessing"),
+        ],
+    ),
+    (
+        "ExternalConnectionModule.bsl",
+        "external connection module",
+        &[
+            ("приначалеработысистемы", "onstart"),
+            ("призавершенииработысистемы", "onexit"),
+        ],
+    ),
+];
+
+/// The module kind when `procedure` (lowercased) is an event the platform
+/// raises on the module in `file_path`.
+fn bsl_module_event(file_path: &str, procedure: &str) -> Option<&'static str> {
+    let file = file_path.rsplit('/').next()?;
+    let (_, module, events) = BSL_MODULE_EVENTS
+        .iter()
+        .find(|(name, _, _)| file == *name)?;
+    events
+        .iter()
+        .any(|(ru, en)| procedure == *ru || procedure == *en)
+        .then_some(*module)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1967,6 +4697,8 @@ mod tests {
                 cognitive: 3,
             },
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph
@@ -1993,6 +4725,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let callee = CallNode {
@@ -2002,6 +4736,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
@@ -2009,8 +4745,8 @@ mod tests {
 
         // Add call edge
         let edge = CallEdge {
-            target: "callee".to_string(),
-            file_path: "/path/to/file.rs".to_string(),
+            target: "callee".into(),
+            file_path: "/path/to/file.rs".into(),
             line: 12,
             column: 5,
             call_type: CallType::Direct,
@@ -2029,12 +4765,12 @@ mod tests {
         // Verify the edge was added
         let caller_node = graph.nodes.get("caller").unwrap();
         assert_eq!(caller_node.calls.len(), 1);
-        assert_eq!(caller_node.calls[0].target, "callee");
+        assert_eq!(&*caller_node.calls[0].target, "callee");
 
         // Reverse edges are computed on demand from `calls`.
         let callers = graph.get_callers("callee");
         assert_eq!(callers.len(), 1);
-        assert_eq!(callers[0].target, "caller");
+        assert_eq!(&*callers[0].target, "caller");
     }
 
     #[test]
@@ -2053,8 +4789,8 @@ mod tests {
                     file_path: "/path/to/file.rs".to_string(),
                     line,
                     calls: vec![CallEdge {
-                        target: "target".to_string(),
-                        file_path: "/path/to/file.rs".to_string(),
+                        target: "target".into(),
+                        file_path: "/path/to/file.rs".into(),
                         line,
                         column: 5,
                         call_type,
@@ -2064,6 +4800,8 @@ mod tests {
                     }],
                     metrics: FunctionMetrics::default(),
                     receiver: None,
+                    result_type: None,
+                    intercepts: None,
                 },
             );
         }
@@ -2076,14 +4814,16 @@ mod tests {
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
+                intercepts: None,
             },
         );
 
         let callers = graph.get_callers("target");
         assert_eq!(callers.len(), 2);
-        let mut names: Vec<_> = callers.iter().map(|c| c.target.clone()).collect();
+        let mut names: Vec<&str> = callers.iter().map(|c| &*c.target).collect();
         names.sort();
-        assert_eq!(names, vec!["caller1".to_string(), "caller2".to_string()]);
+        assert_eq!(names, vec!["caller1", "caller2"]);
     }
 
     #[test]
@@ -2097,6 +4837,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("isolated".to_string(), node);
@@ -2124,8 +4866,8 @@ mod tests {
             line: 10,
             calls: vec![
                 CallEdge {
-                    target: "callee1".to_string(),
-                    file_path: "/path/to/file.rs".to_string(),
+                    target: "callee1".into(),
+                    file_path: "/path/to/file.rs".into(),
                     line: 12,
                     column: 5,
                     call_type: CallType::Direct,
@@ -2134,8 +4876,8 @@ mod tests {
                     resolution: CallResolution::Unknown,
                 },
                 CallEdge {
-                    target: "callee2".to_string(),
-                    file_path: "/path/to/file.rs".to_string(),
+                    target: "callee2".into(),
+                    file_path: "/path/to/file.rs".into(),
                     line: 15,
                     column: 10,
                     call_type: CallType::StaticMethod,
@@ -2146,14 +4888,16 @@ mod tests {
             ],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("caller".to_string(), caller);
 
         let callees = graph.get_callees("caller");
         assert_eq!(callees.len(), 2);
-        assert_eq!(callees[0].target, "callee1");
-        assert_eq!(callees[1].target, "callee2");
+        assert_eq!(&*callees[0].target, "callee1");
+        assert_eq!(&*callees[1].target, "callee2");
         assert_eq!(callees[0].call_type, CallType::Direct);
         assert_eq!(callees[1].call_type, CallType::StaticMethod);
     }
@@ -2169,6 +4913,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("leaf".to_string(), node);
@@ -2205,6 +4951,8 @@ mod tests {
             calls: Vec::new(),
             metrics: metrics.clone(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("complex_function".to_string(), node);
@@ -2238,8 +4986,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "b".into(),
+                file_path: "/file.rs".into(),
                 line: 2,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2249,6 +4997,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -2256,8 +5006,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2267,6 +5017,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -2274,8 +5026,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 20,
             calls: vec![CallEdge {
-                target: "d".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "d".into(),
+                file_path: "/file.rs".into(),
                 line: 22,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2285,6 +5037,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_d = CallNode {
@@ -2294,6 +5048,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -2326,8 +5082,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2337,6 +5093,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -2346,6 +5104,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("b".to_string(), node_b);
@@ -2370,8 +5130,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "b".into(),
+                file_path: "/file.rs".into(),
                 line: 2,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2381,6 +5141,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -2388,8 +5150,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2399,6 +5161,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -2406,8 +5170,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 20,
             calls: vec![CallEdge {
-                target: "d".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "d".into(),
+                file_path: "/file.rs".into(),
                 line: 22,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2417,6 +5181,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_d = CallNode {
@@ -2426,6 +5192,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -2458,8 +5226,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 1,
             calls: vec![CallEdge {
-                target: "b".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "b".into(),
+                file_path: "/file.rs".into(),
                 line: 2,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2469,6 +5237,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -2476,8 +5246,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "c".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "c".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2487,6 +5257,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_c = CallNode {
@@ -2496,6 +5268,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -2520,6 +5294,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         let node_b = CallNode {
@@ -2529,6 +5305,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("a".to_string(), node_a);
@@ -2549,8 +5327,8 @@ mod tests {
             line: 10,
             calls: vec![
                 CallEdge {
-                    target: "f1".to_string(),
-                    file_path: "/file.rs".to_string(),
+                    target: "f1".into(),
+                    file_path: "/file.rs".into(),
                     line: 11,
                     column: 1,
                     call_type: CallType::Direct,
@@ -2559,8 +5337,8 @@ mod tests {
                     resolution: CallResolution::Unknown,
                 },
                 CallEdge {
-                    target: "f2".to_string(),
-                    file_path: "/file.rs".to_string(),
+                    target: "f2".into(),
+                    file_path: "/file.rs".into(),
                     line: 12,
                     column: 1,
                     call_type: CallType::Direct,
@@ -2571,6 +5349,8 @@ mod tests {
             ],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         // Create a less connected function
@@ -2579,8 +5359,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 50,
             calls: vec![CallEdge {
-                target: "f3".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "f3".into(),
+                file_path: "/file.rs".into(),
                 line: 51,
                 column: 1,
                 call_type: CallType::Direct,
@@ -2590,6 +5370,8 @@ mod tests {
             }],
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         // Three callers point at "hotspot" (forward edges).
@@ -2601,8 +5383,8 @@ mod tests {
                     file_path: "/file.rs".to_string(),
                     line: 20,
                     calls: vec![CallEdge {
-                        target: "hotspot".to_string(),
-                        file_path: "/file.rs".to_string(),
+                        target: "hotspot".into(),
+                        file_path: "/file.rs".into(),
                         line: 20,
                         column: 1,
                         call_type: CallType::Direct,
@@ -2612,6 +5394,8 @@ mod tests {
                     }],
                     metrics: FunctionMetrics::default(),
                     receiver: None,
+                    result_type: None,
+                    intercepts: None,
                 },
             );
         }
@@ -2619,13 +5403,185 @@ mod tests {
         graph.nodes.insert("hotspot".to_string(), hotspot);
         graph.nodes.insert("normal".to_string(), normal);
 
-        let hotspots = graph.get_hotspots(3);
+        let hotspots = graph.get_hotspots(3, false);
 
         // Should find hotspot (5 connections) but not normal (1 connection)
         assert_eq!(hotspots.len(), 1);
         assert_eq!(hotspots[0].0, "hotspot");
         assert_eq!(hotspots[0].1, 3); // incoming
         assert_eq!(hotspots[0].2, 2); // outgoing
+    }
+
+    fn hotspot_node(name: &str, file: &str, calls: &[(&str, CallResolution)]) -> CallNode {
+        CallNode {
+            name: name.to_string(),
+            file_path: file.to_string(),
+            line: 1,
+            calls: calls
+                .iter()
+                .map(|(target, resolution)| CallEdge {
+                    target: (*target).into(),
+                    file_path: file.into(),
+                    line: 2,
+                    column: 1,
+                    call_type: CallType::Method,
+                    scope_hint: None,
+                    resolved: !resolution.is_outside_graph(),
+                    resolution: *resolution,
+                })
+                .collect(),
+            metrics: FunctionMetrics::default(),
+            receiver: None,
+            result_type: None,
+            intercepts: None,
+        }
+    }
+
+    #[test]
+    fn test_get_hotspots_skips_name_only_edges() {
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "src/cache.rs::Cache::len".to_string(),
+            hotspot_node("len", "/repo/src/cache.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/core.rs::Core::run".to_string(),
+            hotspot_node("run", "/repo/src/core.rs", &[]),
+        );
+        for i in 0..6 {
+            graph.nodes.insert(
+                format!("src/user{i}.rs::work"),
+                hotspot_node(
+                    "work",
+                    &format!("/repo/src/user{i}.rs"),
+                    &[
+                        ("src/cache.rs::Cache::len", CallResolution::NameOnly),
+                        ("src/core.rs::Core::run", CallResolution::Receiver),
+                        ("", CallResolution::Unresolved),
+                    ],
+                ),
+            );
+        }
+
+        let hotspots = graph.get_hotspots(3, false);
+        let row = |key: &str| hotspots.iter().find(|h| h.0 == key).cloned();
+
+        assert_eq!(
+            row("src/core.rs::Core::run"),
+            Some(("src/core.rs::Core::run".to_string(), 6, 0))
+        );
+        assert_eq!(
+            row("src/cache.rs::Cache::len"),
+            None,
+            "name-only callers are not connections"
+        );
+        assert!(
+            hotspots.iter().all(|h| h.0 != "src/user0.rs::work"),
+            "one identified call each is below 3"
+        );
+    }
+
+    #[test]
+    fn test_get_hotspots_same_file_counts_only_for_direct_calls() {
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "src/a.rs::Coverage::len".to_string(),
+            hotspot_node("len", "/repo/src/a.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/a.rs::helper".to_string(),
+            hotspot_node("helper", "/repo/src/a.rs", &[]),
+        );
+        for i in 0..3 {
+            let mut caller = hotspot_node(
+                "work",
+                "/repo/src/a.rs",
+                &[
+                    ("src/a.rs::Coverage::len", CallResolution::SameFile),
+                    ("src/a.rs::helper", CallResolution::SameFile),
+                ],
+            );
+            caller.calls[1].call_type = CallType::Direct;
+            graph.nodes.insert(format!("src/a.rs::work{i}"), caller);
+        }
+
+        graph.nodes.insert(
+            "src/a.rs::Builder::add_edge".to_string(),
+            hotspot_node("add_edge", "/repo/src/a.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/a.rs::Builder::process".to_string(),
+            hotspot_node(
+                "process",
+                "/repo/src/a.rs",
+                &[("src/a.rs::Builder::add_edge", CallResolution::SameFile)],
+            ),
+        );
+
+        let hotspots = graph.get_hotspots(1, false);
+        let incoming = |key: &str| hotspots.iter().find(|h| h.0 == key).map(|h| h.1);
+        assert_eq!(incoming("src/a.rs::helper"), Some(3));
+        assert_eq!(incoming("src/a.rs::Coverage::len"), None);
+        assert_eq!(
+            incoming("src/a.rs::Builder::add_edge"),
+            Some(1),
+            "self-call on the same type"
+        );
+    }
+
+    #[test]
+    fn test_get_hotspots_exclude_tests() {
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "src/lib.rs::helper".to_string(),
+            hotspot_node("helper", "/repo/src/lib.rs", &[]),
+        );
+        graph.nodes.insert(
+            "src/app.rs::main".to_string(),
+            hotspot_node(
+                "main",
+                "/repo/src/app.rs",
+                &[("src/lib.rs::helper", CallResolution::Unique)],
+            ),
+        );
+        for i in 0..4 {
+            graph.nodes.insert(
+                format!("tests/t.rs::case{i}"),
+                hotspot_node(
+                    "case",
+                    "/repo/tests/t.rs",
+                    &[
+                        ("src/lib.rs::helper", CallResolution::Unique),
+                        ("tests/t.rs::fixture", CallResolution::Unique),
+                    ],
+                ),
+            );
+        }
+        graph.nodes.insert(
+            "tests/t.rs::fixture".to_string(),
+            hotspot_node("fixture", "/repo/tests/t.rs", &[]),
+        );
+
+        let all = graph.get_hotspots(1, false);
+        assert!(all.iter().any(|h| h.0 == "tests/t.rs::fixture"));
+        assert_eq!(
+            all.iter()
+                .find(|h| h.0 == "src/lib.rs::helper")
+                .map(|h| h.1),
+            Some(5)
+        );
+
+        let prod = graph.get_hotspots(1, true);
+        assert!(
+            prod.iter().all(|h| !h.0.starts_with("tests/")),
+            "test functions are not listed"
+        );
+        assert_eq!(
+            prod.iter()
+                .find(|h| h.0 == "src/lib.rs::helper")
+                .map(|h| h.1),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2664,8 +5620,8 @@ mod tests {
             file_path: "/path/to/file.rs".to_string(),
             line: 42,
             calls: vec![CallEdge {
-                target: "helper".to_string(),
-                file_path: "/path/to/file.rs".to_string(),
+                target: "helper".into(),
+                file_path: "/path/to/file.rs".into(),
                 line: 45,
                 column: 5,
                 call_type: CallType::Direct,
@@ -2682,6 +5638,8 @@ mod tests {
                 cognitive: 4,
             },
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("test_func".to_string(), node);
@@ -2693,8 +5651,8 @@ mod tests {
                 file_path: "/path/to/main.rs".to_string(),
                 line: 10,
                 calls: vec![CallEdge {
-                    target: "test_func".to_string(),
-                    file_path: "/path/to/main.rs".to_string(),
+                    target: "test_func".into(),
+                    file_path: "/path/to/main.rs".into(),
                     line: 10,
                     column: 3,
                     call_type: CallType::Direct,
@@ -2704,6 +5662,8 @@ mod tests {
                 }],
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
+                intercepts: None,
             },
         );
 
@@ -2744,6 +5704,8 @@ mod tests {
                 cognitive: 2,
             },
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("func1".to_string(), node1);
@@ -2765,8 +5727,8 @@ mod tests {
             file_path: "/file.rs".to_string(),
             line: 10,
             calls: vec![CallEdge {
-                target: "helper".to_string(),
-                file_path: "/file.rs".to_string(),
+                target: "helper".into(),
+                file_path: "/file.rs".into(),
                 line: 12,
                 column: 5,
                 call_type: CallType::Direct,
@@ -2783,6 +5745,8 @@ mod tests {
                 cognitive: 2,
             },
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.nodes.insert("func".to_string(), node);
@@ -2799,8 +5763,8 @@ mod tests {
     #[test]
     fn test_call_edge_properties() {
         let edge = CallEdge {
-            target: "target_func".to_string(),
-            file_path: "/path/to/file.rs".to_string(),
+            target: "target_func".into(),
+            file_path: "/path/to/file.rs".into(),
             line: 42,
             column: 10,
             call_type: CallType::Method,
@@ -2809,8 +5773,8 @@ mod tests {
             resolution: CallResolution::Unknown,
         };
 
-        assert_eq!(edge.target, "target_func");
-        assert_eq!(edge.file_path, "/path/to/file.rs");
+        assert_eq!(&*edge.target, "target_func");
+        assert_eq!(&*edge.file_path, "/path/to/file.rs");
         assert_eq!(edge.line, 42);
         assert_eq!(edge.column, 10);
         assert_eq!(edge.call_type, CallType::Method);
@@ -2859,6 +5823,8 @@ mod tests {
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
+                intercepts: None,
             };
             graph.nodes.insert(name.to_string(), node);
         }
@@ -2920,6 +5886,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -2928,6 +5896,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -2958,6 +5928,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
         let node_b = CallNode {
             name: "run".to_string(),
@@ -2966,6 +5938,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph.insert_node(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
@@ -2999,6 +5973,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
         let node_b = CallNode {
             name: "helper".to_string(),
@@ -3007,6 +5983,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: None,
+            result_type: None,
+            intercepts: None,
         };
 
         graph
@@ -3034,6 +6012,8 @@ mod tests {
                 calls: Vec::new(),
                 metrics: FunctionMetrics::default(),
                 receiver: None,
+                result_type: None,
+                intercepts: None,
             };
             graph
                 .nodes
@@ -3055,6 +6035,8 @@ mod tests {
             calls: Vec::new(),
             metrics: FunctionMetrics::default(),
             receiver: receiver.map(str::to_string),
+            result_type: None,
+            intercepts: None,
         }
     }
 
@@ -3075,9 +6057,9 @@ mod tests {
             node("new", "src/cache.rs", Some("Cache")),
         );
 
-        let snapshot = graph.to_json().unwrap();
-        graph.from_json(&snapshot).unwrap();
-        graph.from_json(&snapshot).unwrap();
+        let snapshot = graph.to_snapshot("").unwrap();
+        graph.from_snapshot(&snapshot, None).unwrap();
+        graph.from_snapshot(&snapshot, None).unwrap();
 
         assert_eq!(
             graph.name_index.get("new").map(|c| c.len()),
@@ -3089,12 +6071,61 @@ mod tests {
         assert_eq!(resolution, CallResolution::Receiver);
     }
 
+    /// The string table must give back every edge as it was, including one
+    /// recorded in another file than its function's and one without a hint.
+    #[test]
+    fn test_snapshot_round_trip_keeps_every_edge() {
+        let graph = CallGraph::new();
+        let mut caller = node("caller", "src/a.rs", None);
+        caller.calls = vec![
+            CallEdge {
+                target: CallGraph::qualified_key("src/b.rs", "callee").into(),
+                file_path: "src/a.rs".into(),
+                line: 3,
+                column: 7,
+                call_type: CallType::Direct,
+                scope_hint: Some("B".into()),
+                resolved: true,
+                resolution: CallResolution::SameFile,
+            },
+            CallEdge {
+                target: "unknown_fn".into(),
+                file_path: "src/macro_site.rs".into(),
+                line: 9,
+                column: 1,
+                call_type: CallType::Direct,
+                scope_hint: None,
+                resolved: false,
+                resolution: CallResolution::Unresolved,
+            },
+        ];
+        let caller_key = CallGraph::qualified_key("src/a.rs", "caller");
+        graph.insert_node(caller_key.clone(), caller);
+        graph.insert_node(
+            CallGraph::qualified_key("src/b.rs", "callee"),
+            node("callee", "src/b.rs", None),
+        );
+        graph
+            .file_functions
+            .insert("src/a.rs".to_string(), vec![caller_key.clone()]);
+
+        let bytes = graph.to_snapshot("s").unwrap();
+        let loaded = CallGraph::new();
+        assert!(loaded.from_snapshot(&bytes, Some("s")).unwrap());
+        assert_eq!(loaded.to_snapshot("s").unwrap(), bytes);
+        assert_eq!(
+            format!("{:?}", loaded.nodes.get(&caller_key).unwrap().calls),
+            format!("{:?}", graph.nodes.get(&caller_key).unwrap().calls)
+        );
+        assert!(!loaded.from_snapshot(&bytes, Some("other")).unwrap());
+    }
+
     /// The snapshot replaces the graph instead of being merged into it. A
     /// function deleted from the source used to come back from disk on every
     /// warm start, outlive `find_symbols`, and be written out again by the
-    /// next `to_json` — a phantom that sustained itself.
+    /// next save — a phantom that sustained itself.
     #[test]
-    fn test_from_json_replaces_rather_than_merges() {
+    fn test_from_snapshot_replaces_rather_than_merges() {
         let stale = CallGraph::new();
         stale.insert_node(
             CallGraph::qualified_key("src/lib.rs", "deleted_fn"),
@@ -3104,7 +6135,15 @@ mod tests {
             CallGraph::qualified_key("src/lib.rs", "kept_fn"),
             node("kept_fn", "src/lib.rs", None),
         );
-        let snapshot = stale.to_json().unwrap();
+        // As a walk registers them.
+        stale.file_functions.insert(
+            "src/lib.rs".to_string(),
+            vec![
+                CallGraph::qualified_key("src/lib.rs", "deleted_fn"),
+                CallGraph::qualified_key("src/lib.rs", "kept_fn"),
+            ],
+        );
+        let snapshot = stale.to_snapshot("").unwrap();
 
         // The graph as rebuilt from source after `deleted_fn` was removed.
         let fresh = CallGraph::new();
@@ -3112,14 +6151,14 @@ mod tests {
             CallGraph::qualified_key("src/lib.rs", "kept_fn"),
             node("kept_fn", "src/lib.rs", None),
         );
-        fresh.from_json(&snapshot).unwrap();
+        fresh.from_snapshot(&snapshot, None).unwrap();
 
         // Loading a snapshot means adopting it wholesale...
         assert_eq!(fresh.node_count(), 2);
 
         // ...and what it brings must be evictable, which needs `file_functions`
-        // populated — `remove_functions_for_file` is the only thing standing
-        // between an incremental re-index and a permanent phantom.
+        // to come with it — `remove_functions_for_file` is the only thing
+        // standing between an incremental re-index and a permanent phantom.
         fresh.remove_functions_for_file("src/lib.rs").unwrap();
         assert_eq!(
             fresh.node_count(),
@@ -3146,8 +6185,8 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, target)| CallEdge {
-                    target: (*target).to_string(),
-                    file_path: file.to_string(),
+                    target: (*target).into(),
+                    file_path: file.into(),
                     line: i + 1,
                     column: 0,
                     call_type: CallType::Direct,
@@ -3191,16 +6230,58 @@ mod tests {
             CallGraph::qualified_key("src/lib.rs", "gone"),
             node("gone", "src/lib.rs", None),
         );
+        source.file_functions.insert(
+            "src/lib.rs".to_string(),
+            vec![CallGraph::qualified_key("src/lib.rs", "gone")],
+        );
 
-        // Round-trip so `file_functions` knows the file, as it does after a
-        // real walk; then re-index the file to nothing.
+        // Round-trip so the graph knows the file as it does after a real
+        // walk; then re-index the file to nothing.
         let graph = CallGraph::new();
-        graph.from_json(&source.to_json().unwrap()).unwrap();
+        graph
+            .from_snapshot(&source.to_snapshot("").unwrap(), None)
+            .unwrap();
         graph.remove_functions_for_file("src/lib.rs").unwrap();
         assert_eq!(graph.node_count(), 0);
 
         let (target, resolution) = graph.resolve_callee("gone", "src/main.rs", None);
         assert_eq!(target, "gone", "an edge must never carry an empty target");
         assert_eq!(resolution, CallResolution::Unresolved);
+    }
+
+    #[test]
+    fn test_factory_type_hint_follows_naming_conventions() {
+        for (name, expected) in [
+            ("SfxOperationUseFactory", Some("SfxOperationUse")),
+            ("sfx_operation_repo_factory", Some("SfxOperationRepo")),
+            ("NewGoSchedulerApplication", Some("GoSchedulerApplication")),
+            ("new_store", Some("Store")),
+            ("StoreProvider", Some("Store")),
+            ("RequestBuilder", Some("Request")),
+        ] {
+            assert_eq!(
+                CallGraph::factory_type_hint(name).as_deref(),
+                expected,
+                "hint for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_factory_type_hint_declines_names_without_a_convention() {
+        for name in [
+            // A plain lookup names no type.
+            "lookup", "get", "handle",
+            // `New` followed by a lowercase letter is one word, not a
+            // constructor: `NewsFeed` must not be read as type `SFeed`.
+            "NewsFeed", // Nothing left after stripping.
+            "Factory", "New",
+        ] {
+            assert_eq!(
+                CallGraph::factory_type_hint(name),
+                None,
+                "{name} must not produce a type hint"
+            );
+        }
     }
 }

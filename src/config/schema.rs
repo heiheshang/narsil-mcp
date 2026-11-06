@@ -113,6 +113,48 @@ pub struct RepoProfile {
     /// Maximum file size in bytes to index (0 = unlimited).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_size: Option<u64>,
+
+    /// How linked git worktrees of the repositories are indexed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<WorktreeMode>,
+}
+
+/// How linked git worktrees of the indexed repositories are handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeMode {
+    /// Registered at startup, indexed on first use.
+    #[default]
+    Lazy,
+    /// Indexed in the background right after the repositories.
+    Eager,
+    /// Not discovered.
+    Off,
+}
+
+impl std::str::FromStr for WorktreeMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lazy" => Ok(Self::Lazy),
+            "eager" => Ok(Self::Eager),
+            "off" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown worktree mode '{other}', expected lazy, eager or off"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for WorktreeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Lazy => "lazy",
+            Self::Eager => "eager",
+            Self::Off => "off",
+        })
+    }
 }
 
 /// Tools configuration (categories and overrides)

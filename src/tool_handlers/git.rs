@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for get_blame tool
 pub struct GetBlameHandler;
@@ -119,7 +119,7 @@ impl ToolHandler for GetSymbolHistoryHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
+        let symbol = args.get_str_any(&["symbol", "function"]).unwrap_or("");
         let max_commits = args.get_u64_or("max_commits", 10) as usize;
         engine
             .get_symbol_history(repo, path, symbol, max_commits)

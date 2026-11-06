@@ -1,3 +1,5 @@
+[← Visualization Frontend](frontend.md) · [Back to README](../README.md) · [Protocol and HTTP API →](api.md)
+
 # WebAssembly (Browser) Usage
 
 narsil-mcp can run entirely in the browser via WebAssembly. This provides symbol extraction, search, and similarity analysis without a backend server - perfect for browser-based IDEs, code review tools, or educational platforms.
@@ -224,3 +226,27 @@ Ensure you're using the correct target for your environment:
 - Browser: Use `web` target
 - Bundler (webpack/vite): Use `bundler` target
 - Node.js: Use `nodejs` target
+
+## Quick Start
+
+narsil-mcp can run entirely in the browser via WebAssembly - perfect for browser-based IDEs, code review tools, or educational platforms.
+
+```bash
+npm install @narsil-mcp/wasm
+```
+
+```typescript
+import { CodeIntelClient } from '@narsil-mcp/wasm';
+
+const client = new CodeIntelClient();
+await client.init();
+client.indexFile('src/main.rs', rustSourceCode);
+const symbols = client.findSymbols('Handler');
+```
+
+> **Full documentation:** See [docs/wasm.md](wasm.md) for build instructions, React examples, and API reference.
+
+## See Also
+
+- [Getting Started](getting-started.md) — feature builds
+- [Architecture](architecture.md) — feature flags

@@ -7,6 +7,482 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Git worktrees are indexed.** A server started on the main checkout used to
+  search only that checkout, so in a session inside a git worktree the branch's
+  code was not found. The worktrees of every repository in `--repos` are now
+  found with `git worktree list` and become repositories of their own:
+  `<repo>@<directory>`, also reachable as `<repo>@<branch>` (`/` → `-`) or by
+  absolute path, including worktrees created after startup. They are indexed on
+  first use (the server's own working directory right away), with their own
+  index database, watcher and git handle. `--worktrees lazy|eager|off`
+  (`NARSIL_WORKTREES`) and `--worktree-index-wait-secs`
+  (`NARSIL_WORKTREE_INDEX_WAIT_SECS`, 60) control it. `list_repos` and
+  `get_index_status` show each worktree's branch and state.
+- Two repositories whose directories share a name no longer overwrite each
+  other's index: the second is `name~2`.
+
+- **BSL notify descriptions are calls.** `Новый ОписаниеОповещения("Обработчик",
+  ЭтотОбъект)` is how 1C calls a procedure asynchronously; the graph now has a
+  `Callback` edge from the procedure that builds the description to the
+  handler, and to the error handler when the 4th and 5th arguments name one.
+  The module argument resolves like a receiver: `ЭтотОбъект`/`ЭтаФорма` is the
+  building module (a handler missing there stays unresolved), a common module
+  name or `МодульX` goes to that module, any other variable is a name match.
+  On УТ 11: 9 987 edges, 95% into the same module (exact, `Scope`); 7 880
+  handlers had no caller at all. Of the 9 unresolved, 8 name procedures that do not exist and
+  one is a name with `ё`, which tree-sitter-bsl splits in the definition.
+
+### Fixed
+
+- **Restarting a `--graph` server no longer segfaults once.** A restarted
+  process could start while the old one was still exiting and still held the
+  knowledge graph's RocksDB `LOCK`. RocksDB reports that with a C-`malloc`ed
+  message, which oxigraph 0.5.9 frees through the Rust global allocator —
+  mimalloc here — so the new process died with SIGSEGV and came up only on the
+  supervisor's next retry. `KnowledgeGraph::open` now probes the lock with
+  `fcntl(F_GETLK)` first and waits up to 30 s for the holder to exit, then
+  fails with an ordinary error if the store stays locked.
+- **BSL calls point at the right procedure.** Three faults in reading 1C
+  code, measured on a full УТ 11 dump (10 612 modules, 1 338 393 edges):
+  - The callee of `Модуль.Процедура(А, Результат)` was the *last identifier*
+    in the call, i.e. its last argument (`Результат`), and the receiver of
+    `Справочники.Склады.Ф()` was `Справочники`. The method name now comes
+    from the call's `name` field and the receiver is the last link (`Склады`);
+    a link of a chain `Х.М().Д()` is a method call on `Х`, not a plain call.
+  - A call on a receiver now reaches a configuration procedure only through
+    the module or object the receiver names. `Структура.Вставить(...)` was an
+    exact call of a form procedure named `Вставить` — 152 891 times; platform
+    methods (`Вставить`, `ПолноеИмя`, `ВыгрузитьКолонку`, `ПолучитьЭлементы`…)
+    now leave the graph, other names on an unnamed receiver are `name match
+    only`, and a plain `Процедура()` does not reach another module's form,
+    object or manager procedures.
+  - `Модуль.Процедура()` is looked up in that module's files instead of among
+    every namesake: the named module now wins over the caller's own namesake
+    (21 484 edges changed target, e.g. `ПроведениеДокументов.ОтразитьДвижения`
+    went to `ЗапасыСервер`), and `МодульX.Процедура()` — the standard library's
+    `ОбщегоНазначения.ОбщийМодуль("X")` idiom — goes to common module `X`
+    (5 827 edges, `receiver inferred from a naming convention`, the caveat
+    formerly worded `receiver inferred from factory name`).
+
+  Exact (`Unique`) edges fell from 247 713 to 102 632 and module-scoped ones
+  rose from 33 735 to 252 349; a 40-edge sample of the remaining exact edges
+  was all correct. The most-called procedures are now
+  `ПодставитьПараметрыВСтроку`, `ОбщийМодуль`, `ЗначениеРеквизитаОбъекта`
+  instead of `Вставить`, `ПолноеИмя`, `Ошибки`. Building the graph takes
+  17.5 s instead of 16.0 s, since real method names now get resolved; Go and
+  Rust edges are unchanged.
+- **Rust calls are no longer tied to the one project function of that name
+  when the call syntax rules it out.** An edge whose target was the only
+  function of its name in the graph was reported as exact; in Rust that made
+  `node.walk()` (tree-sitter) 115 calls of a free `callgraph::walk`,
+  `entry.key()` 115 calls of `EmbeddingCache::key`, and `PathBuf::from`
+  calls of `AgentId::from`. Now `x.f()` cannot reach a free function (not in
+  graph), `T::f()` and `std::…::f()` cannot reach an `f` that is neither on
+  `T` nor in that module (outside the index), and `x.f()` on a value of
+  unknown type is a name match when the standard library defines `f` too.
+  Calls found inside macros (`assert!(v.len() > 0)`) keep their method or
+  path shape instead of all counting as plain calls. On narsil's `src/`
+  (27 237 edges) 561 edges lost their exact label — 182 to not-in-graph, 182
+  to outside-the-index, 197 to name match — and a 40-edge sample of the
+  remaining exact method edges had one error left. Go and other languages are
+  unchanged (Go corpus edges identical before and after).
+- **`get_function_hotspots` ranks by edges the graph identified.** Name-only
+  picks among namesakes, calls leaving the graph and same-file picks on a
+  value no longer count as connections. On narsil's own source the top four
+  rows were `AnalysisCache::len`/`insert`/`is_empty`/`get` with ~500 callers
+  each — every `.len()` and `.insert()` in the tree — against a handful of
+  real calls. `exclude_tests` now filters: test functions are neither listed
+  nor counted as callers. "Most Called Functions" in `get_call_graph` uses
+  the same counting.
+- **`get_complexity` names the function it measured.** A bare name shared by
+  several functions used to report one of them silently (`with_options`
+  gave the 3-line `CcgImporter` constructor, not the 318-line engine one);
+  it now says which and lists the rest, as `get_callers` does. A qualifier
+  that picks out one namesake (`Big::with_options`) no longer triggers the
+  ambiguity warning in any call-graph tool.
+- **`get_hotspots` follows renames and reports complexity.** History before a
+  `git mv` counts under the current path (the leader on narsil was the
+  deleted `src/index.rs`, whose 35 commits belong to `src/engine/mod.rs`);
+  deleted files are left out. With the call graph enabled each file shows its
+  most complex function, and `min_complexity`, previously ignored, keeps the
+  files that reach it.
+
+### Changed
+
+- **Russian words match across inflections.** `tokenize_code` now reduces
+  all-Cyrillic tokens to their Snowball Russian stem (with `ё` folded to `е`),
+  so `остановкой` finds `Остановка` and `обработчиков` finds `Обработчики`.
+  Every token-based index shares the tokenizer: BM25 (`semantic_search`,
+  `hybrid_search`), TF-IDF and the chunk token cache. On the 67-query 1C set,
+  `hybrid_search` rose from hit@5 0.507 to 0.687 (McNemar p=0.0075), recall@20
+  0.687 → 0.866 (p=0.0042), MRR@10 +0.112 (p=0.0036); `search_chunks` did not
+  change significantly. Indexing the 210 MB CommonModules dump took 28.1 s
+  instead of 26.3 s. The persisted BM25 index records the tokenizer version
+  and is rebuilt on first start after the upgrade.
+
+- **`semantic_search` says when it is guessing.** Without `--neural` it is
+  keyword search (BM25), so a query whose words the code does not use — e.g.
+  Russian against English identifiers — used to return a confident-looking page
+  of unrelated hits. Each hit now lists the query terms it actually contains
+  (`matched 1/5: handlers`), a page where no hit holds half of the query starts
+  with a weak-match warning, and an empty result points to `neural_search`.
+  The tool description no longer claims it suits natural-language queries.
+  Matched terms come from the document's postings, so `hybrid_search` and
+  snippets also stop treating every query term as matched.
+
+- **Library module paths changed (`narsil_mcp::…`).** `index` is now
+  `engine` (`narsil_mcp::engine::CodeIntelEngine`, `EngineOptions`), and
+  `chunk_cache` moved to `index::text::chunk_cache`. The name `index` now
+  belongs to the new index layer, so old imports fail with a missing-item
+  error inside `index`, not a missing module. `hybrid_search` and
+  `search_chunks` live in `src/engine/search.rs`. The binary and MCP tools are
+  unchanged.
+
+- **`hybrid_search` and `search_chunks` no longer rebuild an index per call.**
+  `hybrid_search` built a fresh BM25 + TF-IDF index over every chunk of the
+  repository on each request, and `search_chunks` re-chunked and re-tokenized
+  every file; on a 2,279-module 1C dump that was 83 s and 37 s per query.
+  `hybrid_search` now fuses three rankings with RRF: the persistent BM25 index
+  (symbol cards), the TF-IDF embeddings (signatures) and query-token overlap
+  with function bodies. The bodies come from a new chunk token cache
+  (`src/index/text/chunk_cache.rs`): chunk boundaries and interned token ids, no text,
+  filled lazily on first use and revalidated per file by size and mtime.
+  `search_chunks` scores from the same cache and re-chunks only the files whose
+  chunks it returns. On that corpus: `hybrid_search` 0.07–0.12 s, `search_chunks`
+  0.6–2 s, the first call after startup ~12 s while the cache warms. Retrieval
+  quality on a 67-query 1C benchmark is unchanged (paired permutation test on
+  MRR, p = 0.29); fusing only the two persistent indexes lost recall@20
+  (0.76 → 0.58), which is why the body ranking is part of the fusion. Unscoped
+  `hybrid_search` results now carry a `Repo` line and repo-relative paths.
+
+- **The BM25 index is tantivy's now, and it survives a restart.** `tantivy` had
+  been a non-optional dependency since the beginning and was imported nowhere:
+  the only occurrence of the name in the source was a licence string in a
+  supply-chain fixture. Search actually ran on a hand-rolled
+  `HashMap<String, Vec<usize>>` inverted index that was never persisted, so
+  every process start re-read and re-tokenized the entire corpus before the
+  first query could be answered, and every posting list sat on the heap for the
+  life of the server. `src/tantivy_index.rs` replaces the scorer; the postings
+  are mmap'd segments under `<index>/search`, and an unchanged file is skipped
+  on the next walk instead of being tokenized again (the symbol store and the
+  search index must *both* hold a repository before anything is skipped, so a
+  half-deleted cache rebuilds rather than answering from nothing). Note that
+  this removes BM25 from the cold-start cost, not the cold start itself: the
+  walk still runs, because `file_cache`, the TF-IDF embeddings and the
+  normalized 1C documents are still built from source every time. Term
+  semantics are unchanged: tantivy is driven through a `CodeTokenizer` that
+  defers to the existing `tokenize_code`, and the synonym table moved to the
+  query side intact. Raw text retention became a per-document choice, so the
+  chunks `hybrid_search` reads back keep their text — compressed on disk now,
+  not resident — while files and symbols still keep none. Re-indexing an edited
+  file also deletes its previous documents, which the map-backed index never
+  did: each save left a stale duplicate behind.
+
+- **`search_code` stops reading the whole corpus.** It is a substring matcher,
+  so no token index could serve it, and it scanned every cached file of every
+  repository calling `line.to_lowercase()` per line — one `String` allocation
+  per line per query, ~125 000 of them for a single call on this repository.
+  A trigram index (`src/trigram.rs`, the Zoekt/Google Code Search approach)
+  now intersects the needle's own 3-grams to decide which files could possibly
+  match, and only those are read. Trigrams over-approximate and never reject a
+  real hit, so the scan still decides and results are identical. Needles under
+  three characters have no trigrams and fall back to the full scan, as does a
+  candidate set large enough that filtering stops paying. The postings live in
+  their own tantivy index under `<index>/substring` rather than on the heap.
+  The per-line comparison is allocation-free for ASCII and still folds Unicode
+  correctly for the Cyrillic corpora.
+
+- **Neural search uses the ANN index it was already shipping.** `usearch` was
+  a declared dependency, `neural::vector_index` implemented an HNSW index over
+  it with `save`/`load`, and nothing ever constructed one: both `NeuralEngine`
+  constructors took the brute-force store, so every query scanned every vector
+  while the dependency was compiled into the binary. Three defects had to be
+  fixed before it could be wired up — capacity was reserved once at
+  construction so the index filled and silently refused every later insert,
+  there was no repository-scoped search for `search_in` to use, and `clear`
+  emptied the id map while leaving the vectors in place. The brute-force store
+  remains the fallback when the `neural` feature is off, and is no longer
+  gratuitously slow: vectors are L2-normalised on insert (the query's own norm
+  used to be recomputed once per stored document), the top-k is a heap instead
+  of a full sort of the corpus, and the vectors are one contiguous buffer
+  rather than an allocation and a cloned `String` per document.
+
+### Added
+
+- **`not in graph` split into the three things it was hiding.** One count
+  covered edges whose target the import list places outside the index
+  (`assert.Len`, `wg.Add` - third-party by construction), edges naming a
+  package that *is* indexed but carries no such function (a method reached
+  through a value, or a file the index skipped), and edges whose name is
+  declared nowhere at all (stdlib, builtins, macros). Read together, a Go
+  corpus sending half its edges into its dependencies looked identical to half
+  a lost graph, and impact analysis re-checked reachable code by hand for no
+  reason. `CallResolution` gains `ExternalPackage` and `PackageMissing`,
+  `resolution_stats` reports the three apart, `get_callees` names the middle
+  count in its footer, and `is_outside_graph()` replaces the equality tests
+  that silently stopped covering the group. Only the middle row grows when
+  something was genuinely not read.
+
+- **Argument names no longer have to be guessed.** Tool schemas had drifted
+  into two families - call-graph and flow tools name their target `function`,
+  symbol tools name it `symbol`; search tools cap with `max_results`, the rest
+  with `limit` - and a caller could spend a whole tool call on the wrong
+  spelling before seeing "missing required parameter". Each of the four
+  spellings is now a declared alias of its counterpart on every tool in either
+  family, honoured by both the handlers (`get_str_any` / `get_u64_any`) and
+  `validate_tool_args`. Two schema-invariant tests fail if a newly added tool
+  declares one spelling without the other, or points an alias at a property
+  that does not exist. `get_metrics` still takes only `format`: per-repository
+  figures come from `get_index_status`, and that is now written down in the
+  skill rather than discovered by a failed call.
+
+- **Skills name the two ways an empty result lies.** Two wrong conclusions came
+  up repeatedly in real sessions, both from tools behaving exactly as
+  documented. `find_symbols` matches one name or pattern, and `search_code`
+  matches one substring including its spaces, so a query built from two
+  identifiers or a sentence returns zero while every term is indexed — neither
+  is an AND over words. And a checkout outside `--repos` (a git worktree, a
+  second clone) is absent rather than stale, however fresh the index is, while
+  test files and test-helper packages *are* indexed like any source. The
+  `narsil-search` skill grows a "One name per lookup, not a phrase" section and
+  three anti-patterns; `narsil-repo-state` grows a fifth cause of an empty
+  answer — which checkout was indexed — plus the note that repeating the
+  primary's directory name in a worktree path leaves two repositories
+  contending for one `repo` value.
+
+- **Methods carry their owning type.** Symbols were indexed under a bare name
+  with `qualified_name` always empty, so a Go method's receiver, a Rust `impl`
+  type and a class name were all lost: `Save` looked the same whichever type
+  declared it. The symbol parser now labels methods, fields and test cases
+  with their owner (`PaymentStore::Save`) using the same owner lookup the call
+  graph resolves calls with, listings print the qualified name, and it works as
+  a lookup key.
+
+- **`get_symbol_definition` disambiguates namesakes.** It used to return
+  whichever same-named symbol was parsed first, silently. It now reports the
+  other definitions of that name, and `receiver` ("AuditStore") or `file`
+  ("payment/store.go", matched as a path suffix) picks one; a filter matching
+  nothing lists the candidates instead of returning an arbitrary symbol.
+
+- **Symbol listings carry the end line.** `find_symbols` printed
+  `file:line` only, so the caller could not tell where a body stopped and had
+  to shell out to `sed` to read one. It now prints `file:start-end` in both the
+  grouped and the compact listing, which feeds `get_file`/`get_excerpt`
+  directly.
+
+- **`get_symbol_definition` can narrow a large body.** Reading a 450-line
+  function whole was the only option. Four new arguments cut it down:
+  `outline` prints the control-flow skeleton (signature plus
+  `if`/`switch`/`case`/`for`/`return` lines) with the gaps marked, `contains`
+  keeps only body lines matching a case-insensitive regex, and
+  `offset`/`max_lines` page through the body. A footer reports how many lines
+  were hidden.
+
+- **Named test cases are symbols.** Go's `t.Run("...")` and JavaScript /
+  TypeScript `describe`/`it`/`test` blocks are indexed as `TestCase` symbols
+  spanning the whole case block, so `find_symbols symbol_type: "test"` lists
+  the cases in a file and `get_symbol_definition` returns one whole case —
+  previously the only way to find a case boundary was grep.
+
+- **Go type declarations keep their kind.** `type X struct` and
+  `type X interface` were both reported as `TypeAlias` (one catch-all pattern
+  for every `type` declaration), so `find_symbols symbol_type: "struct"` never
+  matched a Go struct. Struct and interface declarations now report `Struct`
+  and `Interface`; `type X = Y` aliases, which the query missed entirely, are
+  indexed as `TypeAlias`.
+
+- **Go and Rust struct fields are symbols.** The symbol queries captured
+  functions, methods and type names only, so `find_symbols` with
+  `name_regex: "UUID$"` returned nothing for a field that `search_code` found
+  in one call. `field_declaration` names are now indexed as
+  `SymbolKind::Field` — in Go one symbol per name in `A, B int`, embedded
+  fields skipped, the struct tag kept in the signature; in Rust named struct
+  fields and struct-variant enum fields, tuple fields having no name to index —
+  and `symbol_type: "field"` filters to them. Other languages still do not
+  index fields.
+
+### Fixed
+
+- **`file` on `get_symbol_definition` / `find_symbol_usages` accepts a fragment
+  of the path.** It compared whole trailing path segments only, so
+  `file: "airtime"` rejected `internal/airtime/airtime_operation.go` — in one
+  review session that was four of the five failed calls. A path or a
+  whole-segment suffix still wins when it matches (`store.go` does not also
+  pick `ledger_store.go`); only when neither does is the argument taken as a
+  case-insensitive fragment.
+
+- **`search_code` ignores whitespace width.** A space in the query now matches
+  any run of spaces or tabs, so a pasted SQL fragment is found whatever the
+  file's alignment. The trigram filter no longer requires grams that span
+  whitespace, which would otherwise have ruled such files out before the scan.
+
+- **Go test cases beyond `t.Run`.** `symbol_type: "test"` now covers goblin
+  (`g.Describe`, `g.It`), Ginkgo (`Describe`, `Context`, `When`, `It`,
+  `Specify`) and project wrappers named `It…`/`Describe…`, including the
+  `ItRecover(g, "name", …)` shape where the suite comes first. Raw-string names
+  count too. Existing indexes need a `reindex` to pick these up.
+
+- **`find_symbol_usages` resolves qualified methods.** It used to grep for the
+  full query string (`PaymentStore::Save`), so definitions and usages were both
+  empty after pasting a qualified name from `find_symbols`. It now shares
+  `get_symbol_definition`'s lookup (`qualified_name`, `receiver`, `file`) and
+  searches source for the bare identifier at call sites.
+
+- **`search_code` no longer hides how much it dropped.** Matches are ranked and
+  cut to `max_results` (default 10), but the header printed the post-truncation
+  count as `Found N results`, so a query that matched 300 lines and showed 10
+  read as a complete answer. When the list is cut the header now reads
+  `Showing 10 of 300 matching lines` and names the two ways out (`max_results`,
+  `file_pattern`). The tool description also stops calling it "semantic and
+  keyword search": it is a case-insensitive substring match with no regex, whose
+  scoring gives declaration lines a bonus over call sites — so call sites of a
+  known identifier belong to `find_symbol_usages`/`find_references`, which the
+  description and the `narsil-search` skill now say outright.
+
+- **`get_symbol_definition` suggests near misses.** A miss returned a bare
+  "Symbol not found", costing a second `find_symbols` call. The error now lists
+  the closest indexed symbols with their kind and line range — a name differing
+  only in case, one matching the last segment of a qualified name, or a
+  substring match — and otherwise points at `find_symbols`.
+
+- **Brace alternation in `file_pattern`.** The `glob` crate has no `{a,b}`
+  support and treated the braces literally, so `**/*.{json,md,yml}` matched
+  nothing and `search_code` reported zero hits where `grep` found ten. The
+  pattern is now expanded into one glob per alternative (nested groups
+  included) before compiling; an unbalanced brace is an error instead of a
+  silent empty filter.
+
+- **A type index, and call targets read off declarations.** The call graph
+  stored functions and nothing else, so a qualifier naming anything but a
+  receiver — a field, a variable, the value a call produced — fell through to
+  the alphabetically first namesake. `src/callgraph/types.rs` now holds the
+  declared types of the indexed sources: struct fields with their types, Go's
+  embedded (anonymous) fields, interface method sets, aliases. Package
+  qualifiers are stripped (`account_use.InterestUse` -> `InterestUse`, which is
+  how a receiver is written), primitives and containers are skipped (no method
+  is ever looked up on `string`, and a call cannot be made on a slice), and a
+  name declared twice in the corpus yields nothing rather than a coin flip. The
+  index is not persisted: a graph is restored from JSON with its edges already
+  resolved, so it is only needed while indexing.
+
+- **`CallNode.result_type`**, the declared return type — Go's first non-`error`
+  result, a Rust `-> T`, a TS annotation. Two shapes resolve on it now:
+  a call chained onto another call (`accountRepo(ctx).FindByUuid(id)`, where
+  the helper's name says nothing but its result list says everything), and a
+  variable declared from one (`svc := build()`, plus Go's ubiquitous
+  `value, err := f()` — the extra names are the error and the discards, so the
+  type belongs to the first). Only a target the graph actually identified is
+  trusted here: reading a result type off a name match would compound one guess
+  into another, stated with the confidence of something read. Such edges report
+  `Receiver`, not `receiver inferred from factory name` — the type was read,
+  not guessed from a naming convention.
+
+  On the 3,232-file Go corpus: name-only guesses 8,449 -> 6,076, receiver
+  matches 13,126 -> 29,280, and 2,908 edges moved from "inferred from a factory
+  name" to "read from a declaration". Graph construction 1,05 s -> 1,62 s, held
+  under the +50% budget by noting declarations during the existing walk instead
+  of sweeping each function body a second time.
+
+- **Field chains, struct embedding and interfaces resolved.** The rest of the
+  staged plan in `docs/callgraph-resolution-plan.md`:
+  - A receiver written as a chain of fields (`self.C`,
+    `self.Depend.CustomerDocumentExtService`) is typed from the struct
+    declarations, up to four links; and where the middle of a chain is a method
+    call, its result comes from the interface declaration when the field is an
+    interface — an interface method has no body and so no graph node, but it
+    does state what it returns. That is `self.C.Logger().SendError(err)`
+    resolved end to end.
+  - Go promotes an embedded type's methods onto the outer type, so
+    `self.HandleError(err)` inside a method of `CustomerRepo { base.SimpleQuery }`
+    is `SimpleQuery::HandleError`. Reported as `Receiver`: promotion is a rule
+    of the language. An ambiguity across two embedded types is left alone —
+    that is a compile error in Go, so it means the reading is off.
+  - A receiver whose type is an interface resolves to the one indexed type
+    carrying every method the interface declares, reported as
+    `single implementation of the interface` and deliberately not certain:
+    dispatch is dynamic and another implementation could be injected. An
+    interface with fewer than two methods is not narrowed at all (half a corpus
+    satisfies `Error()`), and a mock in the test tree loses to production code.
+  - A name declared as a builtin, a container, or a type from a package outside
+    the index is recorded as foreign, so `err.Error()` and `wg.Add(1)` leave
+    the graph instead of collecting some namesake of this repository.
+    Package-level `var` declarations count as declarations too.
+
+- **`## Call Edge Resolution` in `get_index_status`**, counting how the edges
+  were resolved. Resolution quality was otherwise invisible: a corpus whose
+  calls stop resolving yields the same number of edges pointing at worse
+  targets, and only a hand-written measurement would notice. Plus a
+  `call_graph_build_50_go_files` benchmark over a DI-shaped Go corpus, and
+  `tests/callgraph_corpus_measure.rs` (`#[ignore]`, `NARSIL_GO_CORPUS=<path>`)
+  for measuring a real one.
+
+  Final tally on the 3,232-file corpus, against where this started:
+  name-only guesses 16,698 -> 2,725 (11% of edges -> 1.8%), receiver matches
+  25 -> 33,020, `SameFile` fallbacks 3,125 -> 276, and ~3,400 edges that
+  pointed at unrelated functions now honestly absent. Graph construction
+  1,05 s -> 1,76 s (+68%, over the +50% budget the plan set — the cost is
+  reading declarations and checking interface implementations; memoized per
+  interface/type pair and bounded, but not free).
+
+### Added
+
+- **Call-graph edges through DI factories and constructors.** A call chained
+  onto a factory call — `self.Depend.SfxOperationUseFactory(self.C).ProcessNewOperation(op)`,
+  the dominant shape in dependency-injected Go services, or plainly
+  `NewGoSchedulerApplication(cfg).Run()` — spells no receiver type at the call
+  site, so `resolve_callee` had nothing to work with and fell through to its
+  last resort: the alphabetically smallest namesake. The edge existed but
+  pointed at an unrelated type, and `get_callers` on the real target showed
+  nothing. The factory's own name carries the type, so it is now used as a
+  scope hint (`XFactory`/`XProvider`/`XBuilder`, `NewX`/`MakeX`, snake_case
+  included), and the target is looked up among the namesakes defined on type
+  `X`. The hint is kept only when exactly one namesake matches, and such edges
+  are reported as `receiver inferred from factory name` — a naming convention
+  is evidence, not proof, so the resolution is deliberately not counted as
+  certain. On a 3,232-file Go corpus this hinted 9,460 edges, of which ~4,700
+  previously resolved to the wrong type.
+
+- **Three more receiver shapes the call graph can now read.** Each was a
+  qualifier that named no type, so resolution fell through to a namesake pick;
+  each has the type written a few lines away.
+  - `self.Logger()` inside a method resolves on the enclosing method's own
+    receiver type. Go spreads one type's methods across the files of its
+    package, so the old answer came from the caller's file or from an unrelated
+    namesake — `BaseApplication::Logger` picked at random out of many `Logger`s.
+  - A call on a local variable or parameter (`batchService.Create(dto)`,
+    `lineRepo := NewPayoutBatchLineRepo(c)`) resolves on the type in its
+    declaration — parameter lists, `var x T`, `x := NewT(...)`, `x := &T{}`.
+    The reading is deliberately shallow (no flow analysis, no shadowing, last
+    declaration wins), so the type is only *offered*: it is used when a
+    namesake is genuinely defined on it and dropped otherwise.
+  - A qualifier that names an imported package is resolved through the file's
+    import list: a package of this repository narrows the namesakes to its
+    directory, and a package outside the index resolves to **nothing**. This
+    is the one that removes false edges rather than redirecting them —
+    `assert.Len(t, x, 3)` from testify used to be reported as a call to some
+    `Len` of the audited repository, `fmt`/`time`/`strings` likewise, and a Go
+    type conversion (`account_model.AccountUuid(x)`) is not a call at all.
+
+  On the same 3,232-file corpus: name-only guesses 16,698 -> 9,593, receiver
+  matches 25 -> 13,126, and ~3,400 edges that pointed at unrelated functions
+  are now honestly absent. Still unresolved: interface values held in struct
+  fields, values out of multi-value assignments, Go struct embedding,
+  reflection and platform-invoked handlers — see
+  `docs/callgraph-resolution-plan.md` for the staged plan that closes them.
+
+### Fixed
+
+- **Package-qualified calls no longer reach into subpackages, and no longer
+  land on methods.** A Go package is exactly one directory, so the
+  `starts_with(dir)` filter added with the import handling was too loose:
+  `config.Get()` saw the `Get` of `internal/config/settings/repository` as a
+  rival to `internal/config`'s own and fell back to a name match. And
+  `pkg.Name()` always names a package-level function — a method needs a value
+  in front of it — so methods are now excluded from the candidates. Name-only
+  guesses on the reference corpus: 9,593 -> 8,449.
+
 ## [1.9.4] - 2026-08-27
 
 ### Added

@@ -27,8 +27,13 @@ because it changes often.
 
 ## Before believing an empty answer
 
-An empty narsil result has three quite different causes. Check in this order:
+An empty narsil result has five quite different causes. Check in this order:
 
+0. **Is the server connected?** A narsil server that failed to start reports
+   `CONNECTION_CLOSED` at session start and contributes **no tools at all** -
+   its absence looks exactly like a feature being off. Say the server is down;
+   do not report on code you could not query. When several narsil servers are
+   configured, this is per server: one may be up while another is not.
 1. **`get_index_status`** - shows enabled features and document counts. Git
    tools need `--git`; `get_callers`/`get_callees`/`get_call_graph` need
    `--call-graph`; `neural_search` and `find_semantic_clones` need `--neural`;
@@ -49,12 +54,45 @@ An empty narsil result has three quite different causes. Check in this order:
    large repository that is minutes and gigabytes, so ask before triggering it in
    someone's live server.
 
-Say which of the three you checked. "No results for X in repo Y, call graph
+4. **Was it indexed by an older narsil?** A persisted index keeps whatever the
+   parser recorded when the files were last read. Symbol kinds and qualified
+   names come from that snapshot: on an index built before those were added, Go
+   structs still report `TypeAlias`, `symbol_type: "struct"` or `"test"` finds
+   nothing, and `get_symbol_definition`'s `receiver` filter has nothing to match.
+   The fix is a `reindex` of that repository - same cost caveat as above, so ask
+   first - and the symptom is a whole category coming back empty rather than one
+   symbol.
+
+5. **Which checkout was indexed, and is your file inside it?** `--repos` lists
+   specific paths. Git worktrees of those repositories are found automatically
+   (unless the server runs with `--worktrees off`) and appear in `list_repos` as
+   `<repo>@<directory>`, but each is its own repository: code you just wrote in a
+   worktree is not in `<repo>`, only in `<repo>@<worktree>`. A worktree is indexed
+   on its first call and watched from then on; `not indexed yet` in `list_repos`
+   is normal, and `is being indexed; retry` means wait, not "absent". A separate
+   clone or a checkout of another repository is still invisible until its path
+   is in `--repos`, which needs a restart.
+
+   The complement of this is worth stating too, because it is the more common
+   wrong conclusion: **tests are indexed**. Test files and test-helper packages
+   are ordinary sources to the indexer; only the built-in exclusions
+   (`vendor/`, `node_modules/`, lock and minified files) are missing, and
+   `--exclude '!**/vendor/**'` re-includes even those. Compare the repo's file
+   count in `get_index_status` against `find . -name '*.ext' | wc -l` before
+   claiming a directory is out of the index — an empty result about test code is
+   almost always the query's shape, not its coverage.
+
+Say which of the six you checked. "No results for X in repo Y, call graph
 enabled, index has 97k files" is an answer; "the tool returned nothing" is not.
 
 ## Multi-repo and remote
 
 `list_repos` first, and pass `repo` everywhere - see the `narsil-search` skill.
+Run it **per server**: repository names are assigned by whatever paths that
+server was started with, so the same codebase can be `go-rest-api` on one and
+`internal` / `cmd` on another indexed by subdirectory. Mismatched names surface
+as `Repository not found`, which is a configuration bug on the server that was
+pointed below the repo root - not a reason to drop the `repo` filter.
 `validate_repo` and `discover_repos` resolve path questions before indexing.
 Remote GitHub repos (`add_remote_repo`, `get_remote_file`) need `--remote` and a
 `GITHUB_TOKEN`.
@@ -67,3 +105,7 @@ Remote GitHub repos (`add_remote_repo`, `get_remote_file`) need `--remote` and a
 | Trigger `reindex` to "make sure" | It is expensive; confirm staleness, then ask |
 | Blame an author from `get_blame` alone | Read the commit that introduced the line |
 | Assume the tool list you saw last session still holds | Presets and flags change per server; `get_index_status` is cheap |
+| Treat a dead server's silence as a fact about the code | Name the server that failed to connect, and scope the answer to what you could actually query |
+| Reuse a repo name across narsil servers | `list_repos` on each; names are per server |
+| Search `<repo>` for code you wrote in a git worktree | Search `<repo>@<worktree>` from `list_repos`; a clone outside `--repos` is not stale, it is absent |
+| Report a directory (tests, fixtures) as "not indexed" from empty hits | Confirm against `get_index_status` file counts; only the built-in exclusions are actually missing |

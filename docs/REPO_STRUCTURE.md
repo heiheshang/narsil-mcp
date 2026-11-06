@@ -1,8 +1,10 @@
+[← Licensing](LICENSING.md) · [Back to README](../README.md) · [1C Embedding Plan →](1c-embedding-implementation-plan.md)
+
 # Repository Structure: Open Core Separation
 
 > **Version:** 1.0
 > **Last Updated:** January 2026
-> **Related Documents:** [LICENSING.md](./LICENSING.md), [NARSIL_BACKEND_MASTER_PLAN.md](./NARSIL_BACKEND_MASTER_PLAN.md)
+> **Related Documents:** [LICENSING.md](./LICENSING.md), NARSIL_BACKEND_MASTER_PLAN.md (private, not in this repository)
 
 ---
 
@@ -41,7 +43,7 @@ narsil-mcp/
 │   ├── mcp.rs                      # MCP server implementation
 │   │
 │   ├── parser.rs                   # Language parsers (16+)
-│   ├── index.rs                    # Indexing infrastructure
+│   ├── engine/mod.rs               # Indexing infrastructure
 │   │
 │   ├── cache/                      # Query caching (Sprint 1)
 │   │   ├── mod.rs
@@ -431,3 +433,8 @@ jobs:
 - [ ] Set up issue templates for feature requests
 - [ ] Configure Dependabot for both repos
 - [ ] Set up release automation
+
+## See Also
+
+- [Licensing](LICENSING.md) — licensing model
+- [Architecture](architecture.md) — code architecture

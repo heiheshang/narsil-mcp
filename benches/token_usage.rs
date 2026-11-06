@@ -13,7 +13,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use narsil_mcp::config::filter::{ClientInfo, ToolFilter};
 use narsil_mcp::config::schema::ToolConfig;
-use narsil_mcp::index::EngineOptions;
+use narsil_mcp::engine::EngineOptions;
 use narsil_mcp::tool_metadata::TOOL_METADATA;
 use serde_json::json;
 use std::time::Duration;

@@ -1,0 +1,146 @@
+{
+  "dataset_name": "narsil_test_fixtures",
+  "dataset_version": "1.0",
+  "pipeline_name": "narsil_search_code",
+  "total_queries": 3,
+  "completed_queries": 3,
+  "failed_queries": 0,
+  "judged_queries": 0,
+  "judge_failures": 0,
+  "retrieval": {
+    "mean_precision_at_k": 0.0,
+    "mean_recall_at_k": 0.0,
+    "mrr": 0.0,
+    "k": 5
+  },
+  "semantic": null,
+  "latency": {
+    "count": 3,
+    "mean_ms": 507.4046666666667,
+    "p50_ms": 1.218,
+    "p95_ms": 1368.1389,
+    "p99_ms": 1489.64298,
+    "min_ms": 0.977,
+    "max_ms": 1520.019
+  },
+  "diagnosis_counts": {
+    "PASS": 0,
+    "WRONG_CHUNK_RETRIEVED": 3,
+    "WRONG_CHUNK_RANK": 0,
+    "INSUFFICIENT_CONTEXT": 0,
+    "RETRIEVED_BUT_NOT_GROUNDED": 0,
+    "ANSWER_INCORRECT": 0,
+    "LATENCY_OUTLIER": 0,
+    "UNKNOWN": 0
+  },
+  "diagnosis_by_query_type": {
+    "factual": {
+      "PASS": 0,
+      "WRONG_CHUNK_RETRIEVED": 3,
+      "WRONG_CHUNK_RANK": 0,
+      "INSUFFICIENT_CONTEXT": 0,
+      "RETRIEVED_BUT_NOT_GROUNDED": 0,
+      "ANSWER_INCORRECT": 0,
+      "LATENCY_OUTLIER": 0,
+      "UNKNOWN": 0
+    }
+  },
+  "metrics_by_query_type": {
+    "factual": {
+      "query_type": "factual",
+      "total_queries": 3,
+      "completed_queries": 3,
+      "failed_queries": 0,
+      "mean_precision_at_k": 0.0,
+      "mean_recall_at_k": 0.0,
+      "mrr": 0.0,
+      "answer_correctness_rate": null,
+      "groundedness_rate": null,
+      "diagnosis_counts": {
+        "PASS": 0,
+        "WRONG_CHUNK_RETRIEVED": 3,
+        "WRONG_CHUNK_RANK": 0,
+        "INSUFFICIENT_CONTEXT": 0,
+        "RETRIEVED_BUT_NOT_GROUNDED": 0,
+        "ANSWER_INCORRECT": 0,
+        "LATENCY_OUTLIER": 0,
+        "UNKNOWN": 0
+      }
+    }
+  },
+  "top_failures": [
+    {
+      "query_id": "q_calculate_total",
+      "query": "calculate total price of items in a list",
+      "category": "WRONG_CHUNK_RETRIEVED",
+      "severity": "major",
+      "confidence": 1.0,
+      "reason": "None of the expected relevant chunks were retrieved in the top results.",
+      "action": "Review the retrieval strategy and query formulation; the pipeline retrieved irrelevant context.",
+      "evidence": [
+        "Expected chunks: /home/oper/Programs/narsil-mcp/test-fixtures/example.py:1:calculate_total",
+        "Retrieved chunks: None",
+        "Recall@5: 0.0",
+        "Secondary signal: Retrieval latency was 1520.0 ms (exceeded threshold 1000.0 ms)."
+      ]
+    },
+    {
+      "query_id": "q_fetch_data",
+      "query": "fetch data from URL using urllib",
+      "category": "WRONG_CHUNK_RETRIEVED",
+      "severity": "major",
+      "confidence": 1.0,
+      "reason": "None of the expected relevant chunks were retrieved in the top results.",
+      "action": "Review the retrieval strategy and query formulation; the pipeline retrieved irrelevant context.",
+      "evidence": [
+        "Expected chunks: /home/oper/Programs/narsil-mcp/test-fixtures/example.py:2:fetch_data",
+        "Retrieved chunks: None",
+        "Recall@5: 0.0"
+      ]
+    },
+    {
+      "query_id": "q_process_user",
+      "query": "process user id and name into a result dict",
+      "category": "WRONG_CHUNK_RETRIEVED",
+      "severity": "major",
+      "confidence": 1.0,
+      "reason": "None of the expected relevant chunks were retrieved in the top results.",
+      "action": "Review the retrieval strategy and query formulation; the pipeline retrieved irrelevant context.",
+      "evidence": [
+        "Expected chunks: /home/oper/Programs/narsil-mcp/test-fixtures/example.py:0:process_user",
+        "Retrieved chunks: None",
+        "Recall@5: 0.0"
+      ]
+    }
+  ],
+  "overall_insights": [
+    "Wrong-chunk retrieval is the dominant failure mode (3 queries, 100% of failures).",
+    "High tail latency observed: P95 retrieval latency is 1368.1 ms."
+  ],
+  "health_profile": {
+    "score": 7.5,
+    "grade": "Critical",
+    "status": "Critical",
+    "strengths": [],
+    "weaknesses": [
+      "Low recall (mean Recall@5: 0.00)",
+      "Poor precision (mean Precision@5: 0.00)",
+      "Suboptimal ranking quality (MRR: 0.00)",
+      "High retrieval latency (mean: 507.4ms, P95: 1368.1ms)",
+      "Complete retrieval misses on 3 queries (WRONG_CHUNK_RETRIEVED)"
+    ],
+    "recommendations": [
+      "Review the retrieval strategy and query formulation; the pipeline retrieved irrelevant context.",
+      "Investigate slow retrieval or generation paths and optimize the latency bottleneck."
+    ]
+  },
+  "confidence": {
+    "score": 68.5,
+    "level": "Moderate",
+    "reasons": [
+      "All evaluation queries completed successfully.",
+      "Limited dataset sample size (3 queries; larger sample recommended).",
+      "Semantic judge was not configured; retrieval-only evidence."
+    ]
+  }
+}

@@ -1,8 +1,9 @@
 use anyhow::Result;
+use narsil_mcp::engine::FindSymbolsQuery;
 use narsil_mcp::lsp::LspConfig;
 use narsil_mcp::neural::NeuralConfig;
 use narsil_mcp::streaming::StreamingConfig;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Test helper to create a temporary test repository
@@ -32,7 +33,7 @@ impl TestRepo {
 
 #[tokio::test]
 async fn test_persistence_index_creation() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file(
@@ -78,7 +79,7 @@ async fn test_persistence_index_creation() -> Result<()> {
 
 #[tokio::test]
 async fn test_persistence_index_loading() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -122,14 +123,10 @@ async fn test_persistence_index_loading() -> Result<()> {
         engine.complete_initialization().await?;
 
         let symbols = engine
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("User"));
         assert!(symbols.contains("create_user"));
@@ -152,14 +149,10 @@ async fn test_persistence_index_loading() -> Result<()> {
 
         // Verify symbols are available (loaded from cache)
         let symbols = engine2
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("User"));
         assert!(symbols.contains("create_user"));
@@ -170,7 +163,7 @@ async fn test_persistence_index_loading() -> Result<()> {
 
 #[tokio::test]
 async fn test_persistence_stale_file_detection() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -239,14 +232,11 @@ async fn test_persistence_stale_file_detection() -> Result<()> {
 
         // Verify the new struct is present
         let symbols = engine2
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                Some("Modified"),
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                pattern: Some("Modified"),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("ModifiedStruct"));
     }
@@ -256,7 +246,7 @@ async fn test_persistence_stale_file_detection() -> Result<()> {
 
 #[tokio::test]
 async fn test_persistence_disabled() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file(
@@ -292,14 +282,10 @@ async fn test_persistence_disabled() -> Result<()> {
 
     // Verify it still works, just doesn't persist
     let symbols = engine
-        .find_symbols(
-            repo.path().file_name().unwrap().to_str().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .find_symbols(FindSymbolsQuery {
+            repo: repo.path().file_name().unwrap().to_str().unwrap(),
+            ..Default::default()
+        })
         .await?;
     assert!(symbols.contains("test"));
 
@@ -308,7 +294,7 @@ async fn test_persistence_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_empty_persisted_index() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     // Don't add any files initially
@@ -360,14 +346,10 @@ async fn test_empty_persisted_index() -> Result<()> {
         engine2.complete_initialization().await?;
 
         let symbols = engine2
-            .find_symbols(
-                repo.path().file_name().unwrap().to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .find_symbols(FindSymbolsQuery {
+                repo: repo.path().file_name().unwrap().to_str().unwrap(),
+                ..Default::default()
+            })
             .await?;
         assert!(symbols.contains("new_function"));
     }
@@ -377,7 +359,7 @@ async fn test_empty_persisted_index() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_creation() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn test() {}")?;
@@ -412,7 +394,7 @@ async fn test_async_watcher_creation() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn test() {}")?;
@@ -447,7 +429,7 @@ async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_file_change_detection() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -498,7 +480,7 @@ async fn test_async_watcher_file_change_detection() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_debouncing() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -563,7 +545,7 @@ async fn test_async_watcher_debouncing() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_watcher_filters_non_source_files() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use std::time::Duration;
 
     let repo = TestRepo::new()?;
@@ -627,7 +609,7 @@ async fn test_async_watcher_filters_non_source_files() -> Result<()> {
 /// file event could arrive — silently disabling `--watch`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use narsil_mcp::persist;
     use std::sync::Arc;
     use std::time::Duration;
@@ -674,14 +656,11 @@ async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
     // The new symbol must be visible — proves the watcher is alive and
     // processed the file change.
     let result = engine
-        .find_symbols(
-            &repo_name,
-            None,
-            Some("watcher_reindexed_me"),
-            None,
-            None,
-            None,
-        )
+        .find_symbols(FindSymbolsQuery {
+            repo: &repo_name,
+            pattern: Some("watcher_reindexed_me"),
+            ..Default::default()
+        })
         .await?;
     assert!(
         result.contains("watcher_reindexed_me"),
@@ -697,7 +676,7 @@ async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
 /// dropped the Sender accidentally — not a bug in this function.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
     use narsil_mcp::persist;
     use std::sync::Arc;
     use std::time::Duration;
@@ -744,7 +723,7 @@ async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
 /// answering "no results" while `find_symbols` still worked.
 #[tokio::test]
 async fn test_warm_start_keeps_search_working() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file(
@@ -799,7 +778,11 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
     engine.complete_initialization().await?;
 
     let symbols = engine
-        .find_symbols(&repo_name, None, Some("calculate"), None, None, None)
+        .find_symbols(FindSymbolsQuery {
+            repo: &repo_name,
+            pattern: Some("calculate"),
+            ..Default::default()
+        })
         .await?;
     assert!(
         symbols.contains("calculate_invoice_total"),
@@ -833,6 +816,232 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
     Ok(())
 }
 
+/// With `--call-graph` every file is parsed again on a warm start, but the
+/// search documents of unchanged files are kept rather than rebuilt: the
+/// results must be the cold ones, without duplicates, and a file removed
+/// in between must disappear from them.
+#[tokio::test]
+async fn test_warm_call_graph_start_keeps_search_documents() -> Result<()> {
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        "pub fn calculate_invoice_total(items: &[i32]) -> i32 { items.iter().sum() }\n",
+    )?;
+    repo.add_rust_file(
+        "src/gone.rs",
+        "pub fn removed_invoice_helper() -> i32 { 1 }\n",
+    )?;
+    std::fs::write(
+        repo.path().join("notes.txt"),
+        "The invoice total is computed by calculate_invoice_total.\n",
+    )?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: true,
+        persist_enabled: true,
+        watch_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+    let repo_name = repo
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+
+    let start = || {
+        CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            options.clone(),
+        )
+    };
+
+    let cold = {
+        let engine = start().await?;
+        engine.complete_initialization().await?;
+        let hits = engine
+            .semantic_search(Some(&repo_name), "invoice total", 10, None, None)
+            .await?;
+        assert!(hits.contains("notes.txt"), "cold:\n{hits}");
+        assert!(hits.contains("removed_invoice_helper"), "cold:\n{hits}");
+        hits
+    };
+
+    // Unchanged: the same documents, not a second copy of each.
+    {
+        let engine = start().await?;
+        engine.complete_initialization().await?;
+        let warm = engine
+            .semantic_search(Some(&repo_name), "invoice total", 10, None, None)
+            .await?;
+        assert_eq!(warm, cold);
+    }
+
+    std::fs::remove_file(repo.path().join("src/gone.rs"))?;
+    let engine = start().await?;
+    engine.complete_initialization().await?;
+    let warm = engine
+        .semantic_search(Some(&repo_name), "invoice total", 10, None, None)
+        .await?;
+    assert!(
+        !warm.contains("removed_invoice_helper"),
+        "removed file still searchable:\n{warm}"
+    );
+    assert!(warm.contains("notes.txt"), "warm:\n{warm}");
+    assert!(warm.contains("calculate_invoice_total"), "warm:\n{warm}");
+
+    Ok(())
+}
+
+/// With `--call-graph`, a warm start in which no file changed loads the call
+/// graph from its snapshot instead of parsing: the graph and the symbols must
+/// be exactly those of a cold start. A changed file, or a snapshot from
+/// another save, must send it back to parsing.
+#[tokio::test]
+async fn test_warm_start_loads_unchanged_call_graph() -> Result<()> {
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "svc/service.go",
+        "package svc\n\ntype Repo struct{}\n\nfunc (r *Repo) Find(id int) int { return id }\n\n\
+         type Service struct {\n\trepo *Repo\n}\n\n\
+         func (s *Service) Run(id int) int { return s.repo.Find(id) }\n\n\
+         func NewService() *Service { return &Service{repo: &Repo{}} }\n",
+    )?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        "pub fn total(items: &[i32]) -> i32 { helper(items) }\nfn helper(items: &[i32]) -> i32 { items.iter().sum() }\n",
+    )?;
+    repo.add_rust_file(
+        "CommonModules/Общий/Ext/Module.bsl",
+        "Процедура Выполнить() Экспорт\n\tПосчитать();\nКонецПроцедуры\n\n\
+         Процедура Посчитать()\nКонецПроцедуры\n",
+    )?;
+    std::fs::write(repo.path().join("notes.txt"), "plain text\n")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: true,
+        persist_enabled: true,
+        watch_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+    let repo_name = repo
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+    let start = || async {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            options.clone(),
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        anyhow::Ok((
+            engine.call_graph_snapshot(&repo_name).unwrap(),
+            format!("{:?}", engine.repo_symbols(&repo_name).unwrap()),
+            engine.tfidf_snapshot().unwrap(),
+        ))
+    };
+    let snapshot_file = || -> Result<PathBuf> {
+        Ok(std::fs::read_dir(index_dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.to_string_lossy().ends_with(".callgraph.bin"))
+            .expect("call-graph snapshot saved"))
+    };
+
+    let tfidf_file = || -> Result<PathBuf> {
+        Ok(std::fs::read_dir(index_dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.to_string_lossy().ends_with(".tfidf.bin"))
+            .expect("TF-IDF snapshot saved"))
+    };
+
+    let cold = start().await?;
+    assert!(!cold.0.is_empty());
+    let saved = std::fs::read(snapshot_file()?)?;
+    let saved_tfidf = std::fs::read(tfidf_file()?)?;
+
+    let warm = start().await?;
+    assert!(
+        warm.0 == cold.0,
+        "warm call graph differs from the cold one"
+    );
+    assert_eq!(warm.1, cold.1);
+    assert!(
+        warm.2 == cold.2,
+        "restored TF-IDF state differs from the cold one"
+    );
+    assert_eq!(
+        std::fs::read(snapshot_file()?)?,
+        saved,
+        "nothing changed, so nothing is saved"
+    );
+
+    // A TF-IDF snapshot of another save is rejected and rebuilt from the
+    // files, then written back for the next start.
+    let mut foreign_tfidf = saved_tfidf.clone();
+    let stamp_byte = foreign_tfidf
+        .iter()
+        .position(|b| *b == b'/')
+        .expect("stamp");
+    foreign_tfidf[stamp_byte + 1] ^= 1;
+    std::fs::write(tfidf_file()?, &foreign_tfidf)?;
+    let rebuilt_tfidf = start().await?;
+    assert!(rebuilt_tfidf.2 == cold.2, "rebuilt TF-IDF state differs");
+    assert_eq!(rebuilt_tfidf.1, cold.1);
+    assert_eq!(
+        std::fs::read(tfidf_file()?)?,
+        saved_tfidf,
+        "TF-IDF snapshot not written back"
+    );
+
+    // A snapshot of another save (here: one with its stamp altered) is not
+    // trusted; the graph is rebuilt from source and still the cold one.
+    let mut foreign = saved.clone();
+    let stamp_byte = foreign.iter().position(|b| *b == b'/').expect("stamp");
+    foreign[stamp_byte + 1] ^= 1;
+    std::fs::write(snapshot_file()?, &foreign)?;
+    let rebuilt = start().await?;
+    assert!(rebuilt.0 == cold.0, "graph rebuilt from source differs");
+    assert_eq!(rebuilt.1, cold.1);
+    assert!(
+        rebuilt.2 == cold.2,
+        "TF-IDF state differs after a graph rebuild"
+    );
+
+    // A changed file is parsed again: its new call shows up.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.add_rust_file(
+        "src/lib.rs",
+        "pub fn total(items: &[i32]) -> i32 { helper(items) + extra() }\nfn helper(items: &[i32]) -> i32 { items.iter().sum() }\nfn extra() -> i32 { 1 }\n",
+    )?;
+    let changed = start().await?;
+    assert!(
+        changed.0 != cold.0,
+        "changed file did not reach the call graph"
+    );
+    assert!(changed.1.contains("extra"));
+
+    Ok(())
+}
+
 /// A warm start must describe the repository the same way a cold one does.
 ///
 /// Files whose symbols come from the persisted index are never parsed, so their
@@ -841,7 +1050,7 @@ async fn test_warm_start_keeps_search_working() -> Result<()> {
 /// one repository's files across two buckets in `list_repos`.
 #[tokio::test]
 async fn test_warm_start_reports_the_same_languages() -> Result<()> {
-    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn alpha() -> i32 { 1 }\n")?;
@@ -898,4 +1107,131 @@ async fn test_warm_start_reports_the_same_languages() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// `--watch` edges are resolved when the caller's file is read. A change to
+/// another file used to leave them as they were: a call to a function that
+/// appeared later stayed unresolved, and one to a function that moved kept
+/// pointing at its old place.
+mod watch_call_graph {
+    use super::TestRepo;
+    use anyhow::Result;
+    use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+    use tempfile::TempDir;
+
+    async fn engine(repo: &TestRepo, index_dir: &TempDir) -> Result<(CodeIntelEngine, String)> {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo.path().to_path_buf()],
+            EngineOptions {
+                git_enabled: false,
+                call_graph_enabled: true,
+                persist_enabled: false,
+                watch_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        let name = repo
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        Ok((engine, name))
+    }
+
+    fn change(repo: &TestRepo, file: &str, change_type: ChangeType) -> FileChange {
+        FileChange {
+            path: repo.path().join(file),
+            change_type,
+        }
+    }
+
+    async fn callers(engine: &CodeIntelEngine, repo: &str, function: &str) -> Result<String> {
+        engine.get_callers(repo, function, false, 1, None).await
+    }
+
+    #[tokio::test]
+    async fn a_function_added_later_gets_its_callers() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file("src/a.rs", "pub fn kickoff() { helper_fn(); }\n")?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+
+        repo.add_rust_file("src/b.rs", "pub fn helper_fn() {}\n")?;
+        engine
+            .process_file_changes(&[change(&repo, "src/b.rs", ChangeType::Created)])
+            .await?;
+
+        let report = callers(&engine, &name, "helper_fn").await?;
+        assert!(report.contains("kickoff"), "{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_common_module_added_later_gets_its_callers() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file(
+            "CommonModules/Клиент/Ext/Module.bsl",
+            "Процедура Запустить() Экспорт\n\tСервис.Сделать();\nКонецПроцедуры\n",
+        )?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+
+        let module = "CommonModules/Сервис/Ext/Module.bsl";
+        repo.add_rust_file(module, "Процедура Сделать() Экспорт\nКонецПроцедуры\n")?;
+        engine
+            .process_file_changes(&[change(&repo, module, ChangeType::Created)])
+            .await?;
+
+        let report = callers(&engine, &name, "Сделать").await?;
+        assert!(report.contains("Запустить"), "{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_function_is_not_called_any_more() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file("src/a.rs", "pub fn kickoff() { helper_fn(); }\n")?;
+        repo.add_rust_file("src/b.rs", "pub fn helper_fn() {}\n")?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+
+        std::fs::remove_file(repo.path().join("src/b.rs"))?;
+        engine
+            .process_file_changes(&[change(&repo, "src/b.rs", ChangeType::Deleted)])
+            .await?;
+
+        let report = engine.get_callees(&name, "kickoff", false, 1, None).await?;
+        assert!(!report.contains("src/b.rs"), "{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_moved_function_keeps_its_callers() -> Result<()> {
+        let repo = TestRepo::new()?;
+        repo.add_rust_file("src/a.rs", "pub fn kickoff() { helper_fn(); }\n")?;
+        repo.add_rust_file("src/b.rs", "pub fn helper_fn() {}\n")?;
+        let index_dir = TempDir::new()?;
+        let (engine, name) = engine(&repo, &index_dir).await?;
+        assert!(callers(&engine, &name, "helper_fn")
+            .await?
+            .contains("kickoff"));
+
+        std::fs::remove_file(repo.path().join("src/b.rs"))?;
+        engine
+            .process_file_changes(&[change(&repo, "src/b.rs", ChangeType::Deleted)])
+            .await?;
+        repo.add_rust_file("src/c.rs", "pub fn helper_fn() {}\n")?;
+        engine
+            .process_file_changes(&[change(&repo, "src/c.rs", ChangeType::Created)])
+            .await?;
+
+        let report = callers(&engine, &name, "helper_fn").await?;
+        assert!(report.contains("kickoff"), "{report}");
+        Ok(())
+    }
 }

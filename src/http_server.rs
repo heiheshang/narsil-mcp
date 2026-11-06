@@ -15,16 +15,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::index::CodeIntelEngine;
+use crate::config::ClientInfo;
+use crate::engine::CodeIntelEngine;
 use crate::mcp::McpServer;
 use crate::tool_handlers::ToolRegistry;
 use crate::tool_metadata::TOOL_METADATA;
@@ -75,7 +78,12 @@ pub struct AppState {
 ///
 /// Clients normally drop the connection rather than sending `DELETE /mcp`, so
 /// expiry — not the explicit teardown — is what actually retires a session.
-const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+///
+/// Must be well above the idle window of on-demand deployments (30 min on
+/// .136): a client returning after the server was stopped for idleness
+/// presents its old id, and Cursor does not re-`initialize` on the 404.
+/// Memory stays bounded by `MAX_SESSIONS`, not by the TTL.
+const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Hard cap on tracked sessions. `/mcp` has no authentication by design and
 /// the server binds `0.0.0.0`, so anyone who can reach the port can mint
@@ -86,19 +94,48 @@ const MAX_SESSIONS: usize = 4096;
 /// request.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the background task snapshots sessions to disk.
+const PERSIST_INTERVAL: Duration = Duration::from_secs(10);
+
+/// One tracked session: its deadline and the client identity `initialize`
+/// negotiated. Carrying `client_info` per session (rather than as a single
+/// field on `McpServer`, which is shared by every session on this port) is
+/// what lets two concurrently-connected clients get independently correct
+/// `tools/list` filtering, and what makes persisting it below meaningful.
+#[derive(Clone)]
+struct SessionEntry {
+    last_seen: Instant,
+    client_info: Option<ClientInfo>,
+}
+
+/// On-disk shape of one session. `Instant` has no meaning across a process
+/// restart (monotonic clock, unspecified epoch, and not `Serialize`), so the
+/// deadline is persisted as wall-clock `SystemTime` and converted back to an
+/// `Instant` on load.
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    id: String,
+    last_seen: SystemTime,
+    client_info: Option<ClientInfo>,
+}
+
 /// Live MCP sessions, bounded in both size and age.
 ///
-/// In memory only. Sessions used to be written to
-/// `$XDG_CONFIG_HOME/narsil-mcp/sessions-<port>.json` on every mint and
-/// teardown, which was wrong three ways: the whole set was re-serialized under
+/// Snapshotted to `$XDG_CONFIG_HOME/narsil-mcp/sessions-<port>.json` by a
+/// background task (`spawn_session_persister`), not inline in the request
+/// handler. An earlier version persisted synchronously on every mint and
+/// teardown and was wrong three ways: the whole set was re-serialized under
 /// the mutex inside an async handler, so concurrent requests queued behind a
 /// blocking write; the set only ever grew; and a session id surviving a
 /// restart passed validation while the `client_info` from its `initialize`
 /// did not, so `tools/list` answered with an unadapted tool set instead of an
-/// honest 404. A restart now returns `Unknown Mcp-Session-Id`, which is what
-/// the client is expected to handle by re-initializing.
+/// honest 404. This version fixes all three: the write happens off the
+/// request path on a timer, over a cloned snapshot of the already-bounded
+/// map; and `client_info` is part of what gets persisted and restored, so a
+/// resurrected session behaves exactly as it did before the restart instead
+/// of silently losing its tool filtering.
 struct SessionStore {
-    seen: HashMap<String, Instant>,
+    seen: HashMap<String, SessionEntry>,
     last_sweep: Instant,
 }
 
@@ -110,15 +147,85 @@ impl SessionStore {
         }
     }
 
+    /// Rebuild from a persisted snapshot, dropping anything already past its
+    /// TTL as of `now_wall` rather than resurrecting stale sessions.
+    fn from_persisted(
+        persisted: Vec<PersistedSession>,
+        now_wall: SystemTime,
+        now: Instant,
+    ) -> Self {
+        let mut seen = HashMap::new();
+        for p in persisted {
+            // SystemTime isn't monotonic (NTP, DST, manual clock changes), so
+            // a time-went-backwards read is treated as "just seen" instead of
+            // underflowing.
+            let age = now_wall.duration_since(p.last_seen).unwrap_or_default();
+            if age >= SESSION_TTL {
+                continue;
+            }
+            let Some(last_seen) = now.checked_sub(age) else {
+                continue;
+            };
+            seen.insert(
+                p.id,
+                SessionEntry {
+                    last_seen,
+                    client_info: p.client_info,
+                },
+            );
+        }
+        Self {
+            seen,
+            last_sweep: now,
+        }
+    }
+
+    /// Snapshot for persistence: wall-clock deadlines, ready to serialize.
+    fn snapshot(&self, now: Instant, now_wall: SystemTime) -> Vec<PersistedSession> {
+        self.seen
+            .iter()
+            .map(|(id, entry)| PersistedSession {
+                id: id.clone(),
+                // Round-trips the elapsed duration through wall-clock time
+                // without assuming the two clocks share an epoch.
+                last_seen: now_wall - now.duration_since(entry.last_seen),
+                client_info: entry.client_info.clone(),
+            })
+            .collect()
+    }
+
     /// Whether `sid` is live, refreshing its deadline if so.
     fn touch(&mut self, sid: &str, now: Instant) -> bool {
         self.sweep(now);
         match self.seen.get_mut(sid) {
-            Some(last_seen) => {
-                *last_seen = now;
+            Some(entry) => {
+                entry.last_seen = now;
                 true
             }
             None => false,
+        }
+    }
+
+    /// The client info negotiated for `sid`'s `initialize`, if any.
+    fn client_info(&self, sid: &str) -> Option<ClientInfo> {
+        self.seen.get(sid).and_then(|e| e.client_info.clone())
+    }
+
+    /// Record the client info an `initialize` on `sid` negotiated — but only
+    /// the *first* one: a caller reads a client_info snapshot before
+    /// `handle_message`'s await and writes it back after, with no lock held
+    /// across the await, so two concurrent `initialize` calls on the same
+    /// session race on which write lands last. Checking "is it still unset"
+    /// fresh here (under this call's lock, not the pre-await snapshot) means
+    /// only a genuine None-to-Some transition is ever applied — a later
+    /// write can no longer clobber an identity an earlier one already
+    /// established, and a request that read an already-set client_info back
+    /// unchanged is a no-op instead of a redundant write on every call.
+    fn set_client_info_if_absent(&mut self, sid: &str, client_info: ClientInfo) {
+        if let Some(entry) = self.seen.get_mut(sid) {
+            if entry.client_info.is_none() {
+                entry.client_info = Some(client_info);
+            }
         }
     }
 
@@ -130,7 +237,7 @@ impl SessionStore {
             let Some(oldest) = self
                 .seen
                 .iter()
-                .min_by_key(|(_, last_seen)| **last_seen)
+                .min_by_key(|(_, entry)| entry.last_seen)
                 .map(|(sid, _)| sid.clone())
             else {
                 break;
@@ -141,7 +248,13 @@ impl SessionStore {
             );
             self.seen.remove(&oldest);
         }
-        self.seen.insert(sid, now);
+        self.seen.insert(
+            sid,
+            SessionEntry {
+                last_seen: now,
+                client_info: None,
+            },
+        );
     }
 
     fn remove(&mut self, sid: &str) -> bool {
@@ -158,13 +271,90 @@ impl SessionStore {
     fn sweep_now(&mut self, now: Instant) {
         self.last_sweep = now;
         self.seen
-            .retain(|_, last_seen| now.duration_since(*last_seen) < SESSION_TTL);
+            .retain(|_, entry| now.duration_since(entry.last_seen) < SESSION_TTL);
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.seen.len()
     }
+}
+
+/// Where sessions for this port are persisted, or `None` if the config dir
+/// can't be resolved. Persistence is best-effort: losing it just means a
+/// restart falls back to "every client re-initializes", the old behavior.
+fn sessions_file_path(port: u16) -> Option<PathBuf> {
+    ProjectDirs::from("com", "anthropic", "narsil-mcp")
+        .map(|dirs| dirs.config_dir().join(format!("sessions-{port}.json")))
+}
+
+/// Load a persisted session snapshot from disk, if any. Errors (missing
+/// file, corrupt JSON) are logged and treated as "nothing to restore" —
+/// persistence is a best-effort optimization, never a source of truth.
+async fn load_persisted_sessions(path: &PathBuf) -> Vec<PersistedSession> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                warn!("Discarding unreadable session snapshot {:?}: {}", path, e);
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            warn!("Failed to read session snapshot {:?}: {}", path, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Periodically snapshot `sessions` to `path`. Runs off the request path: it
+/// only holds the lock long enough to clone the (already bounded) map, then
+/// serializes and writes outside it, so a slow disk never queues concurrent
+/// `/mcp` requests behind a blocking write — the bug the previous
+/// synchronous-on-every-request version had.
+///
+/// Skips the write when the serialized snapshot is byte-identical to the
+/// last one written: a truly idle server (no session touched since the last
+/// tick, so every `last_seen` is unchanged) would otherwise re-serialize and
+/// rewrite the same bytes, and re-`create_dir_all` an already-existing
+/// directory, every `PERSIST_INTERVAL` forever.
+fn spawn_session_persister(sessions: Arc<Mutex<SessionStore>>, path: PathBuf) {
+    tokio::spawn(async move {
+        if let Some(parent) = path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                warn!("Failed to create session snapshot dir {:?}: {}", parent, e);
+            }
+        }
+
+        let mut interval = tokio::time::interval(PERSIST_INTERVAL);
+        let mut last_written: Option<Vec<u8>> = None;
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let now_wall = SystemTime::now();
+            let snapshot = {
+                let store = sessions.lock().unwrap();
+                store.snapshot(now, now_wall)
+            };
+            let Ok(json) = serde_json::to_vec(&snapshot) else {
+                continue;
+            };
+            if last_written.as_ref() == Some(&json) {
+                continue;
+            }
+            if let Err(e) = tokio::fs::write(&path, &json).await {
+                warn!("Failed to write session snapshot {:?}: {}", path, e);
+                // The directory may have been removed since startup; retry
+                // creating it so the next tick's write has a chance too.
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                continue;
+            }
+            last_written = Some(json);
+        }
+    });
 }
 
 /// Request body for tool calls
@@ -233,12 +423,32 @@ impl HttpServer {
 
     /// Run the HTTP server
     pub async fn run(self) -> Result<()> {
+        let sessions_path = sessions_file_path(self.port);
+        let session_store = match &sessions_path {
+            Some(path) => {
+                let persisted = load_persisted_sessions(path).await;
+                if !persisted.is_empty() {
+                    info!(
+                        "Restored {} MCP session(s) from {:?}",
+                        persisted.len(),
+                        path
+                    );
+                }
+                SessionStore::from_persisted(persisted, SystemTime::now(), Instant::now())
+            }
+            None => SessionStore::new(),
+        };
+
         let state = AppState {
             engine: self.engine,
             tool_registry: Arc::new(self.tool_registry),
             mcp: self.mcp,
-            sessions: Arc::new(Mutex::new(SessionStore::new())),
+            sessions: Arc::new(Mutex::new(session_store)),
         };
+
+        if let Some(path) = sessions_path {
+            spawn_session_persister(state.sessions.clone(), path);
+        }
 
         // Configure CORS to allow frontend access (needed for development mode)
         let cors = CorsLayer::new()
@@ -583,6 +793,12 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
 
     // A session id to return to the client (only set when minting one).
     let mut session_to_issue: Option<String> = None;
+    // The session this request runs under, and the client info it carries in
+    // (empty for a freshly minted session) — `handle_message` may fill this
+    // in via `initialize`, which is then written back to the session store
+    // below so the next request (and a restart, via the persister) sees it.
+    let effective_sid: String;
+    let mut client_info: Option<ClientInfo>;
 
     match (&session_id, is_initialize(&body)) {
         // First contact: initialize starts a fresh session.
@@ -594,7 +810,9 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
                 .unwrap()
                 .insert(sid.clone(), Instant::now());
             info!("MCP streamable-http session started: {}", sid);
-            session_to_issue = Some(sid);
+            session_to_issue = Some(sid.clone());
+            effective_sid = sid;
+            client_info = None;
         }
         // A non-initialize request without a session is a protocol error.
         (None, false) => {
@@ -613,7 +831,9 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
         }
         // Validate an existing session id.
         (Some(sid), _) => {
-            if !state.sessions.lock().unwrap().touch(sid, Instant::now()) {
+            let mut store = state.sessions.lock().unwrap();
+            if !store.touch(sid, Instant::now()) {
+                warn!("Rejected request with unknown Mcp-Session-Id: {}", sid);
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({
@@ -627,13 +847,22 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
                 )
                     .into_response();
             }
+            client_info = store.client_info(sid);
+            effective_sid = sid.clone();
         }
     }
 
-    let response_body = match state.mcp.handle_message(&body).await {
+    let response_body = match state.mcp.handle_message(&body, &mut client_info).await {
         Some(json_str) => json_str,
         // Notification (no id): acknowledged with 202 and no body.
         None => {
+            if let Some(info) = client_info {
+                state
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .set_client_info_if_absent(&effective_sid, info);
+            }
             let mut resp = StatusCode::ACCEPTED.into_response();
             if let Some(sid) = session_to_issue {
                 resp.headers_mut().insert(
@@ -644,6 +873,14 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Strin
             return resp;
         }
     };
+
+    if let Some(info) = client_info {
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .set_client_info_if_absent(&effective_sid, info);
+    }
 
     let mut resp = (
         StatusCode::OK,
@@ -906,5 +1143,137 @@ mod tests {
             !store.touch("sid-0", t0 + Duration::from_secs(1)),
             "the oldest session should have been the one evicted"
         );
+    }
+
+    #[test]
+    fn test_client_info_is_per_session() {
+        let mut store = SessionStore::new();
+        let t0 = Instant::now();
+
+        store.insert("alice".to_string(), t0);
+        store.insert("bob".to_string(), t0);
+        assert_eq!(store.client_info("alice"), None);
+
+        store.set_client_info_if_absent(
+            "alice",
+            ClientInfo {
+                name: "cursor".to_string(),
+                version: Some("1.0".to_string()),
+            },
+        );
+
+        // Setting alice's client info must not leak onto bob's session —
+        // this is the bug a single server-wide `client_info` field had.
+        assert_eq!(store.client_info("bob"), None);
+        assert_eq!(store.client_info("alice").unwrap().name, "cursor");
+    }
+
+    /// `mcp_post` reads a client_info snapshot before `handle_message`'s
+    /// await and writes it back after with no lock held across the await,
+    /// so two concurrent `initialize` calls on one session race on which
+    /// write lands last. `set_client_info_if_absent` closes that: only a
+    /// genuine unset-to-set transition is ever applied, so an established
+    /// identity can't be clobbered by a stale write that started earlier.
+    #[test]
+    fn test_set_client_info_if_absent_does_not_clobber() {
+        let mut store = SessionStore::new();
+        let t0 = Instant::now();
+        store.insert("sid".to_string(), t0);
+
+        store.set_client_info_if_absent(
+            "sid",
+            ClientInfo {
+                name: "cursor".to_string(),
+                version: Some("1.0".to_string()),
+            },
+        );
+        // A second, differently-identified write loses to the first —
+        // simulating a slow write-back from an earlier request completing
+        // after a second request already established the identity.
+        store.set_client_info_if_absent(
+            "sid",
+            ClientInfo {
+                name: "stale-client".to_string(),
+                version: None,
+            },
+        );
+
+        assert_eq!(store.client_info("sid").unwrap().name, "cursor");
+    }
+
+    /// The exact bug the previous persistence attempt had: a session id
+    /// surviving a restart validated, but its `client_info` did not, so
+    /// `tools/list` silently served an unadapted tool set instead of an
+    /// honest 404. Round-tripping through `snapshot`/`from_persisted` must
+    /// restore `client_info` intact, not just the id.
+    #[test]
+    fn test_persisted_session_restores_client_info() {
+        let mut store = SessionStore::new();
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+
+        store.insert("sid-1".to_string(), now);
+        store.set_client_info_if_absent(
+            "sid-1",
+            ClientInfo {
+                name: "cursor".to_string(),
+                version: Some("1.2.3".to_string()),
+            },
+        );
+
+        let snapshot = store.snapshot(now, now_wall);
+        let mut restored = SessionStore::from_persisted(snapshot, now_wall, now);
+
+        assert!(
+            restored.touch("sid-1", now),
+            "restored session must be live"
+        );
+        let info = restored
+            .client_info("sid-1")
+            .expect("client_info must survive a restart");
+        assert_eq!(info.name, "cursor");
+        assert_eq!(info.version.as_deref(), Some("1.2.3"));
+    }
+
+    /// A snapshot taken long before the reload must not resurrect sessions
+    /// that would already have expired by the time the server comes back —
+    /// persistence restores state, it doesn't pause the TTL clock.
+    #[test]
+    fn test_persisted_sessions_past_ttl_are_dropped_on_load() {
+        let mut store = SessionStore::new();
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+
+        store.insert("stale".to_string(), now);
+        let snapshot = store.snapshot(now, now_wall);
+
+        // Reload as if the server had been down past the session TTL.
+        let later_wall = now_wall + SESSION_TTL + Duration::from_secs(1);
+        let later = now + SESSION_TTL + Duration::from_secs(1);
+        let mut restored = SessionStore::from_persisted(snapshot, later_wall, later);
+
+        assert_eq!(restored.len(), 0);
+        assert!(!restored.touch("stale", later));
+    }
+
+    /// 28.10.2026 on .136: last call 07:28, stopped for idleness 07:59,
+    /// woken by the same client 08:02. With a 30-minute TTL the session was
+    /// dropped on load and Cursor stayed stuck on the 404.
+    #[test]
+    fn test_session_survives_idle_stop_and_wake() {
+        const IDLE_STOP: Duration = Duration::from_secs(30 * 60);
+        let mut store = SessionStore::new();
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+
+        store.insert("cursor".to_string(), now);
+        let stopped = now + IDLE_STOP + Duration::from_secs(60);
+        let snapshot = store.snapshot(stopped, now_wall + IDLE_STOP + Duration::from_secs(60));
+
+        let woken_after = Duration::from_secs(34 * 60 + 30);
+        let mut restored =
+            SessionStore::from_persisted(snapshot, now_wall + woken_after, now + woken_after);
+
+        assert!(restored.touch("cursor", now + woken_after));
     }
 }

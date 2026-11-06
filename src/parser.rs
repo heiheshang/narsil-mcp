@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use streaming_iterator::StreamingIterator;
@@ -112,6 +113,7 @@ impl LanguageParser {
                     (const_item name: (identifier) @const.name) @const.def
                     (static_item name: (identifier) @static.name) @static.def
                     (mod_item name: (identifier) @mod.name) @mod.def
+                    (field_declaration name: (field_identifier) @field.name) @field.def
                 "#,
             },
             // Python
@@ -135,6 +137,10 @@ impl LanguageParser {
                     (method_definition name: (property_identifier) @method.name) @method.def
                     (arrow_function) @arrow.def
                     (variable_declarator name: (identifier) @var.name) @var.def
+                    (call_expression
+                      function: (identifier) @_case
+                      arguments: (arguments . [(string) (template_string)] @test.name)
+                      (#any-of? @_case "describe" "it" "test")) @test.def
                 "#,
             },
             // TypeScript
@@ -149,6 +155,10 @@ impl LanguageParser {
                     (interface_declaration name: (type_identifier) @interface.name) @interface.def
                     (type_alias_declaration name: (type_identifier) @type.name) @type.def
                     (enum_declaration name: (identifier) @enum.name) @enum.def
+                    (call_expression
+                      function: (identifier) @_case
+                      arguments: (arguments . [(string) (template_string)] @test.name)
+                      (#any-of? @_case "describe" "it" "test")) @test.def
                 "#,
             },
             // TSX
@@ -162,6 +172,10 @@ impl LanguageParser {
                     (method_definition name: (property_identifier) @method.name) @method.def
                     (interface_declaration name: (type_identifier) @interface.name) @interface.def
                     (type_alias_declaration name: (type_identifier) @type.name) @type.def
+                    (call_expression
+                      function: (identifier) @_case
+                      arguments: (arguments . [(string) (template_string)] @test.name)
+                      (#any-of? @_case "describe" "it" "test")) @test.def
                 "#,
             },
             // Go
@@ -169,10 +183,36 @@ impl LanguageParser {
                 name: "go".to_string(),
                 language: tree_sitter_go::LANGUAGE.into(),
                 extensions: vec!["go"],
+                // Test cases: `t.Run("...")`, goblin's `g.Describe`/`g.It`, and
+                // Ginkgo's dot-imported `Describe`/`Context`/`It`. `It`/`Describe`
+                // also admit an uppercase continuation, so project wrappers such
+                // as `ItRecover` count while `Items`/`Itoa` do not; a wrapper may
+                // take the suite (`g`, `t`) first and the name second. `Run` stays
+                // exact in selector form and is absent in bare form: `RunQuery("...")`
+                // and `Run("...")` are ordinary calls far more often than tests.
                 symbol_query: r#"
                     (function_declaration name: (identifier) @function.name) @function.def
                     (method_declaration name: (field_identifier) @method.name) @method.def
+                    (type_declaration (type_spec name: (type_identifier) @struct.name type: (struct_type))) @struct.def
+                    (type_declaration (type_spec name: (type_identifier) @interface.name type: (interface_type))) @interface.def
                     (type_declaration (type_spec name: (type_identifier) @type.name)) @type.def
+                    (type_declaration (type_alias name: (type_identifier) @type.name)) @type.def
+                    (field_declaration name: (field_identifier) @field.name) @field.def
+                    (source_file (const_declaration (const_spec name: (identifier) @const.name (#not-eq? @const.name "_")) @const.def))
+                    (source_file (var_declaration (var_spec name: (identifier) @var.name (#not-eq? @var.name "_")) @var.def))
+                    (source_file (var_declaration (var_spec_list (var_spec name: (identifier) @var.name (#not-eq? @var.name "_")) @var.def)))
+                    (call_expression
+                      function: (selector_expression field: (field_identifier) @_run)
+                      arguments: (argument_list . [(interpreted_string_literal) (raw_string_literal)] @test.name)
+                      (#match? @_run "^(Run|Context|When|Specify|(It|Describe)([A-Z][A-Za-z0-9_]*)?)$")) @test.def
+                    (call_expression
+                      function: (identifier) @_case
+                      arguments: (argument_list . [(interpreted_string_literal) (raw_string_literal)] @test.name)
+                      (#match? @_case "^(Context|When|Specify|(It|Describe)([A-Z][A-Za-z0-9_]*)?)$")) @test.def
+                    (call_expression
+                      function: [(identifier) @_wrap (selector_expression field: (field_identifier) @_wrap)]
+                      arguments: (argument_list . (identifier) . [(interpreted_string_literal) (raw_string_literal)] @test.name)
+                      (#match? @_wrap "^(It|Describe)[A-Z][A-Za-z0-9_]*$")) @test.def
                 "#,
             },
             // C
@@ -342,8 +382,10 @@ impl LanguageParser {
                 language: tree_sitter_haskell::LANGUAGE.into(),
                 extensions: vec!["hs", "lhs"],
                 symbol_query: r#"
-                    (decl name: (variable) @function.name) @function.def
-                    (decl names: (binding_list (variable) @function.name)) @function.def
+                    (bind name: (variable) @function.name) @function.def
+                    (function name: (variable) @function.name) @function.def
+                    (signature name: (variable) @function.name) @function.def
+                    (signature names: (binding_list (variable) @function.name)) @function.def
                     (data_type (name) @struct.name) @struct.def
                     (class (name) @trait.name) @trait.def
                 "#,
@@ -386,17 +428,27 @@ impl LanguageParser {
                 language: tree_sitter_julia::LANGUAGE.into(),
                 extensions: vec!["jl"],
                 symbol_query: r#"
-                    (module_definition (identifier) @mod.name) @mod.def
+                    (module_definition name: (identifier) @mod.name) @mod.def
 
                     (function_definition
                       (signature
                         (call_expression (identifier) @function.name))) @function.def
+                    (function_definition
+                      (signature
+                        (typed_expression
+                          (call_expression (identifier) @function.name)))) @function.def
 
-                    (short_function_definition
+                    (assignment .
                       (call_expression (identifier) @function.name)) @function.def
+                    (assignment .
+                      (typed_expression
+                        (call_expression (identifier) @function.name))) @function.def
 
                     (struct_definition
-                      (identifier) @struct.name) @struct.def
+                      (type_head (identifier) @struct.name)) @struct.def
+                    (struct_definition
+                      (type_head
+                        (parametrized_type_expression (identifier) @struct.name))) @struct.def
                 "#,
             },
             // R
@@ -599,6 +651,7 @@ impl LanguageParser {
             let mut start_line = 0;
             let mut end_line = 0;
             let mut signature: Option<String> = None;
+            let mut def_node: Option<tree_sitter::Node> = None;
 
             for capture in match_.captures {
                 let capture_name = query.capture_names()[capture.index as usize];
@@ -606,11 +659,14 @@ impl LanguageParser {
                 let text = node.utf8_text(source_bytes).unwrap_or("");
 
                 if capture_name.ends_with(".name") {
-                    name = Some(text.to_string());
+                    // A test case's name is a string literal; index the text,
+                    // not the quotes around it.
+                    name = Some(strip_string_literal(text).to_string());
                     kind = Some(parse_symbol_kind(capture_name));
                 } else if capture_name.ends_with(".def") {
                     start_line = node.start_position().row + 1;
                     end_line = node.end_position().row + 1;
+                    def_node = Some(node);
 
                     // Extract first line as signature (safe byte boundary)
                     let first_line_end = text.find('\n').unwrap_or(text.len());
@@ -620,6 +676,15 @@ impl LanguageParser {
             }
 
             if let (Some(name), Some(kind)) = (name, kind) {
+                // `Receiver::method` for anything owned by a type. Two methods
+                // of the same name on different types are indistinguishable
+                // without it, and a lookup then lands on whichever was parsed
+                // first.
+                let qualified_name = def_node
+                    .filter(|_| owner_is_meaningful(&kind))
+                    .and_then(|node| crate::callgraph::extract_receiver_type(node, source_bytes))
+                    .map(|owner| format!("{owner}::{name}"));
+
                 symbols.push(Symbol {
                     name,
                     kind,
@@ -627,13 +692,87 @@ impl LanguageParser {
                     start_line,
                     end_line,
                     signature,
-                    qualified_name: None,
+                    qualified_name,
                     doc_comment: None,
                 });
             }
         }
 
+        dedup_by_specificity(&mut symbols);
+
         Ok(symbols)
+    }
+}
+
+/// Some languages need a specific pattern (Go's `type X struct`) alongside a
+/// catch-all one (`type X = Y`), and tree-sitter reports both for the same
+/// node. Keep one symbol per definition, preferring the more specific kind.
+/// Trim the delimiters off a string literal (`"case"`, `'case'`, `` `case` ``);
+/// any other text is returned unchanged.
+/// Which symbols are worth qualifying with their owning type. A type's own
+/// declaration is not (it would be labelled with the enclosing module), but
+/// everything a type contains is.
+fn owner_is_meaningful(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Constructor
+            | SymbolKind::Field
+            | SymbolKind::TestCase
+    )
+}
+
+fn strip_string_literal(text: &str) -> &str {
+    let mut chars = text.chars();
+    match (chars.next(), text.chars().next_back()) {
+        (Some(first @ ('"' | '\'' | '`')), Some(last))
+            if last == first && text.chars().count() >= 2 =>
+        {
+            &text[first.len_utf8()..text.len() - last.len_utf8()]
+        }
+        _ => text,
+    }
+}
+
+fn dedup_by_specificity(symbols: &mut Vec<Symbol>) {
+    let mut best: HashMap<(String, usize, usize), usize> = HashMap::new();
+    let mut drop = vec![false; symbols.len()];
+
+    for i in 0..symbols.len() {
+        let key = (
+            symbols[i].name.clone(),
+            symbols[i].start_line,
+            symbols[i].end_line,
+        );
+        match best.get(&key) {
+            Some(&kept) => {
+                if kind_specificity(&symbols[i].kind) > kind_specificity(&symbols[kept].kind) {
+                    drop[kept] = true;
+                    best.insert(key, i);
+                } else {
+                    drop[i] = true;
+                }
+            }
+            None => {
+                best.insert(key, i);
+            }
+        }
+    }
+
+    if drop.iter().any(|d| *d) {
+        let mut keep = drop.iter().map(|d| !*d);
+        symbols.retain(|_| keep.next().unwrap_or(true));
+    }
+}
+
+/// `TypeAlias` is what the catch-all pattern yields; anything else carries
+/// more information and wins.
+fn kind_specificity(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Unknown => 0,
+        SymbolKind::TypeAlias => 1,
+        _ => 2,
     }
 }
 
@@ -652,6 +791,8 @@ fn parse_symbol_kind(capture_name: &str) -> SymbolKind {
         "mod" | "module" | "namespace" => SymbolKind::Module,
         "impl" => SymbolKind::Implementation,
         "var" | "arrow" => SymbolKind::Variable,
+        "field" => SymbolKind::Field,
+        "test" => SymbolKind::TestCase,
         _ => SymbolKind::Unknown,
     }
 }
@@ -1120,6 +1261,24 @@ end
     }
 
     #[test]
+    fn every_symbol_query_compiles() {
+        // A query that does not compile is logged once and the language then
+        // yields no symbols at all, which no other test notices unless it
+        // covers that language.
+        let parser = LanguageParser::new().unwrap();
+        let broken: Vec<String> = parser
+            .configs
+            .iter()
+            .filter_map(|lazy| {
+                Query::new(&lazy.config.language, lazy.config.symbol_query)
+                    .err()
+                    .map(|e| format!("{}: {e}", lazy.config.name))
+            })
+            .collect();
+        assert!(broken.is_empty(), "{broken:#?}");
+    }
+
+    #[test]
     fn test_parse_haskell() {
         let parser = LanguageParser::new().unwrap();
         let content = r#"
@@ -1380,39 +1539,38 @@ int add(int a, int b) => a + b;
     #[test]
     fn test_parse_julia() {
         let parser = LanguageParser::new().unwrap();
-        // Simplified test case
         let content = r#"
+module Shapes
+
 function greet(name)
     println("Hello")
 end
 
+function area(s)::Float64
+    s.side^2
+end
+
+square(x) = x * x
+
 struct Person
     name
+end
+
+mutable struct Point{T}
+    x::T
+end
+
 end
         "#;
 
         let parsed = parser.parse_file(Path::new("test.jl"), content).unwrap();
         assert_eq!(parsed.language, "julia");
-
-        // Julia symbol extraction is limited due to complex AST structure
-        // We verify that the parser works by checking the tree was created
-        assert!(
-            parsed.tree.is_some(),
-            "Should successfully parse Julia code"
+        let mut names: Vec<_> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["Person", "Point", "Shapes", "area", "greet", "square"]
         );
-        // If symbols are extracted, verify they contain expected names
-        let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
-        eprintln!("Found Julia symbols: {:?}", names);
-        if !names.is_empty() {
-            // Check that function definitions produce symbol entries
-            assert!(
-                parsed
-                    .symbols
-                    .iter()
-                    .any(|s| s.kind == crate::symbols::SymbolKind::Function),
-                "Should find at least one function symbol"
-            );
-        }
     }
 
     #[test]
@@ -1522,6 +1680,351 @@ $person->greet();
             "Should find sub greet"
         );
         assert!(names.contains(&&"add".to_string()), "Should find sub add");
+    }
+
+    #[test]
+    fn test_parse_rust_struct_fields() {
+        let parser = LanguageParser::new().unwrap();
+        let code = r#"
+pub struct Operation {
+    /// Stable id
+    #[serde(rename = "operation_uuid")]
+    pub operation_uuid: String,
+    amount: i64,
+}
+
+pub struct Tuple(String, i64);
+
+pub enum Event {
+    Created { operation_uuid: String },
+    Deleted(String),
+}
+
+impl Operation {
+    fn id(&self) -> &str { &self.operation_uuid }
+}
+"#;
+        let parsed = parser.parse_file(Path::new("op.rs"), code).unwrap();
+        let fields: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == crate::symbols::SymbolKind::Field)
+            .collect();
+        let mut names: Vec<&str> = fields.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        // Named struct fields and struct-variant fields; tuple fields have no name.
+        assert_eq!(names, vec!["amount", "operation_uuid", "operation_uuid"]);
+        let uuid = fields
+            .iter()
+            .find(|s| s.name == "operation_uuid" && s.start_line == 5)
+            .expect("struct field at its declaration line, not at the attribute");
+        assert_eq!(
+            uuid.signature.as_deref(),
+            Some("pub operation_uuid: String")
+        );
+        // `self.operation_uuid` in the method body is a field access, not a declaration.
+        assert!(parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "id" && s.kind == crate::symbols::SymbolKind::Function));
+    }
+
+    /// `type X struct` used to fall into the catch-all `type` pattern and be
+    /// reported as a TypeAlias, so `find_symbols symbol_type:"struct"` missed
+    /// every Go struct in the repository.
+    /// Two `Save` methods on different types are the same symbol name; the
+    /// owning type is what tells them apart, and the call graph already knows
+    /// how to read it.
+    #[test]
+    fn test_methods_are_qualified_by_owner() {
+        let parser = LanguageParser::new().unwrap();
+
+        let go = r#"
+package store
+
+type PaymentStore struct{}
+type AuditStore struct{}
+
+func (s *PaymentStore) Save() error { return nil }
+func (s *AuditStore) Save() error { return nil }
+func Save() error { return nil }
+"#;
+        let parsed = parser.parse_file(Path::new("store.go"), go).unwrap();
+        let qualified: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == "Save")
+            .map(|s| s.qualified_name.clone())
+            .collect();
+        assert!(qualified.contains(&Some("PaymentStore::Save".to_string())));
+        assert!(qualified.contains(&Some("AuditStore::Save".to_string())));
+        // A free function has no owner to qualify it with.
+        assert!(qualified.contains(&None));
+
+        // Rust methods take the impl type; the struct itself stays unqualified.
+        let rust = r#"
+pub struct Engine;
+impl Engine {
+    pub fn run(&self) {}
+}
+"#;
+        let parsed = parser.parse_file(Path::new("engine.rs"), rust).unwrap();
+        let run = parsed.symbols.iter().find(|s| s.name == "run").unwrap();
+        assert_eq!(run.qualified_name.as_deref(), Some("Engine::run"));
+        let engine = parsed.symbols.iter().find(|s| s.name == "Engine").unwrap();
+        assert_eq!(engine.qualified_name, None);
+    }
+
+    /// Table-driven Go subtests and JS `describe`/`it` blocks are the units a
+    /// caller actually edits; without them the only way to find a case's line
+    /// range is grep.
+    #[test]
+    fn test_parse_test_cases() {
+        let parser = LanguageParser::new().unwrap();
+
+        let go = r#"
+package api
+
+func TestWithdraw(t *testing.T) {
+    t.Run("recovers on timeout", func(t *testing.T) {
+        do()
+    })
+    other.Run("not a subtest name")
+}
+"#;
+        let parsed = parser.parse_file(Path::new("w_test.go"), go).unwrap();
+        let case = parsed
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::TestCase)
+            .expect("t.Run subtest indexed");
+        assert_eq!(case.name, "recovers on timeout");
+        assert_eq!(case.start_line, 5);
+        assert_eq!(case.end_line, 7);
+        // The plain function is still indexed alongside it.
+        assert!(parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "TestWithdraw" && s.kind == SymbolKind::Function));
+
+        // goblin, Ginkgo and a project wrapper over goblin's `It`.
+        let bdd = r#"
+package api
+
+func TestRecover(t *testing.T) {
+    g := goblin.Goblin(t)
+    g.Describe("recovery", func() {
+        g.It("resends stuck operations", func() {})
+        ItRecover(g, "cancels after timeout", func() {})
+    })
+}
+
+var _ = Describe("ledger", func() {
+    Context(`with zero amount`, func() {
+        It("rejects", func() {})
+    })
+})
+
+func helpers() {
+    strconv.Itoa(1)
+    Items("not a test")
+    RunQuery("SELECT 1")
+    Run("not a test either")
+    key := ContextKey("user")
+}
+"#;
+        let parsed = parser.parse_file(Path::new("r_test.go"), bdd).unwrap();
+        let names: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TestCase)
+            .map(|s| s.name.as_str())
+            .collect();
+        for want in [
+            "recovery",
+            "resends stuck operations",
+            "cancels after timeout",
+            "ledger",
+            "with zero amount",
+            "rejects",
+        ] {
+            assert!(names.contains(&want), "{want:?} not indexed: {names:?}");
+        }
+        for unwanted in ["not a test", "SELECT 1", "not a test either", "user"] {
+            assert!(
+                !names.contains(&unwanted),
+                "ordinary call {unwanted:?} indexed as a test case: {names:?}"
+            );
+        }
+
+        let js = r#"
+describe("withdrawals", () => {
+  it("retries", async () => {
+    await run();
+  });
+});
+helper("not a test");
+"#;
+        let parsed = parser.parse_file(Path::new("w.test.js"), js).unwrap();
+        let names: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TestCase)
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"withdrawals".to_string()) && names.contains(&"retries".to_string()),
+            "describe/it not indexed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"not a test".to_string()),
+            "unrelated call indexed as a test case: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_go_type_kinds() {
+        let parser = LanguageParser::new().unwrap();
+        let code = r#"
+package api
+
+type PaymentSnapshotBank struct {
+    Name string
+}
+
+type Store interface {
+    Save() error
+}
+
+type OperationID = string
+"#;
+        let parsed = parser.parse_file(Path::new("types.go"), code).unwrap();
+        let kind = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.kind.clone())
+        };
+
+        assert_eq!(kind("PaymentSnapshotBank"), Some(SymbolKind::Struct));
+        assert_eq!(kind("Store"), Some(SymbolKind::Interface));
+        assert_eq!(kind("OperationID"), Some(SymbolKind::TypeAlias));
+
+        // The specific and the catch-all pattern both match a struct; only one
+        // symbol may survive.
+        assert_eq!(
+            parsed
+                .symbols
+                .iter()
+                .filter(|s| s.name == "PaymentSnapshotBank")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_parse_go_struct_fields() {
+        let parser = LanguageParser::new().unwrap();
+        let code = r#"
+package api
+
+type Operation struct {
+    OperationUUID string `json:"operation_uuid"`
+    Amount, Fee   int64
+    embedded.Base
+}
+
+func (o *Operation) ID() string { return o.OperationUUID }
+"#;
+        let parsed = parser.parse_file(Path::new("op.go"), code).unwrap();
+        let field = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name && s.kind == crate::symbols::SymbolKind::Field)
+        };
+        let uuid = field("OperationUUID").expect("struct field indexed as symbol");
+        assert_eq!(uuid.start_line, 5);
+        assert!(
+            uuid.signature
+                .as_deref()
+                .unwrap()
+                .contains("json:\"operation_uuid\""),
+            "signature keeps the struct tag: {:?}",
+            uuid.signature
+        );
+        // Multi-name declaration yields one symbol per name.
+        assert!(field("Amount").is_some());
+        assert!(field("Fee").is_some());
+        // Method and type are still there, the receiver's field access is not a field symbol.
+        assert!(parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "ID" && s.kind == crate::symbols::SymbolKind::Method));
+        assert!(parsed.symbols.iter().any(|s| s.name == "Operation"));
+        assert_eq!(
+            parsed
+                .symbols
+                .iter()
+                .filter(|s| s.kind == crate::symbols::SymbolKind::Field)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_parse_go_package_vars_and_consts() {
+        use crate::symbols::SymbolKind;
+        let parser = LanguageParser::new().unwrap();
+        let code = r#"
+package solerror
+
+const Single = "x"
+
+const (
+    KindA Kind = iota
+    KindB
+    _
+)
+
+var MetricKindEnum = struct {
+    Counter string
+}{Counter: "counter"}
+
+var (
+    ErrA, ErrB = ErrorCode{Code: "a"}, ErrorCode{Code: "b"}
+    _ Coder = (*ErrorCode)(nil)
+)
+
+func f() {
+    var local = 1
+    const localConst = 2
+}
+"#;
+        let parsed = parser.parse_file(Path::new("error.go"), code).unwrap();
+        let kind_of = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.kind.clone())
+        };
+        assert_eq!(kind_of("Single"), Some(SymbolKind::Constant));
+        assert_eq!(kind_of("KindA"), Some(SymbolKind::Constant));
+        assert_eq!(kind_of("KindB"), Some(SymbolKind::Constant));
+        assert_eq!(kind_of("MetricKindEnum"), Some(SymbolKind::Variable));
+        assert_eq!(kind_of("ErrA"), Some(SymbolKind::Variable));
+        assert_eq!(kind_of("ErrB"), Some(SymbolKind::Variable));
+        let enum_var = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "MetricKindEnum")
+            .unwrap();
+        assert_eq!((enum_var.start_line, enum_var.end_line), (12, 14));
+        assert!(parsed.symbols.iter().all(|s| s.name != "_"));
+        assert_eq!(kind_of("local"), None);
+        assert_eq!(kind_of("localConst"), None);
     }
 
     #[test]

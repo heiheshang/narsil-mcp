@@ -3,7 +3,7 @@
 /// These tests verify that different editors get appropriate tool presets
 /// based on their MCP client identification.
 use narsil_mcp::config::{ClientInfo, ConfigLoader, ToolFilter};
-use narsil_mcp::index::EngineOptions;
+use narsil_mcp::engine::EngineOptions;
 
 #[test]
 fn test_vscode_gets_balanced_preset() {

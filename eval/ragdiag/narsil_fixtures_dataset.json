@@ -1,0 +1,33 @@
+{
+  "name": "narsil_test_fixtures",
+  "version": "1.0",
+  "samples": [
+    {
+      "id": "q_calculate_total",
+      "query": "calculate total price of items in a list",
+      "expected_answer": "calculate_total iterates items and sums price times quantity.",
+      "relevant_chunk_ids": [
+        "/home/oper/Programs/narsil-mcp/test-fixtures/example.py:1:calculate_total"
+      ],
+      "query_type": "factual"
+    },
+    {
+      "id": "q_process_user",
+      "query": "process user id and name into a result dict",
+      "expected_answer": "process_user builds a dict with id, name, name_length, and valid flag.",
+      "relevant_chunk_ids": [
+        "/home/oper/Programs/narsil-mcp/test-fixtures/example.py:0:process_user"
+      ],
+      "query_type": "factual"
+    },
+    {
+      "id": "q_fetch_data",
+      "query": "fetch data from URL using urllib",
+      "expected_answer": "fetch_data opens the URL with urllib.request.urlopen and returns decoded text.",
+      "relevant_chunk_ids": [
+        "/home/oper/Programs/narsil-mcp/test-fixtures/example.py:2:fetch_data"
+      ],
+      "query_type": "factual"
+    }
+  ]
+}

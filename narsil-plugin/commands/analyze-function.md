@@ -18,7 +18,12 @@ The user should provide a function name. Parse $ARGUMENTS to extract:
 
 1. **Find the function**: Use `workspace_symbol_search` to locate the function if the exact location is unknown
 
-2. **Get the source**: Use `get_symbol_definition` to read the function code
+2. **Get the source**: Use `get_symbol_definition` to read the function code.
+   For a long body, call it with `outline=true` first — that returns the
+   control-flow skeleton with line numbers, and `get_file` reads the region
+   worth reading in full. If the output carries an `**Also defined**` line the
+   name is ambiguous: re-ask with `receiver="TypeName"` (the Go receiver, Rust
+   `impl` type or class) or `file="pkg/file.go"`.
 
 3. **Analyze callers**: Use `get_callers` with `transitive=true` and `max_depth=3` to see what calls this function
 

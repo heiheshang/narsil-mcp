@@ -2,7 +2,7 @@
 //! result caps and loud failures instead of silently-empty successes.
 
 use anyhow::Result;
-use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+use narsil_mcp::engine::{CodeIntelEngine, EngineOptions};
 use narsil_mcp::tool_handlers::ToolRegistry;
 use serde_json::json;
 use std::path::Path;
@@ -181,6 +181,70 @@ async fn search_code_path_alias_with_bare_filename() -> Result<()> {
     assert!(
         !out.contains("other.md"),
         "path filter leaked other files:\n{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_code_reports_matches_hidden_by_truncation() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let body: String = (0..20)
+        .map(|i| format!("call needle_marker at step {i}\n"))
+        .collect();
+    repo.add_file("docs/many.md", &body)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "needle_marker", "max_results": 3}),
+        )
+        .await?;
+
+    // The count must describe what matched, not what survived the cut.
+    assert!(
+        out.contains("Showing 3 of 20"),
+        "truncation was reported as a complete result:\n{out}"
+    );
+    Ok(())
+}
+
+/// A pasted SQL fragment rarely carries the file's exact alignment; two spaces
+/// against one used to read as "no such code".
+#[tokio::test]
+async fn search_code_ignores_whitespace_width() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "repo/stuck.go",
+        "package repo\n\nconst q = `SELECT id FROM ops\n\tWHERE  status\t=  'new'`\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "where status = 'new'"}),
+        )
+        .await?;
+    assert!(
+        out.contains("stuck.go"),
+        "whitespace width decided the match:\n{out}"
+    );
+
+    let none = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "wherestatus"}),
+        )
+        .await?;
+    assert!(
+        none.contains("Found 0 results"),
+        "whitespace that is absent must not be invented:\n{none}"
     );
     Ok(())
 }
@@ -560,5 +624,636 @@ async fn oversized_files_skipped_from_index() -> Result<()> {
         .await?;
     assert!(out.contains("small.md"), "{out}");
     assert!(!out.contains("huge.md"), "oversized file indexed:\n{out}");
+    Ok(())
+}
+
+/// A symbol listing without the end line forces the caller to guess where a
+/// body stops (or shell out to `sed`); the range is what feeds `get_file`.
+#[tokio::test]
+async fn find_symbols_reports_line_range() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/lib.rs",
+        r#"pub fn spans_several_lines() {
+    let a = 1;
+    let b = 2;
+    println!("{a}{b}");
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "spans_several_lines"}),
+        )
+        .await?;
+    assert!(
+        out.contains("src/lib.rs:1-5"),
+        "no end line in the listing:\n{out}"
+    );
+
+    let compact = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "spans_several_lines", "compact": true}),
+        )
+        .await?;
+    assert!(
+        compact.contains("src/lib.rs:1-5"),
+        "no end line in compact mode:\n{compact}"
+    );
+    Ok(())
+}
+
+/// A bare "not found" costs another round trip. The error must name the
+/// symbols that nearly matched.
+#[tokio::test]
+async fn get_symbol_definition_suggests_near_misses() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/lib.rs",
+        "pub struct PaymentSnapshotBank { pub name: String }\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // Wrong case.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "paymentsnapshotbank"}),
+        )
+        .await
+        .expect_err("unknown symbol must fail");
+    assert!(
+        err.to_string().contains("PaymentSnapshotBank"),
+        "no candidate offered: {err}"
+    );
+
+    // Wrong qualifier, right last segment.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "models::PaymentSnapshotBank"}),
+        )
+        .await
+        .expect_err("unknown symbol must fail");
+    assert!(
+        err.to_string().contains("src/lib.rs:1"),
+        "candidate without a location: {err}"
+    );
+
+    // Nothing close: still actionable, no bogus suggestion.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Zzzzz"}),
+        )
+        .await
+        .expect_err("unknown symbol must fail");
+    assert!(
+        err.to_string().contains("find_symbols"),
+        "no way forward offered: {err}"
+    );
+    Ok(())
+}
+
+/// A 400-line function has to be readable in pieces, or callers fall back to
+/// `sed`. `outline`, `contains` and `offset`/`max_lines` are those pieces.
+#[tokio::test]
+async fn get_symbol_definition_narrows_large_bodies() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/exec.go",
+        r#"package exec
+
+func ExecuteLineItem(rail string) error {
+	total := 0
+	total = total + 1
+	switch rail {
+	case "eft":
+		return runEft()
+	case "payshape":
+		return runPayshape()
+	}
+	return nil
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let outline = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "outline": true}),
+        )
+        .await?;
+    assert!(
+        outline.contains("switch rail") && outline.contains("case \"payshape\""),
+        "outline dropped the control flow:\n{outline}"
+    );
+    assert!(
+        !outline.contains("total := 0"),
+        "outline kept straight-line code:\n{outline}"
+    );
+    assert!(
+        outline.contains("func ExecuteLineItem"),
+        "outline dropped the signature:\n{outline}"
+    );
+    assert!(outline.contains('⋯'), "gaps not marked:\n{outline}");
+
+    let grepped = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "contains": "payshape"}),
+        )
+        .await?;
+    assert!(
+        grepped.contains("runPayshape") && !grepped.contains("runEft()"),
+        "contains did not scope to matching lines:\n{grepped}"
+    );
+
+    let paged = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "offset": 1, "max_lines": 2}),
+        )
+        .await?;
+    assert!(
+        paged.contains("total = total + 1") && !paged.contains("total := 0"),
+        "offset not applied:\n{paged}"
+    );
+    assert!(
+        !paged.contains("return nil"),
+        "max_lines not applied:\n{paged}"
+    );
+    assert!(
+        paged.contains("hidden"),
+        "hidden lines not reported:\n{paged}"
+    );
+
+    // A bad regex must fail loudly rather than match nothing.
+    registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "ExecuteLineItem", "contains": "("}),
+        )
+        .await
+        .expect_err("invalid 'contains' regex must be an error");
+    Ok(())
+}
+
+/// Two methods with one name used to be a coin flip: the lookup returned
+/// whichever was parsed first, with nothing in the output to say so.
+#[tokio::test]
+async fn get_symbol_definition_disambiguates_namesakes() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "internal/payment/store.go",
+        r#"package payment
+
+type PaymentStore struct{}
+
+func (s *PaymentStore) Save() error {
+	return savePayment()
+}
+"#,
+    )?;
+    repo.add_file(
+        "internal/audit/store.go",
+        r#"package audit
+
+type AuditStore struct{}
+
+func (s *AuditStore) Save() error {
+	return saveAudit()
+}
+"#,
+    )?;
+    repo.add_file(
+        "internal/ledger/ledger_store.go",
+        r#"package ledger
+
+type LedgerStore struct{}
+
+func (s *LedgerStore) Save() error {
+	return saveLedger()
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // Ambiguous lookup: still answers, but says what else it could have meant.
+    let ambiguous = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save"}),
+        )
+        .await?;
+    assert!(
+        ambiguous.contains("Also defined"),
+        "namesake not reported:\n{ambiguous}"
+    );
+
+    // By receiver.
+    let by_receiver = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "AuditStore"}),
+        )
+        .await?;
+    assert!(
+        by_receiver.contains("saveAudit") && !by_receiver.contains("savePayment"),
+        "receiver ignored:\n{by_receiver}"
+    );
+    assert!(
+        !by_receiver.contains("Also defined"),
+        "a single match must not report namesakes:\n{by_receiver}"
+    );
+
+    // By file suffix.
+    let by_file = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "payment/store.go"}),
+        )
+        .await?;
+    assert!(
+        by_file.contains("savePayment"),
+        "file suffix ignored:\n{by_file}"
+    );
+
+    // A fragment of the path that is no whole-segment suffix.
+    let by_fragment = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "AUDIT"}),
+        )
+        .await?;
+    assert!(
+        by_fragment.contains("saveAudit") && !by_fragment.contains("Also defined"),
+        "path fragment ignored:\n{by_fragment}"
+    );
+
+    // A fragment shared by both paths leaves both in play.
+    let shared = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "store"}),
+        )
+        .await?;
+    assert!(
+        shared.contains("Also defined"),
+        "a fragment matching both files must keep both:\n{shared}"
+    );
+
+    // The qualified name is itself a lookup key.
+    let by_qualified = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "AuditStore::Save"}),
+        )
+        .await?;
+    assert!(
+        by_qualified.contains("saveAudit") && !by_qualified.contains("savePayment"),
+        "qualified name did not resolve:\n{by_qualified}"
+    );
+
+    // A whole-segment suffix outranks the fragment reading of the same text:
+    // `store.go` names the two `store.go` files, not `ledger_store.go`.
+    let by_segment = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "file": "store.go"}),
+        )
+        .await?;
+    assert!(
+        !by_segment.contains("saveLedger") && !by_segment.contains("ledger_store.go"),
+        "segment suffix fell through to a fragment match:\n{by_segment}"
+    );
+
+    // A filter that matches nothing lists what was available.
+    let err = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "CacheStore"}),
+        )
+        .await
+        .expect_err("no match for the given receiver must be an error");
+    assert!(
+        err.to_string().contains("AuditStore::Save"),
+        "candidates not listed: {err}"
+    );
+    Ok(())
+}
+
+/// The listing prints qualified names, so a qualified name pasted back into
+/// `pattern` must find its symbol.
+#[tokio::test]
+async fn find_symbols_matches_qualified_names() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "store.go",
+        r#"package store
+
+type PaymentStore struct{}
+
+func (s *PaymentStore) Save() error { return nil }
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "PaymentStore::Save"}),
+        )
+        .await?;
+    assert!(
+        out.contains("PaymentStore::Save"),
+        "qualified pattern found nothing:\n{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn symbol_and_function_are_interchangeable_across_families() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "svc.go",
+        "package svc\n\nfunc Helper() int { return 1 }\n\nfunc Caller() int { return Helper() }\n",
+    )?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let registry = ToolRegistry::new();
+
+    // Call-graph family declares 'function'; a caller reaching for 'symbol'
+    // used to spend the whole call on a schema mismatch.
+    let callers = registry
+        .dispatch(
+            "get_callers",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Helper"}),
+        )
+        .await?;
+    assert!(callers.contains("Caller"), "{callers}");
+
+    // Symbol family declares 'symbol'; 'function' now works there too.
+    let usages = registry
+        .dispatch(
+            "find_symbol_usages",
+            &engine,
+            json!({"repo": repo.name(), "function": "Helper"}),
+        )
+        .await?;
+    assert!(usages.contains("svc.go"), "{usages}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_symbol_usages_resolves_qualified_methods() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "store.go",
+        r#"package store
+
+type PaymentStore struct{}
+
+func (s *PaymentStore) Save() error { return nil }
+
+func Caller() { var s PaymentStore; s.Save() }
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbol_usages",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "PaymentStore::Save"}),
+        )
+        .await?;
+    assert!(
+        out.contains("PaymentStore::Save"),
+        "definition not listed:\n{out}"
+    );
+    assert!(
+        out.contains("store.go | 7 | usage"),
+        "call site line not listed:\n{out}"
+    );
+    assert!(!out.contains("No usages found"), "{out}");
+
+    let with_receiver = registry
+        .dispatch(
+            "find_symbol_usages",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "PaymentStore"}),
+        )
+        .await?;
+    assert!(
+        with_receiver.contains("store.go | 7 | usage"),
+        "{with_receiver}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn limit_and_max_results_are_interchangeable() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "a.rs",
+        "fn alpha() {}\nfn alpha_two() {}\nfn alpha_three() {}\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    // search_code declares 'max_results'; 'limit' must cap it just the same.
+    let capped = registry
+        .dispatch(
+            "search_code",
+            &engine,
+            json!({"repo": repo.name(), "query": "alpha", "limit": 1}),
+        )
+        .await?;
+    assert_eq!(capped.matches("a.rs").count(), 1, "{capped}");
+
+    // find_symbols declares 'limit'; 'max_results' is its long-standing alias.
+    let symbols = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "alpha", "max_results": 1}),
+        )
+        .await?;
+    assert!(symbols.contains("alpha"), "{symbols}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_complexity_reports_namesakes() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "small.rs",
+        "pub struct Small;\n\nimpl Small {\n    pub fn with_options(x: u32) -> u32 {\n        x\n    }\n}\n",
+    )?;
+    repo.add_file(
+        "big.rs",
+        r#"pub struct Big;
+
+impl Big {
+    pub fn with_options(a: u32, b: u32) -> u32 {
+        let mut n = 0;
+        for i in 0..a {
+            if i % 2 == 0 {
+                if b > i {
+                    n += 1;
+                } else {
+                    n -= 1;
+                }
+            }
+        }
+        n
+    }
+}
+"#,
+    )?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let bare = engine.get_complexity(&repo.name(), "with_options").await?;
+    assert!(
+        bare.contains("Ambiguous name"),
+        "namesake not reported:\n{bare}"
+    );
+    assert!(
+        bare.contains("Resolved to"),
+        "chosen function not named:\n{bare}"
+    );
+
+    let qualified = engine
+        .get_complexity(&repo.name(), "Big::with_options")
+        .await?;
+    assert!(!qualified.contains("Ambiguous name"), "{qualified}");
+    assert!(
+        !qualified.contains("| Cyclomatic Complexity | 1 |"),
+        "qualified name must reach the branching namesake:\n{qualified}"
+    );
+
+    Ok(())
+}
+
+fn git(repo: &TestRepo, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(repo.path())
+        .status()?;
+    anyhow::ensure!(status.success(), "git {args:?} failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_hotspots_follows_renames_and_reports_complexity() -> Result<()> {
+    let repo = TestRepo::new()?;
+    git(&repo, &["init", "-q"])?;
+    repo.add_file(
+        "old.rs",
+        "pub fn tangled(a: u32) -> u32 {\n    if a > 1 {\n        if a > 2 {\n            return 2;\n        }\n        return 1;\n    }\n    0\n}\n",
+    )?;
+    repo.add_file("plain.rs", "pub fn plain() -> u32 {\n    1\n}\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "one"])?;
+    repo.add_file(
+        "old.rs",
+        &format!(
+            "{}// touched\n",
+            std::fs::read_to_string(repo.path().join("old.rs"))?
+        ),
+    )?;
+    git(&repo, &["commit", "-qam", "two"])?;
+    git(&repo, &["mv", "old.rs", "new.rs"])?;
+    git(&repo, &["commit", "-qm", "rename"])?;
+
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: true,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let out = engine.get_hotspots(&repo.name(), 30, None).await?;
+    let new_row = out
+        .lines()
+        .find(|l| l.contains("`new.rs`"))
+        .unwrap_or_default();
+    assert!(
+        new_row.starts_with("| `new.rs` | 3 |"),
+        "history before the rename is lost:\n{out}"
+    );
+    assert!(
+        new_row.contains("`tangled`"),
+        "most complex function missing:\n{out}"
+    );
+    assert!(
+        !out.contains("old.rs"),
+        "renamed-away path still listed:\n{out}"
+    );
+
+    let filtered = engine.get_hotspots(&repo.name(), 30, Some(3)).await?;
+    assert!(
+        filtered.contains("`new.rs`") && !filtered.contains("`plain.rs`"),
+        "{filtered}"
+    );
+
     Ok(())
 }

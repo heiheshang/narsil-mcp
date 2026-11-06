@@ -1,13 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 use crate::config::schema::ToolConfig;
 use crate::config::{ClientInfo, ConfigLoader, ToolFilter};
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 use crate::tool_metadata::TOOL_METADATA;
 
 // Re-export for internal use
@@ -77,7 +77,6 @@ pub struct McpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
     config: ToolConfig,
-    client_info: Arc<Mutex<Option<ClientInfo>>>,
 }
 
 impl McpServer {
@@ -101,7 +100,6 @@ impl McpServer {
             engine: Arc::new(engine),
             tool_registry: ToolRegistry::new(),
             config,
-            client_info: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -126,7 +124,6 @@ impl McpServer {
             engine,
             tool_registry: ToolRegistry::new(),
             config,
-            client_info: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -137,6 +134,10 @@ impl McpServer {
         let mut stdout = tokio::io::stdout();
         let mut reader = tokio::io::BufReader::new(stdin);
         let mut line = String::new();
+        // stdio is inherently single-session (one client per process), so a
+        // plain local binding is enough — no Mutex/Arc needed, unlike the HTTP
+        // transport where multiple sessions share one McpServer.
+        let mut client_info: Option<ClientInfo> = None;
 
         loop {
             line.clear();
@@ -176,7 +177,7 @@ impl McpServer {
 
             debug!("Received: {}", line.trim());
 
-            if let Some(response_str) = self.handle_message(&line).await {
+            if let Some(response_str) = self.handle_message(&line, &mut client_info).await {
                 debug!("Sending: {}", response_str);
                 stdout
                     .write_all(format!("{}\n", response_str).as_bytes())
@@ -190,11 +191,24 @@ impl McpServer {
 
     /// Handle a raw JSON-RPC message from any transport (stdio or HTTP).
     ///
+    /// `client_info` is caller-owned session state: `initialize` writes the
+    /// negotiated client identity into it, `tools/list` reads it back to
+    /// filter the tool set. Stdio's `run()` loop owns one binding for its
+    /// whole (single) session; the HTTP transport owns one per
+    /// `Mcp-Session-Id`, which is what lets concurrent sessions with
+    /// different clients get independently correct tool filtering — and lets
+    /// the HTTP layer persist/restore it across a process restart instead of
+    /// silently serving an unadapted tool set for a resurrected session id.
+    ///
     /// Returns `None` when no response should be sent: notifications (no `id`)
     /// and malformed messages without a usable `id` produce no response, per
     /// JSON-RPC 2.0 ("The Server MUST NOT reply to a Notification").
     /// Returns `Some(json_string)` with the serialized response otherwise.
-    pub async fn handle_message(&self, raw: &str) -> Option<String> {
+    pub async fn handle_message(
+        &self,
+        raw: &str,
+        client_info: &mut Option<ClientInfo>,
+    ) -> Option<String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return None;
@@ -204,10 +218,10 @@ impl McpServer {
             Ok(request) => {
                 if request.id.is_none() {
                     debug!("Handling notification: {}", request.method);
-                    let _ = self.handle_request(request).await;
+                    let _ = self.handle_request(request, client_info).await;
                     return None;
                 }
-                self.handle_request(request).await
+                self.handle_request(request, client_info).await
             }
             Err(e) => {
                 if let Ok(raw_value) = serde_json::from_str::<Value>(trimmed) {
@@ -232,16 +246,20 @@ impl McpServer {
         serde_json::to_string(&response).ok()
     }
 
-    async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(
+        &self,
+        request: JsonRpcRequest,
+        client_info: &mut Option<ClientInfo>,
+    ) -> JsonRpcResponse {
         let id = request.id.clone();
 
         match request.method.as_str() {
             // MCP Lifecycle
-            "initialize" => self.handle_initialize(id, request.params),
+            "initialize" => self.handle_initialize(id, request.params, client_info),
             "initialized" => JsonRpcResponse::success(id, json!({})),
 
             // Tool listing and execution
-            "tools/list" => self.handle_tools_list(id),
+            "tools/list" => self.handle_tools_list(id, client_info),
             "tools/call" => self.handle_tool_call(id, request.params).await,
 
             // Resource listing
@@ -258,7 +276,12 @@ impl McpServer {
         }
     }
 
-    fn handle_initialize(&self, id: Option<Value>, params: Value) -> JsonRpcResponse {
+    fn handle_initialize(
+        &self,
+        id: Option<Value>,
+        params: Value,
+        client_info: &mut Option<ClientInfo>,
+    ) -> JsonRpcResponse {
         // Extract and store client info for editor detection
         if let Some(client_info_value) = params.get("clientInfo") {
             if let (Some(name), version) = (
@@ -273,9 +296,7 @@ impl McpServer {
                     version,
                 };
                 info!("MCP client detected: {} {:?}", client.name, client.version);
-                if let Ok(mut guard) = self.client_info.lock() {
-                    *guard = Some(client);
-                }
+                *client_info = Some(client);
             }
         }
 
@@ -299,13 +320,17 @@ impl McpServer {
         )
     }
 
-    fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
-        // Get client info for editor-specific filtering
-        let client_info: Option<ClientInfo> =
-            self.client_info.lock().ok().and_then(|guard| guard.clone());
-
+    fn handle_tools_list(
+        &self,
+        id: Option<Value>,
+        client_info: &Option<ClientInfo>,
+    ) -> JsonRpcResponse {
         // Create tool filter with current config and engine options
-        let filter = ToolFilter::new(self.config.clone(), self.engine.options(), client_info);
+        let filter = ToolFilter::new(
+            self.config.clone(),
+            self.engine.options(),
+            client_info.clone(),
+        );
 
         // Get filtered list of enabled tools
         let enabled_tools = filter.get_enabled_tools();

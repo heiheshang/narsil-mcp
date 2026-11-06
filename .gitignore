@@ -82,3 +82,8 @@ sbom.json
 /PROMPT_debug.md
 /PROMPT_plan.md
 /IMPLEMENTATION_PLAN.md
+
+# AI Factory: локальный контекст агента
+.ai-factory/
+.ai-factory.json
+AGENTS.md

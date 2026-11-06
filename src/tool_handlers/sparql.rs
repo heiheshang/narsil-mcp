@@ -8,7 +8,7 @@ use serde_json::Value;
 #[cfg(feature = "graph")]
 use super::ArgExtractor;
 use super::ToolHandler;
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for sparql_query tool
 pub struct SparqlQueryHandler;
@@ -23,7 +23,9 @@ impl ToolHandler for SparqlQueryHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let query = args.get_str("query").unwrap_or("");
         let timeout_ms = args.get_u64("timeout_ms");
-        let limit = args.get_u64("limit").map(|v| v as usize);
+        let limit = args
+            .get_u64_any(&["limit", "max_results"])
+            .map(|v| v as usize);
         let offset = args.get_u64("offset").map(|v| v as usize);
         let format = args.get_str("format");
 
@@ -75,7 +77,9 @@ impl ToolHandler for RunSparqlTemplateHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let template_name = args.get_str("template").unwrap_or("");
         let timeout_ms = args.get_u64("timeout_ms");
-        let limit = args.get_u64("limit").map(|v| v as usize);
+        let limit = args
+            .get_u64_any(&["limit", "max_results"])
+            .map(|v| v as usize);
         let format = args.get_str("format");
 
         // Extract params from JSON object

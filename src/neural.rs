@@ -10,7 +10,8 @@
 use anyhow::{bail, Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
@@ -614,147 +615,454 @@ pub mod vector_index {
     use super::*;
     use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-    /// Vector index for efficient approximate nearest neighbor search
+    /// Initial key capacity, and the floor for each growth step.
+    const INITIAL_CAPACITY: usize = 1024;
+
+    /// Approximate-nearest-neighbour index over code embeddings (HNSW).
+    ///
+    /// This module existed but was never wired up: both `NeuralEngine`
+    /// constructors took the brute-force store, so every neural query scanned
+    /// the whole corpus while the HNSW dependency was compiled and shipped.
+    ///
+    /// Three things had to be fixed before it could be used:
+    ///
+    /// * capacity was reserved once at construction, so the index filled up
+    ///   and every subsequent `add` failed;
+    /// * there was no repository-scoped search, which `search_in` requires;
+    /// * `clear` emptied the id map but left every vector in the index, so the
+    ///   next search returned ids that no longer existed.
     pub struct VectorIndex {
         index: Index,
-        id_map: RwLock<Vec<String>>,
+        /// Keys are indices into this vector; entry `i` names the vector
+        /// stored under key `i`.
+        ids: RwLock<Vec<Arc<str>>>,
         dimension: usize,
     }
 
-    impl VectorIndex {
-        /// Create a new vector index
-        pub fn new(dimension: usize, capacity: usize) -> Result<Self> {
-            let options = IndexOptions {
-                dimensions: dimension,
-                metric: MetricKind::Cos,
-                quantization: ScalarKind::F32,
-                connectivity: 16,     // M parameter for HNSW
-                expansion_add: 128,   // ef_construction
-                expansion_search: 64, // ef_search
-                multi: false,
-            };
+    fn options(dimension: usize) -> IndexOptions {
+        IndexOptions {
+            dimensions: dimension,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            connectivity: 16,     // M parameter for HNSW
+            expansion_add: 128,   // ef_construction
+            expansion_search: 64, // ef_search
+            multi: false,
+        }
+    }
 
-            let index = Index::new(&options)?;
-            index.reserve(capacity)?;
+    impl VectorIndex {
+        pub fn new(dimension: usize, capacity: usize) -> Result<Self> {
+            let index = Index::new(&options(dimension))?;
+            index.reserve(capacity.max(INITIAL_CAPACITY))?;
 
             Ok(Self {
                 index,
-                id_map: RwLock::new(Vec::with_capacity(capacity)),
+                ids: RwLock::new(Vec::with_capacity(capacity)),
                 dimension,
             })
         }
 
-        /// Add an embedding with associated document ID
+        /// Add an embedding under `doc_id`.
+        ///
+        /// Capacity grows geometrically. usearch reserves up front and refuses
+        /// inserts past the reservation, so a fixed one turns a full index into
+        /// a stream of dropped documents rather than an error anyone notices.
         pub fn add(&self, doc_id: &str, embedding: &[f32]) -> Result<()> {
-            let mut id_map = self.id_map.write();
-            let idx = id_map.len() as u64;
-            id_map.push(doc_id.to_string());
-            self.index.add(idx, embedding)?;
+            if embedding.len() != self.dimension {
+                anyhow::bail!(
+                    "expected {} dimensions for {}, got {}",
+                    self.dimension,
+                    doc_id,
+                    embedding.len()
+                );
+            }
+
+            let mut ids = self.ids.write();
+            let key = ids.len() as u64;
+
+            if self.index.size() >= self.index.capacity() {
+                let grown = (self.index.capacity() * 2).max(INITIAL_CAPACITY);
+                self.index.reserve(grown)?;
+            }
+
+            self.index.add(key, embedding)?;
+            // Pushed only after the insert succeeds, so a failure cannot leave
+            // the id map claiming a vector the index does not hold.
+            ids.push(Arc::from(doc_id));
             Ok(())
         }
 
-        /// Search for similar embeddings
-        pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
-            match self.index.search(query, k) {
-                Ok(results) => {
-                    let id_map = self.id_map.read();
-                    results
-                        .keys
-                        .iter()
-                        .zip(results.distances.iter())
-                        .filter_map(|(&idx, &dist)| {
-                            id_map.get(idx as usize).map(|id| (id.clone(), 1.0 - dist))
-                            // Convert distance to similarity
-                        })
-                        .collect()
-                }
-                Err(_) => Vec::new(),
+        /// Make room for `additional` more vectors at once.
+        pub fn reserve(&self, additional: usize) -> Result<()> {
+            let _ids = self.ids.write();
+            let needed = self.index.size() + additional;
+            if needed > self.index.capacity() {
+                self.index.reserve(needed)?;
             }
+            Ok(())
         }
 
-        /// Save the index to disk
+        pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+            self.search_filtered(query, k, |_| true)
+        }
+
+        /// Rank only the vectors whose document id passes `allow`.
+        ///
+        /// The predicate runs inside the graph traversal rather than over its
+        /// results, so asking for `k` hits in one repository returns `k` hits
+        /// from that repository — not whatever survives a global top-`k`.
+        pub fn search_filtered<F>(&self, query: &[f32], k: usize, allow: F) -> Vec<(String, f32)>
+        where
+            F: Fn(&str) -> bool,
+        {
+            if k == 0 || query.len() != self.dimension {
+                return Vec::new();
+            }
+
+            // The guard is held across the call and borrowed by the predicate.
+            // usearch invokes it during traversal; taking the lock inside would
+            // re-enter it once per visited node.
+            let ids = self.ids.read();
+            if ids.is_empty() {
+                return Vec::new();
+            }
+
+            let matches = match self.index.filtered_search(query, k, |key| {
+                ids.get(key as usize).is_some_and(|id| allow(id))
+            }) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Vector index search failed: {}", e);
+                    return Vec::new();
+                }
+            };
+
+            matches
+                .keys
+                .iter()
+                .zip(matches.distances.iter())
+                .filter_map(|(&key, &dist)| {
+                    // usearch reports cosine *distance*; callers rank by
+                    // similarity.
+                    ids.get(key as usize).map(|id| (id.to_string(), 1.0 - dist))
+                })
+                .collect()
+        }
+
+        /// Save the index to disk.
         pub fn save(&self, path: &Path) -> Result<()> {
             let path_str = path.to_string_lossy();
             self.index.save(&path_str)?;
 
-            // Save id_map separately
-            let id_map = self.id_map.read();
+            let ids = self.ids.read();
+            let plain: Vec<&str> = ids.iter().map(|s| &**s).collect();
             let id_map_path = path.with_extension("ids.json");
-            let json = serde_json::to_string(&*id_map)?;
-            std::fs::write(id_map_path, json)?;
+            std::fs::write(id_map_path, serde_json::to_string(&plain)?)?;
 
             Ok(())
         }
 
-        /// Load the index from disk
+        /// Load the index from disk.
         pub fn load(path: &Path, dimension: usize) -> Result<Self> {
-            let options = IndexOptions {
-                dimensions: dimension,
-                metric: MetricKind::Cos,
-                quantization: ScalarKind::F32,
-                ..Default::default()
-            };
-            let index = Index::new(&options)?;
+            let index = Index::new(&options(dimension))?;
             let path_str = path.to_string_lossy();
             index.load(&path_str)?;
 
             let id_map_path = path.with_extension("ids.json");
             let json = std::fs::read_to_string(id_map_path)?;
-            let id_map: Vec<String> = serde_json::from_str(&json)?;
+            let ids: Vec<String> = serde_json::from_str(&json)?;
+            let ids: Vec<Arc<str>> = ids.into_iter().map(Arc::from).collect();
+
+            if ids.len() != index.size() {
+                anyhow::bail!(
+                    "vector index holds {} vectors but its id map names {}",
+                    index.size(),
+                    ids.len()
+                );
+            }
 
             Ok(Self {
                 index,
-                id_map: RwLock::new(id_map),
+                ids: RwLock::new(ids),
                 dimension,
             })
         }
 
-        /// Get the number of indexed documents
         pub fn len(&self) -> usize {
-            self.id_map.read().len()
+            self.ids.read().len()
         }
 
-        /// Check if the index is empty
         pub fn is_empty(&self) -> bool {
             self.len() == 0
         }
 
-        /// Clear the index
+        /// Drop every vector.
         pub fn clear(&self) {
-            self.id_map.write().clear();
-            // Note: usearch doesn't have a clear method, need to recreate
+            let mut ids = self.ids.write();
+            if let Err(e) = self.index.reset() {
+                tracing::warn!("Failed to reset vector index: {}", e);
+                return;
+            }
+            if let Err(e) = self.index.reserve(INITIAL_CAPACITY) {
+                tracing::warn!("Failed to re-reserve vector index: {}", e);
+            }
+            ids.clear();
         }
 
-        /// Get the dimension
         pub fn dimension(&self) -> usize {
             self.dimension
         }
     }
 }
 
-// ============================================================================
-// Simple Vector Store (fallback when neural feature is not enabled)
-// ============================================================================
+/// Where [`NeuralEngine`] keeps its vectors.
+///
+/// With the `neural` feature there is an HNSW index and search is sublinear;
+/// without it the brute-force store is the only option. The engine talks to
+/// this rather than to either one directly.
+enum VectorStore {
+    #[cfg(feature = "neural")]
+    Ann(vector_index::VectorIndex),
+    Brute(SimpleVectorStore),
+}
 
-/// Simple in-memory vector store using linear search
-/// Used when usearch is not available (neural feature not enabled)
+impl VectorStore {
+    fn new(dimension: usize) -> Self {
+        #[cfg(feature = "neural")]
+        {
+            match vector_index::VectorIndex::new(dimension, 4096) {
+                Ok(idx) => return VectorStore::Ann(idx),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create ANN vector index ({}); \
+                         falling back to brute-force search",
+                        e
+                    );
+                }
+            }
+        }
+        VectorStore::Brute(SimpleVectorStore::new(dimension))
+    }
+
+    fn add(&self, doc_id: &str, embedding: &[f32]) {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(idx) => {
+                if let Err(e) = idx.add(doc_id, embedding) {
+                    tracing::warn!("Failed to index vector for {}: {}", doc_id, e);
+                }
+            }
+            VectorStore::Brute(s) => s.add(doc_id, embedding),
+        }
+    }
+
+    fn add_many<'a>(&self, items: impl IntoIterator<Item = (&'a str, &'a [f32])>) {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(_) => items
+                .into_iter()
+                .for_each(|(doc_id, embedding)| self.add(doc_id, embedding)),
+            VectorStore::Brute(s) => s.add_many(items),
+        }
+    }
+
+    fn reserve(&self, additional: usize) {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(idx) => {
+                if let Err(e) = idx.reserve(additional) {
+                    tracing::warn!("Failed to reserve {} vectors: {}", additional, e);
+                }
+            }
+            VectorStore::Brute(s) => s.reserve(additional),
+        }
+    }
+
+    fn search_filtered<F>(&self, query: &[f32], k: usize, allow: F) -> Vec<(String, f32)>
+    where
+        F: Fn(&str) -> bool,
+    {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(idx) => idx.search_filtered(query, k, allow),
+            VectorStore::Brute(s) => s.search_filtered(query, k, allow),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(idx) => idx.len(),
+            VectorStore::Brute(s) => s.len(),
+        }
+    }
+
+    fn clear(&self) {
+        match self {
+            #[cfg(feature = "neural")]
+            VectorStore::Ann(idx) => idx.clear(),
+            VectorStore::Brute(s) => s.clear(),
+        }
+    }
+}
+
+/// Brute-force in-memory vector store.
+///
+/// The fallback when the `neural` feature (and with it usearch's HNSW index) is
+/// not compiled in. It is a linear scan by design, but three things that made
+/// the scan far more expensive than it needed to be are gone:
+///
+/// * **vectors are L2-normalised on insert**, so similarity is a plain dot
+///   product. The old code recomputed the *query's* own norm once per stored
+///   document — N times for a value that never changed — plus the document's
+///   norm on every query instead of once on insert. Three passes over each
+///   vector became one;
+/// * **the top-k is a heap**, not a full sort of every document. Ranking a
+///   corpus to return ten results was `O(N log N)` where `O(N log k)` will do;
+/// * **vectors are contiguous**. `Vec<(String, Vec<f32>)>` put every vector in
+///   its own allocation and cloned a `String` per document per query; one flat
+///   buffer scans linearly and lets the autovectoriser work.
 pub struct SimpleVectorStore {
-    embeddings: RwLock<Vec<(String, Vec<f32>)>>,
+    inner: RwLock<Vectors>,
     dimension: usize,
+}
+
+/// Ids and vector data kept under one lock so they cannot fall out of step.
+///
+/// Identical vectors are stored once: symbols with the same text get the
+/// same embedding, and on 1c-src 473 thousand ids share 137 thousand
+/// vectors, 1.3 GB saved.
+#[derive(Default)]
+struct Vectors {
+    /// Interned ids, one per stored vector.
+    ids: Vec<Arc<str>>,
+    /// For each id, the index of its vector in `data`.
+    slots: Vec<u32>,
+    /// Distinct vectors, `dimension` floats each, L2-normalised, in blocks
+    /// of `VECTORS_PER_BLOCK`. One growing buffer was copied whole at each
+    /// doubling, the old and new copies both resident: 0.3 GB more at the
+    /// peak of 1c-src's startup.
+    blocks: Vec<Vec<f32>>,
+    /// Distinct vectors stored.
+    count: usize,
+    /// A vector's hash to the slot holding it. Only a hint: the slot is
+    /// compared before it is shared.
+    by_hash: ahash::AHashMap<u64, u32>,
+}
+
+const VECTORS_PER_BLOCK: usize = 1024;
+
+impl Vectors {
+    fn vector(&self, slot: u32, dimension: usize) -> &[f32] {
+        let slot = slot as usize;
+        let start = (slot % VECTORS_PER_BLOCK) * dimension;
+        &self.blocks[slot / VECTORS_PER_BLOCK][start..start + dimension]
+    }
+
+    /// The slot already holding `vector`, whose [`vector_hash`] is `hash`.
+    fn find(&self, vector: &[f32], hash: u64) -> Option<u32> {
+        let &slot = self.by_hash.get(&hash)?;
+        bits_equal(self.vector(slot, vector.len()), vector).then_some(slot)
+    }
+
+    /// The slot holding `vector`, whose [`vector_hash`] is `hash`, stored
+    /// first if no slot holds it yet.
+    fn intern(&mut self, vector: &[f32], hash: u64) -> u32 {
+        let dimension = vector.len();
+        if let Some(slot) = self.find(vector, hash) {
+            return slot;
+        }
+        if self.count.is_multiple_of(VECTORS_PER_BLOCK) {
+            self.blocks
+                .push(Vec::with_capacity(VECTORS_PER_BLOCK * dimension));
+        }
+        let slot = self.count as u32;
+        self.blocks
+            .last_mut()
+            .expect("a block was just made room in")
+            .extend_from_slice(vector);
+        self.count += 1;
+        self.by_hash.entry(hash).or_insert(slot);
+        slot
+    }
+}
+
+fn vector_hash(vector: &[f32]) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    vector.iter().for_each(|x| hasher.write_u32(x.to_bits()));
+    hasher.finish()
+}
+
+fn bits_equal(a: &[f32], b: &[f32]) -> bool {
+    a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 impl SimpleVectorStore {
     pub fn new(dimension: usize) -> Self {
         Self {
-            embeddings: RwLock::new(Vec::new()),
+            inner: RwLock::new(Vectors::default()),
             dimension,
         }
     }
 
+    /// Store `embedding` under `doc_id`.
+    ///
+    /// A vector of the wrong length is dropped rather than stored: appending it
+    /// to the flat buffer would shift every subsequent vector's offset and
+    /// silently corrupt every later search.
     pub fn add(&self, doc_id: &str, embedding: &[f32]) {
-        self.embeddings
-            .write()
-            .push((doc_id.to_string(), embedding.to_vec()));
+        self.add_many([(doc_id, embedding)]);
+    }
+
+    /// [`add`](Self::add) for several vectors under one lock. Everything
+    /// that does not touch the store is done before taking it: with the
+    /// hashing inside, indexing threads queued on it and 1c-src's vectors
+    /// took 2.8 s instead of 1.
+    pub fn add_many<'a>(&self, items: impl IntoIterator<Item = (&'a str, &'a [f32])>) {
+        let prepared: Vec<(Arc<str>, Vec<f32>, u64)> = items
+            .into_iter()
+            .filter(|(doc_id, embedding)| {
+                let fits = embedding.len() == self.dimension;
+                if !fits {
+                    tracing::warn!(
+                        "Refusing vector for {}: expected {} dimensions, got {}",
+                        doc_id,
+                        self.dimension,
+                        embedding.len()
+                    );
+                }
+                fits
+            })
+            .map(|(doc_id, embedding)| {
+                let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                // A zero vector has no direction; it scores 0 against
+                // everything, which is the honest answer.
+                let normalized: Vec<f32> = if norm > 0.0 {
+                    embedding.iter().map(|x| x / norm).collect()
+                } else {
+                    embedding.to_vec()
+                };
+                let hash = vector_hash(&normalized);
+                (Arc::from(doc_id), normalized, hash)
+            })
+            .collect();
+        let mut inner = self.inner.write();
+        for (doc_id, vector, hash) in prepared {
+            let slot = inner.intern(&vector, hash);
+            inner.ids.push(doc_id);
+            inner.slots.push(slot);
+        }
+    }
+
+    /// Make room for `additional` more ids at once. Growing by doubling
+    /// copied the arrays whole each time, under the lock every insert takes.
+    /// Vectors are not reserved: most of them turn out to be duplicates.
+    pub fn reserve(&self, additional: usize) {
+        let mut inner = self.inner.write();
+        inner.ids.reserve(additional);
+        inner.slots.reserve(additional);
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
@@ -766,20 +1074,56 @@ impl SimpleVectorStore {
     where
         F: Fn(&str) -> bool,
     {
-        let embeddings = self.embeddings.read();
-        let mut results: Vec<(String, f32)> = embeddings
-            .iter()
-            .filter(|(id, _)| allow(id))
-            .map(|(id, emb)| (id.clone(), cosine_similarity(query, emb)))
-            .collect();
+        if k == 0 || query.len() != self.dimension {
+            return Vec::new();
+        }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(k);
-        results
+        let inner = self.inner.read();
+        if inner.ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Normalise the query once. Stored vectors are already unit length, so
+        // from here similarity is a dot product.
+        let norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return Vec::new();
+        }
+        let q: Vec<f32> = query.iter().map(|x| x / norm).collect();
+
+        // `Reverse` makes this a min-heap, so the weakest of the k best sits on
+        // top and is the one displaced.
+        let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k + 1);
+        // Each distinct vector is scored once, for the first id that uses it.
+        let mut scores: Vec<Option<f32>> = vec![None; inner.count];
+
+        for (i, (id, &slot)) in inner.ids.iter().zip(&inner.slots).enumerate() {
+            if !allow(id) {
+                continue;
+            }
+            let score = *scores[slot as usize].get_or_insert_with(|| {
+                let vec = inner.vector(slot, self.dimension);
+                q.iter().zip(vec).map(|(a, b)| a * b).sum()
+            });
+
+            if heap.len() < k {
+                heap.push(Reverse(ScoredDoc { score, idx: i }));
+            } else if heap.peek().is_some_and(|Reverse(w)| score > w.score) {
+                heap.pop();
+                heap.push(Reverse(ScoredDoc { score, idx: i }));
+            }
+        }
+
+        let mut out: Vec<(String, f32)> = heap
+            .into_iter()
+            .map(|Reverse(s)| (inner.ids[s.idx].to_string(), s.score))
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     pub fn len(&self) -> usize {
-        self.embeddings.read().len()
+        self.inner.read().ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -787,11 +1131,37 @@ impl SimpleVectorStore {
     }
 
     pub fn clear(&self) {
-        self.embeddings.write().clear();
+        *self.inner.write() = Vectors::default();
     }
 
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+}
+
+/// Heap entry ordered by score. `f32` is not `Ord`, and NaN must not be allowed
+/// to make the ordering inconsistent, so it is pinned to `Less`.
+struct ScoredDoc {
+    score: f32,
+    idx: usize,
+}
+
+impl PartialEq for ScoredDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score
+    }
+}
+impl Eq for ScoredDoc {}
+impl PartialOrd for ScoredDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScoredDoc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Less)
     }
 }
 
@@ -854,7 +1224,7 @@ pub struct NeuralStats {
 /// Main neural embedding engine
 pub struct NeuralEngine {
     backend: Arc<dyn EmbeddingBackend>,
-    store: SimpleVectorStore,
+    store: VectorStore,
     documents: RwLock<HashMap<String, NeuralDocument>>,
     config: NeuralConfig,
 }
@@ -982,7 +1352,7 @@ impl NeuralEngine {
         }
 
         let backend = with_embedding_cache(backend, &config);
-        let store = SimpleVectorStore::new(config.dimension);
+        let store = VectorStore::new(config.dimension);
 
         Ok(Self {
             backend,
@@ -1010,7 +1380,7 @@ impl NeuralEngine {
         )?);
         let backend = with_embedding_cache(backend, &config);
 
-        let store = SimpleVectorStore::new(config.dimension);
+        let store = VectorStore::new(config.dimension);
 
         Ok(Self {
             backend,
@@ -1063,23 +1433,33 @@ impl NeuralEngine {
     /// Batches are dispatched in parallel: `embed_batch` is a blocking HTTP
     /// call, and sequential dispatch left the embedding server idle between
     /// requests (~3× slower on a full corpus).
-    pub fn index_batch(&self, items: &[(NeuralDocument,)]) -> Result<()> {
+    pub fn index_batch(&self, items: Vec<NeuralDocument>) -> Result<()> {
         const BATCH_SIZE: usize = 96; // Voyage API limit is 128, use 96 for safety
 
         use rayon::prelude::*;
-        items.par_chunks(BATCH_SIZE).try_for_each(|chunk| {
-            let contents: Vec<String> = chunk.iter().map(|(doc,)| doc.content.clone()).collect();
-            let embeddings = self.backend.embed_batch(&contents)?;
+        self.store.reserve(items.len());
+        items
+            .into_par_iter()
+            .chunks(BATCH_SIZE)
+            .try_for_each(|chunk| {
+                let contents: Vec<String> = chunk.iter().map(|doc| doc.content.clone()).collect();
+                let embeddings = self.backend.embed_batch(&contents)?;
 
-            for ((doc,), embedding) in chunk.iter().zip(embeddings.iter()) {
-                // Repository-scoped key: ids are repo-relative and collide
+                // Repository-scoped keys: ids are repo-relative and collide
                 // across repositories (every repo has a `src/lib.rs::main`).
-                let key = crate::search::scoped_doc_id(&doc.repo, &doc.id);
-                self.store.add(&key, embedding);
-                self.documents.write().insert(key, doc.clone());
-            }
-            Ok(())
-        })
+                let keyed: Vec<(String, NeuralDocument)> = chunk
+                    .into_iter()
+                    .map(|doc| (crate::search::scoped_doc_id(&doc.repo, &doc.id), doc))
+                    .collect();
+                self.store.add_many(
+                    keyed
+                        .iter()
+                        .zip(embeddings.iter())
+                        .map(|((key, _), embedding)| (key.as_str(), embedding.as_slice())),
+                );
+                self.documents.write().extend(keyed);
+                Ok(())
+            })
     }
 
     /// Search for similar code across every indexed repository
@@ -1102,7 +1482,9 @@ impl NeuralEngine {
 
         let documents = self.documents.read();
         let results = match repo {
-            None => self.store.search(&query_embedding, k),
+            None => self
+                .store
+                .search_filtered(&query_embedding, k, |id| documents.contains_key(id)),
             Some(repo) => self.store.search_filtered(&query_embedding, k, |id| {
                 documents.get(id).is_some_and(|doc| &*doc.repo == repo)
             }),
@@ -1183,6 +1565,26 @@ impl NeuralEngine {
     pub fn clear(&self) {
         self.store.clear();
         self.documents.write().clear();
+    }
+
+    /// Forget the documents of one repository. Their vectors stay in the
+    /// store, but results are mapped through `documents`, so they are never
+    /// returned.
+    pub fn remove_repo(&self, repo: &str) -> usize {
+        let mut documents = self.documents.write();
+        let before = documents.len();
+        documents.retain(|_, doc| &*doc.repo != repo);
+        before - documents.len()
+    }
+
+    /// Forget the documents of `repo` whose file lies under `dir` (relative).
+    pub fn remove_under(&self, repo: &str, dir: &std::path::Path) -> usize {
+        let mut documents = self.documents.write();
+        let before = documents.len();
+        documents.retain(|_, doc| {
+            &*doc.repo != repo || !std::path::Path::new(&doc.file_path).starts_with(dir)
+        });
+        before - documents.len()
     }
 
     /// Check if neural search is available
@@ -2263,5 +2665,148 @@ mod tests {
         // Default model is voyage-code-2 (hardcoded in NeuralConfig::default)
         let expected_dim = default_dimension_for_model(config.model_name.as_deref());
         assert_eq!(config.dimension, expected_dim);
+    }
+
+    #[test]
+    fn vectors_past_the_first_block_are_found() {
+        let store = SimpleVectorStore::new(2);
+        let n = VECTORS_PER_BLOCK + 10;
+        for i in 0..n {
+            let angle = i as f32 * 0.001;
+            store.add(&format!("v{i}"), &[angle.cos(), angle.sin()]);
+        }
+        assert_eq!(store.inner.read().count, n);
+        let last = (n - 1) as f32 * 0.001;
+        assert_eq!(
+            store.search(&[last.cos(), last.sin()], 1)[0].0,
+            format!("v{}", n - 1)
+        );
+    }
+
+    #[test]
+    fn identical_vectors_are_stored_once() {
+        let store = SimpleVectorStore::new(3);
+        store.add("a", &[1.0, 2.0, 2.0]);
+        store.add("b", &[0.0, 1.0, 0.0]);
+        // Same direction, so the same vector once normalised.
+        store.add("c", &[2.0, 4.0, 4.0]);
+
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.inner.read().count, 2);
+        let found = store.search(&[1.0, 2.0, 2.0], 3);
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(&ids[..2], ["a", "c"]);
+        assert_eq!(found[0].1, found[1].1);
+        assert_eq!(ids[2], "b");
+
+        store.clear();
+        assert!(store.is_empty());
+        store.add("d", &[0.0, 0.0, 1.0]);
+        assert_eq!(store.search(&[0.0, 0.0, 1.0], 1)[0].0, "d");
+    }
+}
+
+#[cfg(all(test, feature = "neural"))]
+mod ann_tests {
+    use super::*;
+    use vector_index::VectorIndex;
+
+    fn unit(v: [f32; 3]) -> Vec<f32> {
+        v.to_vec()
+    }
+
+    #[test]
+    fn finds_the_nearest_vector() {
+        let idx = VectorIndex::new(3, 8).unwrap();
+        idx.add("a", &unit([1.0, 0.0, 0.0])).unwrap();
+        idx.add("b", &unit([0.0, 1.0, 0.0])).unwrap();
+
+        let hits = idx.search(&unit([0.95, 0.05, 0.0]), 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "a");
+    }
+
+    #[test]
+    fn grows_past_its_initial_reservation() {
+        // usearch refuses inserts past the reservation. A fixed one silently
+        // dropped every document after the first few thousand.
+        let idx = VectorIndex::new(3, 2).unwrap();
+        for i in 0..500 {
+            let t = i as f32 / 500.0;
+            idx.add(&format!("doc{i}"), &unit([t, 1.0 - t, 0.0]))
+                .expect("index must grow rather than refuse");
+        }
+        assert_eq!(idx.len(), 500);
+    }
+
+    #[test]
+    fn filter_applies_before_top_k() {
+        // Asking for one hit in `wanted` must return the `wanted` document,
+        // not lose it to closer documents from elsewhere.
+        let idx = VectorIndex::new(3, 8).unwrap();
+        for i in 0..50 {
+            idx.add(&format!("noise::{i}"), &unit([1.0, 0.0, 0.0]))
+                .unwrap();
+        }
+        idx.add("wanted::x", &unit([0.9, 0.1, 0.0])).unwrap();
+
+        let hits = idx.search_filtered(&unit([1.0, 0.0, 0.0]), 1, |id| id.starts_with("wanted"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "wanted::x");
+    }
+
+    #[test]
+    fn similarity_is_reported_not_distance() {
+        let idx = VectorIndex::new(3, 8).unwrap();
+        idx.add("a", &unit([1.0, 0.0, 0.0])).unwrap();
+
+        let hits = idx.search(&unit([1.0, 0.0, 0.0]), 1);
+        assert!(
+            hits[0].1 > 0.99,
+            "an identical vector must score ~1.0, got {}",
+            hits[0].1
+        );
+    }
+
+    #[test]
+    fn clear_removes_the_vectors_not_just_their_names() {
+        // The old `clear` emptied the id map and left the vectors behind, so
+        // the next search returned keys that no longer mapped to anything.
+        let idx = VectorIndex::new(3, 8).unwrap();
+        idx.add("a", &unit([1.0, 0.0, 0.0])).unwrap();
+        idx.clear();
+
+        assert_eq!(idx.len(), 0);
+        assert!(idx.search(&unit([1.0, 0.0, 0.0]), 5).is_empty());
+
+        // And it must still be usable afterwards.
+        idx.add("b", &unit([0.0, 1.0, 0.0])).unwrap();
+        assert_eq!(idx.search(&unit([0.0, 1.0, 0.0]), 1)[0].0, "b");
+    }
+
+    #[test]
+    fn wrong_dimension_is_rejected() {
+        let idx = VectorIndex::new(3, 8).unwrap();
+        assert!(idx.add("bad", &[1.0, 0.0]).is_err());
+        assert_eq!(
+            idx.len(),
+            0,
+            "a rejected vector must not leave an id behind"
+        );
+    }
+
+    #[test]
+    fn round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.usearch");
+
+        let idx = VectorIndex::new(3, 8).unwrap();
+        idx.add("a", &unit([1.0, 0.0, 0.0])).unwrap();
+        idx.add("b", &unit([0.0, 1.0, 0.0])).unwrap();
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::load(&path, 3).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.search(&unit([1.0, 0.0, 0.0]), 1)[0].0, "a");
     }
 }

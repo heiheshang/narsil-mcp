@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::index::CodeIntelEngine;
+use crate::engine::CodeIntelEngine;
 
 /// Handler for get_call_graph tool
 pub struct GetCallGraphHandler;
@@ -17,7 +17,7 @@ impl ToolHandler for GetCallGraphHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         let depth = args.get_u64_or("depth", 3) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -37,7 +37,7 @@ impl ToolHandler for GetCallersHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
@@ -58,7 +58,7 @@ impl ToolHandler for GetCalleesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
@@ -96,7 +96,7 @@ impl ToolHandler for GetComplexityHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = args.get_str_any(&["function", "symbol"]).unwrap_or("");
         engine.get_complexity(repo, function).await
     }
 }
