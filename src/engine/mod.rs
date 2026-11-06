@@ -3,7 +3,11 @@
 //! This is the core engine that powers all MCP tool operations.
 
 mod indexing;
+mod repo_registry;
 mod search;
+
+use repo_registry::RepoRegistry;
+pub use repo_registry::{RepoEntry, RepoKind, RepoState};
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -430,8 +434,8 @@ impl QueryCoverage {
 pub struct CodeIntelEngine {
     /// Base path for index storage (stored for potential future use)
     _index_path: PathBuf,
-    /// Registered repository paths
-    repo_paths: Vec<PathBuf>,
+    /// Repository roots and the keys their data is stored under
+    registry: RepoRegistry,
     /// Cached repo metadata
     repos: DashMap<String, RepoMetadata>,
     /// Symbol index: repo -> symbols
@@ -936,7 +940,13 @@ impl CodeIntelEngine {
 
         let engine = Self {
             _index_path: expanded_index,
-            repo_paths: expanded_repos.clone(),
+            registry: {
+                let registry = RepoRegistry::new();
+                for path in &expanded_repos {
+                    registry.register_primary(path);
+                }
+                registry
+            },
             repos: DashMap::new(),
             symbols: DashMap::new(),
             file_cache: DashMap::default(),
@@ -977,11 +987,7 @@ impl CodeIntelEngine {
                     if let Ok(persisted) = loaded {
                         if !persisted.files.is_empty() {
                             let _span = debug_span!("restore_symbols").entered();
-                            let repo_name = repo_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
+                            let repo_name = engine.repo_key(repo_path);
 
                             // Load symbols from persisted index
                             let symbols: Vec<Symbol> = persisted
@@ -1052,11 +1058,7 @@ impl CodeIntelEngine {
         if options.call_graph_enabled {
             for repo_path in &expanded_repos {
                 if repo_path.exists() {
-                    let repo_name = repo_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let repo_name = engine.repo_key(repo_path);
                     let call_graph = CallGraph::new();
                     info!("Call graph initialized for repository: {}", repo_name);
                     engine.call_graphs.insert(repo_name, call_graph);
@@ -1094,12 +1096,10 @@ impl CodeIntelEngine {
 
         // Index repos that weren't loaded from persistence
         let mut indexed_any = false;
-        for repo_path in &self.repo_paths {
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+        let primaries = self.registry.primaries();
+        for entry in &primaries {
+            let repo_path = &entry.path;
+            let repo_name = entry.key.clone();
 
             let was_cached = self.repos.contains_key(&repo_name);
 
@@ -1140,8 +1140,13 @@ impl CodeIntelEngine {
             };
 
             match outcome {
-                Err(e) => warn!("Failed to index {:?}: {}", repo_path, e),
+                Err(e) => {
+                    warn!("Failed to index {:?}: {}", repo_path, e);
+                    self.registry
+                        .set_state(&repo_name, RepoState::Failed(e.to_string()));
+                }
                 Ok(outcome) => {
+                    self.registry.set_state(&repo_name, RepoState::Ready);
                     // Rewrite the persisted index only when this walk changed
                     // it. Saving re-hashes every file, so a pass that merely
                     // confirmed the cache must not pay for it on each startup.
@@ -1183,77 +1188,17 @@ impl CodeIntelEngine {
 
         // Initialize git repos if enabled
         if self.options.git_enabled {
-            for repo_path in &self.repo_paths {
-                if repo_path.exists() {
-                    let repo_name = repo_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    match GitRepo::new(repo_path) {
-                        Ok(git_repo) => {
-                            info!("Git enabled for repository: {}", repo_name);
-                            self.git_repos.insert(repo_name, git_repo);
-                        }
-                        Err(e) => {
-                            warn!("Failed to initialize git for {}: {}", repo_name, e);
-                        }
-                    }
+            for entry in &primaries {
+                if entry.path.exists() {
+                    self.attach_git(&entry.key, &entry.path);
                 }
             }
         }
 
         // Load persisted call-graphs if enabled
         if self.options.call_graph_enabled {
-            if let Some(store) = &self.index_store {
-                for repo_path in &self.repo_paths {
-                    let repo_name = repo_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    // A graph that was just built from source is
-                    // authoritative and the snapshot is not: `--call-graph`
-                    // forces a full re-walk (symbol reuse is disabled because
-                    // the call graph needs the parse trees), so loading on top
-                    // could only resurrect functions the code no longer
-                    // defines. The snapshot is still worth having when nothing
-                    // was built this run — an unreadable or unwalked repository.
-                    if self
-                        .call_graphs
-                        .get(&repo_name)
-                        .is_some_and(|cg| cg.node_count() > 0)
-                    {
-                        debug!(
-                            "Call-graph for {} was rebuilt from source; \
-                             ignoring the persisted snapshot",
-                            repo_name
-                        );
-                        continue;
-                    }
-                    match store.load_call_graph(repo_path) {
-                        Ok(Some(snapshot)) => {
-                            if let Some(cg) = self.call_graphs.get(&repo_name) {
-                                if let Err(e) = cg.from_snapshot(&snapshot, None) {
-                                    warn!(
-                                        "Failed to load persisted call-graph for {}: {}",
-                                        repo_name, e
-                                    );
-                                } else {
-                                    info!("Loaded persisted call-graph for {}", repo_name);
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            debug!("No persisted call-graph found for {}", repo_name);
-                        }
-                        Err(e) => {
-                            warn!("Failed to load call-graph for {}: {}", repo_name, e);
-                        }
-                    }
-                }
+            for entry in &primaries {
+                self.load_startup_call_graph(&entry.key, &entry.path);
             }
         }
 
@@ -1274,6 +1219,85 @@ impl CodeIntelEngine {
         self.log_memory_breakdown();
 
         Ok(())
+    }
+
+    /// A graph that was just built from source is authoritative and the
+    /// snapshot is not: `--call-graph` forces a full re-walk (symbol reuse is
+    /// disabled because the call graph needs the parse trees), so loading on
+    /// top could only resurrect functions the code no longer defines. The
+    /// snapshot is still worth having when nothing was built this run — an
+    /// unreadable or unwalked repository.
+    fn load_startup_call_graph(&self, repo_name: &str, repo_path: &Path) {
+        let Some(store) = &self.index_store else {
+            return;
+        };
+        if self
+            .call_graphs
+            .get(repo_name)
+            .is_some_and(|cg| cg.node_count() > 0)
+        {
+            debug!(
+                "Call-graph for {} was rebuilt from source; \
+                 ignoring the persisted snapshot",
+                repo_name
+            );
+            return;
+        }
+        match store.load_call_graph(repo_path) {
+            Ok(Some(snapshot)) => {
+                if let Some(cg) = self.call_graphs.get(repo_name) {
+                    if let Err(e) = cg.from_snapshot(&snapshot, None) {
+                        warn!(
+                            "Failed to load persisted call-graph for {}: {}",
+                            repo_name, e
+                        );
+                    } else {
+                        info!("Loaded persisted call-graph for {}", repo_name);
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!("No persisted call-graph found for {}", repo_name);
+            }
+            Err(e) => {
+                warn!("Failed to load call-graph for {}: {}", repo_name, e);
+            }
+        }
+    }
+
+    fn attach_git(&self, repo_name: &str, repo_path: &Path) {
+        match GitRepo::new(repo_path) {
+            Ok(git_repo) => {
+                info!("Git enabled for repository: {}", repo_name);
+                self.git_repos.insert(repo_name.to_string(), git_repo);
+            }
+            Err(e) => {
+                warn!("Failed to initialize git for {}: {}", repo_name, e);
+            }
+        }
+    }
+
+    /// The key a repository root is stored under.
+    pub(super) fn repo_key(&self, repo_path: &Path) -> String {
+        self.registry.key_for_root(repo_path).unwrap_or_else(|| {
+            repo_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        })
+    }
+
+    /// Roots whose documents are in the shared indexes: every primary, and
+    /// the worktrees that were indexed.
+    pub(super) fn indexed_roots(&self) -> Vec<RepoEntry> {
+        self.registry
+            .snapshot()
+            .into_iter()
+            .filter(|e| {
+                !e.is_worktree() || matches!(e.state, RepoState::Indexing | RepoState::Ready)
+            })
+            .collect()
     }
 
     /// Check if background initialization has completed
@@ -1313,7 +1337,8 @@ impl CodeIntelEngine {
     }
 
     async fn index_repos(&self) -> Result<()> {
-        for repo_path in &self.repo_paths {
+        for entry in self.indexed_roots() {
+            let repo_path = &entry.path;
             if repo_path.exists() {
                 info!("Indexing repository: {:?}", repo_path);
                 if let Err(e) = self.index_repo(repo_path).await {
@@ -2857,7 +2882,7 @@ impl CodeIntelEngine {
     /// TF-IDF statistics are shared by all repositories, so a snapshot of the
     /// engine stands for one repository only when there is only one.
     pub(super) fn tfidf_snapshots_apply(&self) -> bool {
-        self.options.persist_enabled && self.repo_paths.len() == 1
+        self.options.persist_enabled && self.registry.indexed_count() == 1
     }
 
     /// The repository's 1C normalized documents with `stamp`, unless it has
@@ -2916,12 +2941,11 @@ impl CodeIntelEngine {
         };
 
         let mut saved_count = 0;
-        for repo_path in &self.repo_paths {
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+        for entry in self.indexed_roots() {
+            let repo_path = &entry.path;
+            let repo_name = entry.key.clone();
+            // A worktree inside this tree is saved on its own.
+            let nested = self.registry.nested_roots(repo_path);
 
             // Unique per save, so a warm start can tell these snapshots and
             // this SQLite index apart from those of an earlier save.
@@ -2974,7 +2998,9 @@ impl CodeIntelEngine {
                 // Files without symbols are recorded too: a warm start keeps the
                 // search documents of every file that did not change.
                 for entry in self.file_cache.iter() {
-                    if entry.key().starts_with(repo_path) {
+                    if entry.key().starts_with(repo_path)
+                        && !nested.iter().any(|n| entry.key().starts_with(n))
+                    {
                         by_file.entry(entry.key().clone()).or_default();
                     }
                 }
@@ -3062,7 +3088,8 @@ impl CodeIntelEngine {
 
         match crate::persist::FileWatcher::new() {
             Ok(mut watcher) => {
-                for repo_path in &self.repo_paths {
+                for entry in self.indexed_roots() {
+                    let repo_path = &entry.path;
                     if repo_path.exists() {
                         if let Err(e) = watcher.watch(repo_path) {
                             warn!("Failed to watch {:?}: {}", repo_path, e);
@@ -3094,7 +3121,8 @@ impl CodeIntelEngine {
 
         match crate::persist::AsyncFileWatcher::new() {
             Ok((mut watcher, rx)) => {
-                for repo_path in &self.repo_paths {
+                for entry in self.indexed_roots() {
+                    let repo_path = &entry.path;
                     if repo_path.exists() {
                         if let Err(e) = watcher.watch(repo_path) {
                             warn!("Failed to watch {:?}: {}", repo_path, e);
@@ -3131,26 +3159,21 @@ impl CodeIntelEngine {
             // paths even when the user supplied a symlinked path (for example
             // `/private/var/...` vs `/var/...` on macOS), so compare both raw
             // and canonical forms.
-            let repo_path = self
-                .repo_paths
-                .iter()
-                .find(|p| path_is_within_repo(&change.path, p));
-
-            let repo_path = match repo_path {
-                Some(p) => p,
-                None => continue,
+            let Some(owner) = self.registry.owner_of(&change.path) else {
+                continue;
             };
+            if owner.is_worktree() && owner.state != RepoState::Ready {
+                debug!(repo = %owner.key, path = ?change.path, "change in unindexed worktree ignored");
+                continue;
+            }
+            let repo_path = &owner.path;
 
             if index_filter.is_excluded(change.path.strip_prefix(repo_path).unwrap_or(&change.path))
             {
                 continue;
             }
 
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let repo_name = owner.key.clone();
 
             match change.change_type {
                 ChangeType::Created | ChangeType::Modified => {
@@ -3962,7 +3985,7 @@ impl CodeIntelEngine {
                 return vec![path];
             }
         }
-        self.repo_paths.clone()
+        self.indexed_roots().into_iter().map(|e| e.path).collect()
     }
 
     /// Re-render a normalized 1C metadata document's searchable content by id.

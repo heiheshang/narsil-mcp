@@ -99,11 +99,7 @@ impl CodeIntelEngine {
         persisted: Option<PersistedIndex>,
     ) -> Result<WalkOutcome> {
         let start_time = std::time::Instant::now();
-        let repo_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let repo_name = self.repo_key(path);
         tracing::Span::current().record("repo", repo_name.as_str());
         // Interned once per repository: every search/neural document carries a
         // cheap clone of this tag so searches can be scoped to one repo.
