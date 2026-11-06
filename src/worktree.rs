@@ -1,8 +1,10 @@
 //! Discovery of linked git worktrees: `git worktree list --porcelain`.
 
 use anyhow::{anyhow, Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,21 +59,60 @@ pub fn parse_porcelain(output: &str) -> Vec<WorktreeInfo> {
     worktrees
 }
 
+/// A hung git (a stale lock, a network mount) must not hang the tool call.
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .context("failed to run git")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git {} failed in {:?}: {}",
-            args.join(" "),
-            dir,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let mut command = Command::new("git");
+    command.args(args).current_dir(dir);
+    let label = format!("git {} in {:?}", args.join(" "), dir);
+    output_within(command, GIT_TIMEOUT, &label)
+}
+
+/// Stdout of `command`, or an error when it fails or outlives `timeout`
+/// (it is killed then).
+fn output_within(mut command: Command, timeout: Duration, label: &str) -> Result<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run {label}"))?;
+    // Read while waiting: a full pipe would otherwise stall the child.
+    let stdout = child.stdout.take().map(read_in_background);
+    let stderr = child.stderr.take().map(read_in_background);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed to wait for child")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            warn!(command = %label, timeout_ms = timeout.as_millis() as u64, "command timed out");
+            return Err(anyhow!("{label} timed out after {timeout:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        handle
+            .and_then(|h| h.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+            .unwrap_or_default()
+    };
+    let (stdout, stderr) = (collect(stdout), collect(stderr));
+    if !status.success() {
+        return Err(anyhow!("{label} failed: {stderr}"));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(stdout)
+}
+
+fn read_in_background(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -136,8 +177,8 @@ pub fn checkout_root(path: &Path) -> Option<PathBuf> {
 
 /// Whether git can be run at all; discovery is skipped without it.
 pub fn git_available() -> bool {
-    match Command::new("git").arg("--version").output() {
-        Ok(output) => output.status.success(),
+    match git_output(Path::new("."), &["--version"]) {
+        Ok(_) => true,
         Err(e) => {
             warn!(error = %e, "git not found; worktree discovery disabled");
             false
@@ -198,6 +239,16 @@ prunable gitdir file points to non-existent location
         assert_eq!(worktrees.len(), 2);
         assert!(worktrees[0].bare);
         assert_eq!(worktrees[1].branch.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn hung_command_is_killed() {
+        let mut command = Command::new("sleep");
+        command.arg("10");
+        let started = Instant::now();
+        let err = output_within(command, Duration::from_millis(100), "sleep 10").unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

@@ -438,6 +438,7 @@ impl CodeIntelEngine {
         }
         let root: PathBuf = entry.path.clone();
         self.file_cache.retain(|path, _| !path.starts_with(&root));
+        self.chunk_cache.remove_under(&root);
         self.query_cache.invalidate_for_repo(key);
         self.index_jobs.remove(key);
         self.send_watch(WatchCommand::Unwatch(root));

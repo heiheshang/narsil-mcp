@@ -121,6 +121,13 @@ impl ChunkTokenCache {
         self.files.remove(path);
     }
 
+    /// Drops every file under `root`; returns how many.
+    pub fn remove_under(&self, root: &Path) -> usize {
+        let before = self.files.len();
+        self.files.retain(|path, _| !path.starts_with(root));
+        before - self.files.len()
+    }
+
     pub fn clear(&self) {
         self.files.clear();
         self.terms.clear();
@@ -177,6 +184,26 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &changed));
         let ids = cache.known_ids(&query);
         assert!(changed.iter().all(|c| c.overlap(&ids) == 0));
+    }
+
+    #[test]
+    fn remove_under_drops_only_that_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let kept = dir.path().join("a.py");
+        let dropped = wt.join("b.py");
+        write(&kept, "def a():\n    return 1\n");
+        write(&dropped, "def b():\n    return 2\n");
+
+        let cache = ChunkTokenCache::new();
+        let chunker = AstChunker::new();
+        cache.chunks_for(&kept, &chunker).unwrap();
+        cache.chunks_for(&dropped, &chunker).unwrap();
+
+        assert_eq!(cache.remove_under(&wt), 1);
+        assert!(cache.files.contains_key(&kept));
+        assert!(!cache.files.contains_key(&dropped));
     }
 
     #[test]
