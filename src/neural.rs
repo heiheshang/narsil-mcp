@@ -571,7 +571,7 @@ impl EmbeddingBackend for ApiEmbedder {
         let response: Response = serde_json::from_str(&text).with_context(|| {
             format!(
                 "Failed to parse embedding response: {}",
-                &text[..text.len().min(200)]
+                crate::text::truncate(&text, 200)
             )
         })?;
 

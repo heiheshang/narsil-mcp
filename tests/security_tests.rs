@@ -270,3 +270,42 @@ async fn scan_security_names_directories_it_never_opened() {
         "nothing was excluded, so there is no gap to report, got:\n{report}"
     );
 }
+
+/// `max_findings` comes straight from the tool arguments; the page end used to
+/// be `offset + max_findings`, which overflows for a huge limit.
+#[tokio::test]
+async fn scan_security_page_with_a_huge_limit() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("paged-repo");
+    fs::create_dir_all(repo_path.join("src")).unwrap();
+    fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-fixtures/security/vulnerable.go"
+        ),
+        repo_path.join("src/app.go"),
+    )
+    .unwrap();
+
+    let engine = CodeIntelEngine::new(temp_dir.path().join("index"), vec![repo_path])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    let options = narsil_mcp::engine::SecurityScanOptions {
+        offset: Some(1),
+        max_findings: Some(usize::MAX),
+        ..Default::default()
+    };
+    let report = engine.scan_security("paged-repo", options).await.unwrap();
+    assert!(report.contains("Security Scan"), "{report}");
+
+    let full = engine
+        .scan_security("paged-repo", Default::default())
+        .await
+        .unwrap();
+    assert!(
+        !full.contains("**Findings**: 0"),
+        "the fixture must have findings to page through:\n{full}"
+    );
+}

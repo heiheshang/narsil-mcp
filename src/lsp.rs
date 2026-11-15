@@ -277,7 +277,12 @@ impl LspManager {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let workspace_folder = WorkspaceFolder {
-            uri: Url::from_file_path(&workspace_root).unwrap(),
+            uri: Url::from_file_path(&workspace_root).map_err(|()| {
+                anyhow!(
+                    "LSP workspace root is not an absolute path: {}",
+                    workspace_root.display()
+                )
+            })?,
             name: workspace_root
                 .file_name()
                 .and_then(|n| n.to_str())

@@ -52,7 +52,7 @@ impl ToolHandler for GetRecentChangesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let days = args.get_u64_or("days", 7) as u32;
+        let days = u32::try_from(args.get_u64_or("days", 7)).unwrap_or(u32::MAX);
         engine.get_recent_changes(repo, days).await
     }
 }
@@ -68,7 +68,7 @@ impl ToolHandler for GetHotspotsHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let days = args.get_u64_or("days", 30) as u32;
+        let days = u32::try_from(args.get_u64_or("days", 30)).unwrap_or(u32::MAX);
         let min_complexity = args.get_u64("min_complexity").map(|v| v as usize);
         engine.get_hotspots(repo, days, min_complexity).await
     }
