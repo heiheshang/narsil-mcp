@@ -94,7 +94,7 @@ impl McpServer {
         let config = ConfigLoader::new().load().unwrap_or_else(|e| {
             eprintln!("Warning: Failed to load config: {}. Using defaults.", e);
             // Return default config by loading it again
-            ConfigLoader::new().default_config.clone()
+            ConfigLoader::new().default_config
         });
         Self {
             engine: Arc::new(engine),
@@ -112,7 +112,7 @@ impl McpServer {
     pub fn from_arc(engine: Arc<CodeIntelEngine>, preset_override: Option<String>) -> Self {
         let mut config = ConfigLoader::new().load().unwrap_or_else(|e| {
             eprintln!("Warning: Failed to load config: {}. Using defaults.", e);
-            ConfigLoader::new().default_config.clone()
+            ConfigLoader::new().default_config
         });
 
         // CLI preset override takes highest priority

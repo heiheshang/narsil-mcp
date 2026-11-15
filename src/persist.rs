@@ -625,7 +625,7 @@ impl AsyncFileWatcher {
                                     _ => continue,
                                 };
 
-                                for change in source_changes_for_path(&path, change_type.clone()) {
+                                for change in source_changes_for_path(&path, change_type) {
                                     // Add to debounce buffer (overwrites previous events for same file)
                                     debounce_buffer.insert(change.path.clone(), change);
                                 }

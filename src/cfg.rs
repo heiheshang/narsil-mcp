@@ -835,7 +835,7 @@ impl CfgBuilder {
                         Statement {
                             line,
                             kind: StatementKind::Assignment { variable: var_name },
-                            text: text.clone(),
+                            text,
                         },
                     );
                     // Process the control flow RHS
@@ -1222,12 +1222,7 @@ impl CfgBuilder {
                 text: format!("if {}", condition),
             },
         );
-        self.set_terminator(
-            current,
-            Terminator::Branch {
-                condition: condition.clone(),
-            },
-        );
+        self.set_terminator(current, Terminator::Branch { condition });
 
         // Create blocks
         let then_block = self.create_block("then");
@@ -1343,12 +1338,7 @@ impl CfgBuilder {
                 text: format!("while {}", condition),
             },
         );
-        self.set_terminator(
-            header,
-            Terminator::Branch {
-                condition: condition.clone(),
-            },
-        );
+        self.set_terminator(header, Terminator::Branch { condition });
 
         // Body and exit blocks
         let body_block = self.create_block("while_body");
@@ -1487,12 +1477,7 @@ impl CfgBuilder {
                 text: format!("match {}", condition),
             },
         );
-        self.set_terminator(
-            current,
-            Terminator::Branch {
-                condition: condition.clone(),
-            },
-        );
+        self.set_terminator(current, Terminator::Branch { condition });
 
         let merge = self.create_block("match_end");
 
@@ -1561,12 +1546,7 @@ impl CfgBuilder {
                 text: format!("switch {}", condition),
             },
         );
-        self.set_terminator(
-            current,
-            Terminator::Branch {
-                condition: condition.clone(),
-            },
-        );
+        self.set_terminator(current, Terminator::Branch { condition });
 
         let merge = self.create_block("switch_end");
         let mut has_default = false;
@@ -1791,12 +1771,7 @@ impl CfgBuilder {
                 text: format!("when {}", condition),
             },
         );
-        self.set_terminator(
-            current,
-            Terminator::Branch {
-                condition: condition.clone(),
-            },
-        );
+        self.set_terminator(current, Terminator::Branch { condition });
 
         let merge = self.create_block("when_end");
         let mut has_else = false;
@@ -1948,12 +1923,7 @@ impl CfgBuilder {
                 text: format!("while {}", condition),
             },
         );
-        self.set_terminator(
-            condition_block,
-            Terminator::Branch {
-                condition: condition.clone(),
-            },
-        );
+        self.set_terminator(condition_block, Terminator::Branch { condition });
 
         self.add_edge(condition_block, body_block, EdgeKind::TrueBranch);
         self.add_edge(condition_block, exit_block, EdgeKind::FalseBranch);

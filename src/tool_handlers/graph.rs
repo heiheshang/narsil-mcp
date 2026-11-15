@@ -290,10 +290,12 @@ impl GetCodeGraphHandler {
         };
 
         // Limit starting nodes for manageable graph size
-        let starting_nodes: Vec<String> = starting_nodes.into_iter().take(100).collect();
-
         // BFS traversal
-        let mut queue: Vec<(String, usize)> = starting_nodes.into_iter().map(|n| (n, 0)).collect();
+        let mut queue: Vec<(String, usize)> = starting_nodes
+            .into_iter()
+            .take(100)
+            .map(|n| (n, 0))
+            .collect();
         // Reverse edges computed once from the forward `calls` (called_by is
         // no longer stored in the graph).
         let reverse = call_graph_data.reverse_edges();
@@ -444,7 +446,7 @@ impl GetCodeGraphHandler {
             if nodes.len() >= options.max_nodes {
                 break;
             }
-            let file_str = file.to_string();
+            let file_str = file.clone();
 
             if !visited.contains(&file_str) {
                 visited.insert(file_str.clone());

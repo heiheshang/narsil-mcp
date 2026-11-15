@@ -666,7 +666,7 @@ impl CodeIntelEngine {
         // Parsed files index per-symbol cards above instead.
         if let Some(calls) = prepared.pending_calls {
             acc.pending_calls.push((relative_path.clone(), calls));
-            acc.deferred_files.insert(file_path.clone());
+            acc.deferred_files.insert(file_path);
         }
         if let Some(cg) = ctx.call_graph {
             for entry in prepared.platform_entries {

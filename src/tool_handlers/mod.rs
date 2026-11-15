@@ -25,6 +25,20 @@ mod sparql;
 mod supply_chain;
 mod symbols;
 
+/// Most engine methods are `async` in name only and compute for as long as the
+/// repository demands; on a multi-thread runtime the worker hands its queue to
+/// another thread for the duration, so health checks and other requests keep
+/// being served. A current-thread runtime cannot do that and runs `fut` in place.
+async fn run_off_workers<F: std::future::Future>(fut: F) -> F::Output {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    let handle = Handle::current();
+    if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        fut.await
+    }
+}
+
 /// Trait for implementing tool handlers
 ///
 /// Each tool handler extracts its arguments from JSON and calls the appropriate
@@ -205,14 +219,16 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
         validate_tool_args(name, &args, ArgValidationMode::from_env())?;
-        // A worktree is addressed by name, branch or path and indexed on first use.
-        engine.resolve_repo_arg(&mut args).await?;
         let span = tracing::info_span!("tool", name = name);
-        async {
-            tracing::debug!("Executing tool {}", name);
-            handler.execute(engine, args).await
-        }
-        .instrument(span)
+        run_off_workers(
+            async {
+                // A worktree is addressed by name, branch or path and indexed on first use.
+                engine.resolve_repo_arg(&mut args).await?;
+                tracing::debug!("Executing tool {}", name);
+                handler.execute(engine, args).await
+            }
+            .instrument(span),
+        )
         .await
     }
 
@@ -529,6 +545,28 @@ impl ArgExtractor for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_tool_does_not_starve_the_only_worker() {
+        // The test body runs on its own thread; the tool has to run on the worker.
+        tokio::spawn(async {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::spawn(async move { tx.send(()).unwrap() });
+
+            run_off_workers(async move {
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("a task spawned before the tool ran while it blocked");
+            })
+            .await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_thread_runtime_runs_the_tool_in_place() {
+        assert_eq!(run_off_workers(async { 7 }).await, 7);
+    }
 
     #[test]
     fn test_registry_creation() {

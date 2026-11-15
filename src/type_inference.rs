@@ -3381,7 +3381,7 @@ impl<'a> TypeInferencer<'a> {
                 }
                 Constraint::Subtype(Type::Var(id), sup) if !Type::Var(id).is_subtype_of(&sup) => {
                     // Add substitution for type variables
-                    self.env.add_substitution(id, sup.clone());
+                    self.env.add_substitution(id, sup);
                 }
                 _ => {}
             }
