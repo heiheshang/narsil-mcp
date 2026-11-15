@@ -3,6 +3,7 @@
 //! chunks that reach a result are re-chunked from disk.
 
 use crate::chunking::{AstChunker, ChunkType};
+use crate::paths::SlashPath;
 use crate::search::tokenize_code;
 use crate::FastMap;
 use std::collections::HashSet;
@@ -63,7 +64,7 @@ impl ChunkTokenCache {
         }
 
         let content = std::fs::read_to_string(path).ok()?;
-        let path_str = path.to_string_lossy();
+        let path_str = path.to_slash_lossy();
         let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             chunker.chunk_file(&content, &path_str)
         })) {

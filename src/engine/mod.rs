@@ -5728,7 +5728,7 @@ impl CodeIntelEngine {
             let Some(content) = self.content_for(file_entry.key()) else {
                 continue;
             };
-            let file_path_str = file_path.to_string_lossy().to_string();
+            let file_path_str = file_path.to_slash_lossy().to_string();
 
             let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 chunker.chunk_file(&content, &file_path_str)

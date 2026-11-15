@@ -32,11 +32,22 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The canonical path without the Windows `\\?\` prefix, which git rejects.
+fn plain_canonical(path: &Path) -> Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    Ok(
+        match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(plain) => PathBuf::from(plain),
+            None => canonical,
+        },
+    )
+}
+
 impl Fixture {
     /// `app/` with one committed file.
     fn new() -> Result<Self> {
         let root = TempDir::new()?;
-        let primary = root.path().canonicalize()?.join("app");
+        let primary = plain_canonical(root.path())?.join("app");
         std::fs::create_dir(&primary)?;
         git(&primary, &["init", "-q", "-b", "main"])?;
         std::fs::write(

@@ -368,7 +368,7 @@ impl CodeIntelEngine {
                 Hit::File(f, i) => {
                     let chunks = rechunked.entry(f).or_insert_with(|| {
                         let path = &files[f];
-                        let path_str = path.to_string_lossy();
+                        let path_str = path.to_slash_lossy();
                         self.content_for(path)
                             .and_then(|content| {
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
