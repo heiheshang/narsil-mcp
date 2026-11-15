@@ -564,7 +564,10 @@ impl GitRepo {
 fn chrono_lite_format(timestamp: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
 
-    let dt = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
+    let dt = u64::try_from(timestamp)
+        .ok()
+        .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+        .unwrap_or(UNIX_EPOCH);
     let now = std::time::SystemTime::now();
 
     let age = now.duration_since(dt).unwrap_or_default();
@@ -589,7 +592,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max - 3])
+        format!("{}...", crate::text::truncate(s, max.saturating_sub(3)))
     }
 }
 
@@ -636,6 +639,20 @@ fn tally_name_status(log: &str) -> HashMap<String, (usize, HashSet<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_keeps_multibyte_commit_summaries_whole() {
+        let summary = "Исправлен разбор аннотаций расширения";
+        let short = truncate(summary, 40);
+        assert!(short.ends_with("..."), "{short}");
+        assert!(short.len() <= 40, "{short}");
+    }
+
+    #[test]
+    fn commit_dates_before_the_epoch_do_not_overflow() {
+        assert!(!chrono_lite_format(-1).is_empty());
+        assert!(!chrono_lite_format(i64::MIN).is_empty());
+    }
 
     #[test]
     fn test_tally_name_status_follows_renames() {

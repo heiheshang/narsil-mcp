@@ -1923,9 +1923,9 @@ impl CallGraph {
             return (CallType::Direct, None);
         };
         let start = path
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-            .map(|i| i + 1)
-            .unwrap_or(0);
+            .char_indices()
+            .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let qualifier = path[start..].trim_start_matches(':');
         if qualifier.is_empty() {
             (CallType::Direct, None)
@@ -4664,6 +4664,18 @@ fn bsl_module_event(file_path: &str, procedure: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macro_qualifier_after_a_non_ascii_character() {
+        assert_eq!(
+            CallGraph::macro_call_shape("Модуль::"),
+            (CallType::Direct, None)
+        );
+        assert_eq!(
+            CallGraph::macro_call_shape("éType::"),
+            (CallType::StaticMethod, Some("Type"))
+        );
+    }
 
     #[test]
     fn test_call_type() {

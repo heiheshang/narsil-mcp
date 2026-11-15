@@ -217,6 +217,19 @@ mod contains_ignore_case_tests {
 }
 
 #[cfg(test)]
+mod import_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn es_import_from_a_non_ascii_specifier() {
+        let imports =
+            parse_imports_from_content("import x from пакет\nimport y from 'lib';\n", "a.js");
+        let paths: Vec<_> = imports.iter().map(|i| i.import_path.as_str()).collect();
+        assert_eq!(paths, ["пакет", "lib"]);
+    }
+}
+
+#[cfg(test)]
 mod file_pattern_tests {
     use super::*;
 
@@ -6536,7 +6549,7 @@ impl CodeIntelEngine {
         let findings = if offset > 0 || max_findings.is_some() {
             let start = offset.min(findings.len());
             let end = match max_findings {
-                Some(limit) => (start + limit).min(findings.len()),
+                Some(limit) => start.saturating_add(limit).min(findings.len()),
                 None => findings.len(),
             };
             findings[start..end].to_vec()
@@ -9547,8 +9560,9 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
         // JavaScript/TypeScript ES imports
         if trimmed.starts_with("import ") {
             if let Some(from_idx) = trimmed.find(" from ") {
-                let path_part = &trimmed[from_idx + 7..];
+                let path_part = &trimmed[from_idx + " from ".len()..];
                 let import_path = path_part
+                    .trim()
                     .trim_matches(|c| c == '\'' || c == '"' || c == ';')
                     .to_string();
 
