@@ -1,3 +1,4 @@
+use crate::paths::SlashPath;
 use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -425,7 +426,7 @@ impl CodeIntelEngine {
             let relative_path = file_path
                 .strip_prefix(ctx.path)
                 .unwrap_or(file_path)
-                .to_string_lossy();
+                .to_slash_lossy();
             cg.collect_file_calls(&relative_path, &content, &tree)
         })?;
         cg.link_extensions();
@@ -472,7 +473,7 @@ impl CodeIntelEngine {
                 let relative = file_path
                     .strip_prefix(ctx.path)
                     .unwrap_or(file_path)
-                    .to_string_lossy();
+                    .to_slash_lossy();
                 prepared.platform_entries =
                     crate::ingest::onec::platform_entry_points(&relative, &content);
             }
@@ -493,7 +494,7 @@ impl CodeIntelEngine {
             let relative = file_path
                 .strip_prefix(ctx.path)
                 .unwrap_or(file_path)
-                .to_string_lossy();
+                .to_slash_lossy();
             if CallGraph::defers_calls(&relative) {
                 prepared.pending_calls = Some(cg.pending_file_calls(&relative, &content, tree));
             }
@@ -615,7 +616,7 @@ impl CodeIntelEngine {
         let relative_path = file_path
             .strip_prefix(ctx.path)
             .unwrap_or(&file_path)
-            .to_string_lossy()
+            .to_slash_lossy()
             .to_string();
 
         // Documents for an unchanged file are already in the
@@ -868,7 +869,7 @@ impl CodeIntelEngine {
             .keys()
             .filter(|f| !walked.contains(f.as_path()))
         {
-            let relative_path = gone.strip_prefix(path).unwrap_or(gone).to_string_lossy();
+            let relative_path = gone.strip_prefix(path).unwrap_or(gone).to_slash_lossy();
             self.search_index
                 .tantivy()
                 .delete_file(repo_tag, &relative_path);

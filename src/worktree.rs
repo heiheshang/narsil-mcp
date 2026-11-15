@@ -1,5 +1,6 @@
 //! Discovery of linked git worktrees: `git worktree list --porcelain`.
 
+use crate::paths::canonical;
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -117,10 +118,6 @@ fn read_in_background(mut pipe: impl Read + Send + 'static) -> std::thread::Join
         let _ = pipe.read_to_end(&mut bytes);
         bytes
     })
-}
-
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Linked worktrees of the repository at `primary`, without `primary`
@@ -314,14 +311,11 @@ prunable gitdir file points to non-existent location
 
         let worktrees = list_worktrees(&primary).unwrap();
         assert_eq!(worktrees.len(), 1);
-        assert_eq!(worktrees[0].path, wt.canonicalize().unwrap());
+        assert_eq!(worktrees[0].path, canonical(&wt));
         assert_eq!(worktrees[0].branch.as_deref(), Some("feature/x"));
         assert_eq!(common_dir(&wt), common_dir(&primary));
         assert!(common_dir(&primary).is_some());
-        assert_eq!(
-            checkout_root(&wt.join("a.rs")),
-            Some(wt.canonicalize().unwrap())
-        );
+        assert_eq!(checkout_root(&wt.join("a.rs")), Some(canonical(&wt)));
 
         std::fs::remove_dir_all(&wt).unwrap();
         assert!(list_worktrees(&primary).unwrap().is_empty());
@@ -346,12 +340,12 @@ prunable gitdir file points to non-existent location
 
         let worktrees = list_worktrees(&mono.join("pkg")).unwrap();
         assert_eq!(worktrees.len(), 1, "the monorepo itself is not a worktree");
-        assert_eq!(worktrees[0].path, wt.canonicalize().unwrap().join("pkg"));
+        assert_eq!(worktrees[0].path, canonical(&wt).join("pkg"));
         assert_eq!(worktrees[0].name, "wt");
 
         // From inside a linked worktree the main checkout is another worktree.
         let from_wt = list_worktrees(&wt).unwrap();
         assert_eq!(from_wt.len(), 1);
-        assert_eq!(from_wt[0].path, mono.canonicalize().unwrap());
+        assert_eq!(from_wt[0].path, canonical(&mono));
     }
 }

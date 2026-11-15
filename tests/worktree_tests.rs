@@ -36,7 +36,7 @@ impl Fixture {
     /// `app/` with one committed file.
     fn new() -> Result<Self> {
         let root = TempDir::new()?;
-        let primary = root.path().canonicalize()?.join("app");
+        let primary = narsil_mcp::paths::canonical(root.path()).join("app");
         std::fs::create_dir(&primary)?;
         git(&primary, &["init", "-q", "-b", "main"])?;
         std::fs::write(

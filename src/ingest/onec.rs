@@ -1,3 +1,4 @@
+use crate::paths::SlashPath;
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -463,10 +464,7 @@ struct ParsedMetadata {
 /// The path with `/` between components on every platform: it lands in
 /// document text and metadata that must read the same on Windows and Linux.
 fn slash_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    path.to_slash_lossy().into_owned()
 }
 
 fn parse_metadata_xml(xml: &str) -> Result<ParsedMetadata> {

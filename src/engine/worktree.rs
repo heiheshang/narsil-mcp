@@ -1,6 +1,7 @@
 //! Linked git worktrees of the indexed repositories: discovery, indexing on
 //! first use, resolution of the `repo` argument, and removal.
 
+use crate::paths::SlashPath;
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -65,7 +66,7 @@ impl CodeIntelEngine {
 
         let cwd = std::env::current_dir()
             .ok()
-            .and_then(|cwd| cwd.canonicalize().ok());
+            .map(|cwd| crate::paths::canonical(&cwd));
         if let Some(owner) = cwd.and_then(|cwd| self.registry.owner_of(&cwd)) {
             if owner.is_worktree() {
                 info!(key = %owner.key, "server cwd is worktree");
@@ -145,7 +146,7 @@ impl CodeIntelEngine {
             let rel = file
                 .strip_prefix(&owner.path)
                 .unwrap_or(file)
-                .to_string_lossy()
+                .to_slash_lossy()
                 .to_string();
             self.search_index.tantivy().delete_file(&owner.key, &rel);
             if let Some(tri) = self.substring_index.as_ref() {
@@ -479,7 +480,7 @@ impl CodeIntelEngine {
     }
 
     fn resolve_worktree_path(&self, path: &Path) -> Option<(RepoEntry, Resolution)> {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = crate::paths::canonical(path);
         let how = |owner: &RepoEntry| {
             if owner.path == path {
                 Resolution::Key

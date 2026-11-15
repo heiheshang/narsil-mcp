@@ -85,7 +85,7 @@ jobs:
           cache-on-failure: true
 
       - name: Run tests
-        run: cargo test --features "${{ env.CI_FEATURES }}" --verbose -- --test-threads=1
+        run: cargo test --no-fail-fast --features "${{ env.CI_FEATURES }}" --verbose -- --test-threads=1
 
   # The graph feature is deliberately outside CI_FEATURES: oxigraph/RocksDB is
   # slow to compile, so it gets one Linux job instead of a slot in the 3-OS

@@ -7,6 +7,7 @@ mod repo_registry;
 mod search;
 mod worktree;
 
+use crate::paths::SlashPath;
 use repo_registry::RepoRegistry;
 pub use repo_registry::{RepoEntry, RepoKind, RepoState};
 
@@ -2391,7 +2392,7 @@ impl CodeIntelEngine {
                 let rel_path = file_path
                     .strip_prefix(&repo_path)
                     .unwrap_or(file_path)
-                    .to_string_lossy();
+                    .to_slash_lossy();
 
                 // Skip test files if exclude_tests is enabled
                 if exclude_tests && is_test_file(&rel_path) {
@@ -2674,7 +2675,7 @@ impl CodeIntelEngine {
             let rel_path = file_path
                 .strip_prefix(repo_path)
                 .unwrap_or(file_path)
-                .to_string_lossy()
+                .to_slash_lossy()
                 .to_string();
 
             let Some(content) = self.content_for(entry.key()) else {
@@ -2722,7 +2723,7 @@ impl CodeIntelEngine {
                                     let rel = path
                                         .strip_prefix(repo_path)
                                         .unwrap_or(&path)
-                                        .to_string_lossy()
+                                        .to_slash_lossy()
                                         .to_string();
                                     references.push((
                                         rel,
@@ -2813,7 +2814,7 @@ impl CodeIntelEngine {
                     continue;
                 };
                 if content.contains(module_name) {
-                    let rel_path = fp.strip_prefix(&repo_path).unwrap_or(fp).to_string_lossy();
+                    let rel_path = fp.strip_prefix(&repo_path).unwrap_or(fp).to_slash_lossy();
                     output.push_str(&format!("- `{}`\n", rel_path));
                 }
             }
@@ -3290,7 +3291,7 @@ impl CodeIntelEngine {
                             .path
                             .strip_prefix(repo_path)
                             .unwrap_or(&change.path)
-                            .to_string_lossy()
+                            .to_slash_lossy()
                             .to_string();
 
                         // Update symbols for this file
@@ -3373,7 +3374,7 @@ impl CodeIntelEngine {
                         .path
                         .strip_prefix(repo_path)
                         .unwrap_or(&change.path)
-                        .to_string_lossy()
+                        .to_slash_lossy()
                         .to_string();
 
                     // Remove symbols for this file
@@ -3756,7 +3757,7 @@ impl CodeIntelEngine {
                 .as_ref()
                 .and_then(|r| path.strip_prefix(r).ok())
                 .unwrap_or(path)
-                .to_string_lossy()
+                .to_slash_lossy()
                 .to_string();
             let cc = node.metrics.cyclomatic;
             let label = match &node.receiver {
@@ -5111,7 +5112,7 @@ impl CodeIntelEngine {
                                 let rel_path = def_path
                                     .strip_prefix(&repo_path)
                                     .unwrap_or(&def_path)
-                                    .to_string_lossy();
+                                    .to_slash_lossy();
                                 output.push_str(&format!(
                                     "- `{}:{}:{}`\n",
                                     rel_path,
@@ -5727,7 +5728,7 @@ impl CodeIntelEngine {
             let Some(content) = self.content_for(file_entry.key()) else {
                 continue;
             };
-            let file_path_str = file_path.to_string_lossy().to_string();
+            let file_path_str = file_path.to_slash_lossy().to_string();
 
             let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 chunker.chunk_file(&content, &file_path_str)
@@ -7451,8 +7452,8 @@ impl CodeIntelEngine {
                         for dep in deps {
                             let rel_path = dep
                                 .strip_prefix(&repo_path)
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| dep.to_string_lossy().to_string());
+                                .map(|p| p.to_slash_lossy().to_string())
+                                .unwrap_or_else(|_| dep.to_slash_lossy().to_string());
                             output.push_str(&format!("- `{}`\n", rel_path));
                         }
                         output.push('\n');
@@ -7471,8 +7472,8 @@ impl CodeIntelEngine {
                         for dep in dependents {
                             let rel_path = dep
                                 .strip_prefix(&repo_path)
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| dep.to_string_lossy().to_string());
+                                .map(|p| p.to_slash_lossy().to_string())
+                                .unwrap_or_else(|_| dep.to_slash_lossy().to_string());
                             output.push_str(&format!("- `{}`\n", rel_path));
                         }
                         output.push('\n');
@@ -7563,8 +7564,8 @@ impl CodeIntelEngine {
                 for (j, path) in cycle.iter().enumerate() {
                     let rel_path = path
                         .strip_prefix(&repo_path)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                        .map(|p| p.to_slash_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_slash_lossy().to_string());
                     output.push_str(&rel_path);
                     if j < cycle.len() - 1 {
                         output.push_str(" -> ");
@@ -7576,8 +7577,8 @@ impl CodeIntelEngine {
                         .first()
                         .map(|p| p
                             .strip_prefix(&repo_path)
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| p.to_string_lossy().to_string()))
+                            .map(|p| p.to_slash_lossy().to_string())
+                            .unwrap_or_else(|_| p.to_slash_lossy().to_string()))
                         .unwrap_or_default()
                 ));
                 output.push_str("```\n\n");
@@ -7876,8 +7877,8 @@ impl CodeIntelEngine {
 
             let rel_path = path
                 .strip_prefix(&repo_path)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                .map(|p| p.to_slash_lossy().to_string())
+                .unwrap_or_else(|_| path.to_slash_lossy().to_string());
 
             // Skip test files if exclude_tests is enabled
             if exclude_tests && is_test_file(&rel_path) {
@@ -8293,7 +8294,7 @@ impl CodeIntelEngine {
                         .key()
                         .strip_prefix(&repo_meta.path)
                         .unwrap_or(entry.key())
-                        .to_string_lossy()
+                        .to_slash_lossy()
                         .replace('\\', "/");
                     if exclude_tests && is_test_file(&display_path) {
                         return None;
@@ -8785,7 +8786,7 @@ impl CodeIntelEngine {
             let rel_path = file_path
                 .strip_prefix(&repo_path)
                 .unwrap_or(file_path)
-                .to_string_lossy()
+                .to_slash_lossy()
                 .to_string();
 
             let Some(content) = self.content_for(entry.key()) else {
@@ -9471,7 +9472,7 @@ impl CodeIntelEngine {
                 let path_str = path.to_string_lossy().to_string();
                 let relative_path = path
                     .strip_prefix(&repo_path)
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|p| p.to_slash_lossy().to_string())
                     .unwrap_or_else(|_| path_str.clone());
                 let language = detect_language_from_path(&path_str);
                 // `file_cache` holds paths only since the on-demand read
