@@ -16,8 +16,12 @@
           rustPlatform.bindgenHook
         ];
 
+        # sqlite: since mid-November nixos-unstable builds libsqlite3-sys
+        # against the system library rather than the bundled one, and the
+        # macOS link failed with `library not found for -lsqlite3`.
         buildInputs = with pkgs; [
           openssl
+          sqlite
           zstd
         ];
 

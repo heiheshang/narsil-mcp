@@ -29,6 +29,8 @@ mod symbols;
 ///
 /// Each tool handler extracts its arguments from JSON and calls the appropriate
 /// engine method, returning the result as a string.
+// clippy 1.99 flags the `#[must_use]` async_trait adds to `execute`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ToolHandler: Send + Sync {
     /// Returns the tool name as it appears in MCP protocol
