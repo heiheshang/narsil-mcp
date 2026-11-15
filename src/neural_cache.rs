@@ -578,7 +578,7 @@ mod tests {
         };
 
         // Simulate a process killed halfway through appending a third record.
-        let file = OpenOptions::new().append(true).open(&path).unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(file.metadata().unwrap().len() + 7).unwrap();
 
         let cache = EmbeddingCache::open(&dir, "test-model", 4).unwrap();

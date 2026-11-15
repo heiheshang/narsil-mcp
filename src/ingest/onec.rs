@@ -161,7 +161,7 @@ impl OneCIngestor {
         metadata.insert("object_name".to_string(), summary.object_name.clone());
         metadata.insert(
             "relative_path".to_string(),
-            summary.relative_path.to_string_lossy().to_string(),
+            slash_path(&summary.relative_path),
         );
         metadata.insert(
             "synthetic_id".to_string(),
@@ -169,7 +169,7 @@ impl OneCIngestor {
         );
         metadata.insert(
             "primary_source_path".to_string(),
-            summary.relative_path.to_string_lossy().to_string(),
+            slash_path(&summary.relative_path),
         );
 
         let mut documents = vec![NormalizedDocument {
@@ -215,7 +215,7 @@ impl OneCIngestor {
             .and_then(Path::parent)
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| relative_path.to_string_lossy().to_string());
+            .unwrap_or_else(|| slash_path(&relative_path));
 
         let title = if form.title.is_empty() {
             format!("1C Form Composition: {form_name}")
@@ -226,10 +226,7 @@ impl OneCIngestor {
         let mut metadata = BTreeMap::new();
         metadata.insert("object_type".to_string(), "FormComposition".to_string());
         metadata.insert("object_name".to_string(), form_name.clone());
-        metadata.insert(
-            "relative_path".to_string(),
-            relative_path.to_string_lossy().to_string(),
-        );
+        metadata.insert("relative_path".to_string(), slash_path(&relative_path));
         metadata.insert(
             "form_element_count".to_string(),
             form.elements.len().to_string(),
@@ -278,7 +275,7 @@ impl OneCIngestor {
             .and_then(Path::parent)
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| relative_path.to_string_lossy().to_string());
+            .unwrap_or_else(|| slash_path(&relative_path));
 
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -286,10 +283,7 @@ impl OneCIngestor {
             "DataCompositionSchema".to_string(),
         );
         metadata.insert("object_name".to_string(), schema_name.clone());
-        metadata.insert(
-            "relative_path".to_string(),
-            relative_path.to_string_lossy().to_string(),
-        );
+        metadata.insert("relative_path".to_string(), slash_path(&relative_path));
         metadata.insert(
             "data_set_count".to_string(),
             schema.data_sets.len().to_string(),
@@ -390,7 +384,7 @@ impl OneCIngestor {
         metadata.insert("object_name".to_string(), summary.object_name.clone());
         metadata.insert(
             "relative_path".to_string(),
-            summary.relative_path.to_string_lossy().to_string(),
+            slash_path(&summary.relative_path),
         );
         metadata.insert(
             "summary_document_id".to_string(),
@@ -398,7 +392,7 @@ impl OneCIngestor {
         );
         metadata.insert(
             "primary_source_path".to_string(),
-            summary.relative_path.to_string_lossy().to_string(),
+            slash_path(&summary.relative_path),
         );
         metadata.insert(
             "linked_module_count".to_string(),
@@ -417,7 +411,7 @@ impl OneCIngestor {
                 summary
                     .module_links
                     .iter()
-                    .map(|(label, path)| format!("{label}: {}", path.to_string_lossy()))
+                    .map(|(label, path)| format!("{label}: {}", slash_path(path)))
                     .collect::<Vec<_>>()
                     .join("\n"),
             );
@@ -464,6 +458,15 @@ struct ParsedMetadata {
     name: Option<String>,
     synonym: Option<String>,
     properties: BTreeMap<String, String>,
+}
+
+/// The path with `/` between components on every platform: it lands in
+/// document text and metadata that must read the same on Windows and Linux.
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn parse_metadata_xml(xml: &str) -> Result<ParsedMetadata> {
@@ -1154,11 +1157,7 @@ fn discover_named_children(repo_root: &Path, metadata_path: &Path, dir_name: &st
         let name = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
-            .or_else(|| {
-                path.strip_prefix(repo_root)
-                    .ok()
-                    .map(|relative| relative.to_string_lossy().to_string())
-            });
+            .or_else(|| path.strip_prefix(repo_root).ok().map(slash_path));
 
         if let Some(name) = name {
             names.push(name);
@@ -1172,11 +1171,11 @@ fn discover_named_children(repo_root: &Path, metadata_path: &Path, dir_name: &st
 fn render_summary_text(summary: &OneCMetadataSummary) -> String {
     let mut lines = vec![
         summary.title.clone(),
-        format!("Path: {}", summary.relative_path.to_string_lossy()),
+        format!("Path: {}", slash_path(&summary.relative_path)),
     ];
 
     for (label, module_path) in &summary.module_links {
-        lines.push(format!("{label}: {}", module_path.to_string_lossy()));
+        lines.push(format!("{label}: {}", slash_path(module_path)));
     }
 
     if !summary.forms.is_empty() {
@@ -1319,14 +1318,10 @@ fn synthetic_base_path(relative_path: &Path) -> String {
     let without_extension = relative_path.with_extension("");
 
     if is_primary_object_metadata_path(relative_path) {
-        return without_extension
-            .parent()
-            .unwrap_or(&without_extension)
-            .to_string_lossy()
-            .to_string();
+        return slash_path(without_extension.parent().unwrap_or(&without_extension));
     }
 
-    without_extension.to_string_lossy().to_string()
+    slash_path(&without_extension)
 }
 
 fn is_primary_object_metadata_path(relative_path: &Path) -> bool {
@@ -1396,7 +1391,7 @@ fn render_linked_document_text(
 ) -> String {
     let mut lines = vec![
         title.to_string(),
-        format!("Metadata Path: {}", summary.relative_path.to_string_lossy()),
+        format!("Metadata Path: {}", slash_path(&summary.relative_path)),
         format!(
             "Summary Document: {}",
             synthetic_summary_id(&summary.relative_path)
@@ -1412,7 +1407,7 @@ fn render_linked_document_text(
     }
 
     for (label, module_path) in &summary.module_links {
-        lines.push(format!("{label}: {}", module_path.to_string_lossy()));
+        lines.push(format!("{label}: {}", slash_path(module_path)));
         if let Some(module_source) = read_repo_file(repo_root, module_path) {
             lines.push(String::new());
             lines.push(format!("[{label} Source]"));
@@ -1424,12 +1419,12 @@ fn render_linked_document_text(
         lines.push(String::new());
         lines.push(format!(
             "Form Metadata: {}",
-            linked_form.relative_path.to_string_lossy()
+            slash_path(&linked_form.relative_path)
         ));
         lines.push(format!("Form Name: {}", linked_form.object_name));
 
         for (label, module_path) in &linked_form.module_links {
-            lines.push(format!("{label}: {}", module_path.to_string_lossy()));
+            lines.push(format!("{label}: {}", slash_path(module_path)));
             if let Some(module_source) = read_repo_file(repo_root, module_path) {
                 lines.push(String::new());
                 lines.push(format!("[{} Source: {}]", label, linked_form.object_name));
@@ -1451,6 +1446,15 @@ fn read_repo_file(repo_root: &Path, relative_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_path_joins_components_with_forward_slashes() {
+        let path = Path::new("Catalogs")
+            .join("Products")
+            .join("Ext")
+            .join("Module.bsl");
+        assert_eq!(slash_path(&path), "Catalogs/Products/Ext/Module.bsl");
+    }
 
     fn fixture_path(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
