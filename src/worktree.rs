@@ -1,5 +1,6 @@
 //! Discovery of linked git worktrees: `git worktree list --porcelain`.
 
+use crate::paths::canonical;
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -117,10 +118,6 @@ fn read_in_background(mut pipe: impl Read + Send + 'static) -> std::thread::Join
         let _ = pipe.read_to_end(&mut bytes);
         bytes
     })
-}
-
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Linked worktrees of the repository at `primary`, without `primary`

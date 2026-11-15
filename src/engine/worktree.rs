@@ -66,7 +66,7 @@ impl CodeIntelEngine {
 
         let cwd = std::env::current_dir()
             .ok()
-            .and_then(|cwd| cwd.canonicalize().ok());
+            .map(|cwd| crate::paths::canonical(&cwd));
         if let Some(owner) = cwd.and_then(|cwd| self.registry.owner_of(&cwd)) {
             if owner.is_worktree() {
                 info!(key = %owner.key, "server cwd is worktree");
@@ -480,7 +480,7 @@ impl CodeIntelEngine {
     }
 
     fn resolve_worktree_path(&self, path: &Path) -> Option<(RepoEntry, Resolution)> {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = crate::paths::canonical(path);
         let how = |owner: &RepoEntry| {
             if owner.path == path {
                 Resolution::Key
