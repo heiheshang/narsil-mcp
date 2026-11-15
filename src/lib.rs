@@ -29,6 +29,7 @@ pub mod incremental;
 pub mod ingest;
 pub mod metrics;
 pub mod parser;
+pub mod paths;
 pub mod repo;
 pub mod search;
 pub mod security_config;

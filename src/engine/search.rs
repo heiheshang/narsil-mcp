@@ -1,3 +1,4 @@
+use crate::paths::SlashPath;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -166,7 +167,7 @@ impl CodeIntelEngine {
             let rel = files[file_idx]
                 .strip_prefix(root)
                 .unwrap_or(&files[file_idx])
-                .to_string_lossy()
+                .to_slash_lossy()
                 .into_owned();
             let id = match sig.symbol.as_deref() {
                 Some(name) => format!("{rel}::{name}"),

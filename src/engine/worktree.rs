@@ -1,6 +1,7 @@
 //! Linked git worktrees of the indexed repositories: discovery, indexing on
 //! first use, resolution of the `repo` argument, and removal.
 
+use crate::paths::SlashPath;
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -145,7 +146,7 @@ impl CodeIntelEngine {
             let rel = file
                 .strip_prefix(&owner.path)
                 .unwrap_or(file)
-                .to_string_lossy()
+                .to_slash_lossy()
                 .to_string();
             self.search_index.tantivy().delete_file(&owner.key, &rel);
             if let Some(tri) = self.substring_index.as_ref() {

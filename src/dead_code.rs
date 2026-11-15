@@ -19,6 +19,7 @@
 //! println!("{}", report.to_markdown());
 //! ```
 
+use crate::paths::SlashPath;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -448,7 +449,7 @@ pub fn find_unused_exports(
         let relative_path = file_path
             .strip_prefix(repo_root)
             .unwrap_or(file_path)
-            .to_string_lossy()
+            .to_slash_lossy()
             .to_string();
 
         // Check if file should be excluded
