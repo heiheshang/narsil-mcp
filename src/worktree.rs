@@ -330,13 +330,15 @@ prunable gitdir file points to non-existent location
     #[test]
     fn subdirectory_primary_maps_to_same_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
-        let mono = dir.path().canonicalize().unwrap().join("mono");
+        // git gets plain paths: a canonical Windows path is `\\?\C:\...`,
+        // which `git worktree add` rejects.
+        let mono = dir.path().join("mono");
         std::fs::create_dir_all(mono.join("pkg")).unwrap();
         git(&mono, &["init", "-q"]);
         std::fs::write(mono.join("pkg/a.rs"), "fn a() {}\n").unwrap();
         git(&mono, &["add", "."]);
         git(&mono, &["commit", "-q", "-m", "init"]);
-        let wt = dir.path().canonicalize().unwrap().join("wt");
+        let wt = dir.path().join("wt");
         git(
             &mono,
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "x"],
@@ -344,12 +346,12 @@ prunable gitdir file points to non-existent location
 
         let worktrees = list_worktrees(&mono.join("pkg")).unwrap();
         assert_eq!(worktrees.len(), 1, "the monorepo itself is not a worktree");
-        assert_eq!(worktrees[0].path, wt.join("pkg"));
+        assert_eq!(worktrees[0].path, wt.canonicalize().unwrap().join("pkg"));
         assert_eq!(worktrees[0].name, "wt");
 
         // From inside a linked worktree the main checkout is another worktree.
         let from_wt = list_worktrees(&wt).unwrap();
         assert_eq!(from_wt.len(), 1);
-        assert_eq!(from_wt[0].path, mono);
+        assert_eq!(from_wt[0].path, mono.canonicalize().unwrap());
     }
 }
