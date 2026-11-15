@@ -505,7 +505,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         }
     }
 
@@ -590,7 +590,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         engine.index_chunk(&chunk);
@@ -619,7 +619,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         engine.index_chunk(&chunk);
@@ -644,7 +644,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         engine.index_chunk(&chunk);
@@ -674,7 +674,7 @@ mod tests {
                 symbol_context: None,
                 chunk_type: ChunkType::Function,
                 doc_comment: None,
-                imports: Vec::new(),
+                imports: Default::default(),
             };
             engine.index_chunk(&chunk);
         }
@@ -704,7 +704,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         let chunk2 = CodeChunk {
@@ -717,7 +717,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         engine.index_chunk(&chunk1);
@@ -763,7 +763,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         engine.index_chunk(&chunk);
@@ -795,7 +795,7 @@ mod tests {
             symbol_context: None,
             chunk_type: ChunkType::Function,
             doc_comment: None,
-            imports: Vec::new(),
+            imports: Default::default(),
         };
 
         engine.index_chunk(&chunk);

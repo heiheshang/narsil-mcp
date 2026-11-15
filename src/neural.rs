@@ -563,7 +563,7 @@ impl EmbeddingBackend for ApiEmbedder {
             let safe_text = if crate::text::is_truncated(&text, 500) {
                 format!("{}... (truncated)", crate::text::truncate(&text, 500))
             } else {
-                text.clone()
+                text
             };
             bail!("API error ({}): {}", status, safe_text);
         }

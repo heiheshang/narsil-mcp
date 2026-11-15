@@ -669,7 +669,13 @@ impl CallGraph {
                     let lower = method.to_lowercase();
                     self.name_index
                         .iter()
-                        .find(|entry| entry.key().to_lowercase() == lower)
+                        .find(|entry| {
+                            entry
+                                .key()
+                                .chars()
+                                .flat_map(char::to_lowercase)
+                                .eq(lower.chars())
+                        })
                         .map(|entry| entry.value().clone())
                 });
             let Some(candidates) = candidates else {
@@ -686,8 +692,8 @@ impl CallGraph {
                 }
                 let common = hook_tail
                     .iter()
-                    .zip(tail(&file))
-                    .take_while(|(a, b)| *a == b)
+                    .zip(file.rsplit('/'))
+                    .take_while(|(a, b)| b.chars().flat_map(char::to_lowercase).eq(a.chars()))
                     .count();
                 if common < MIN_COMMON_TAIL || common < best {
                     continue;
@@ -1040,15 +1046,15 @@ impl CallGraph {
             return types::type_name_of(result, source);
         }
         let mut cursor = result.walk();
-        let declarations: Vec<Node> = result
+        let declared = result
             .children(&mut cursor)
             .filter(|child| child.kind() == "parameter_declaration")
-            .collect();
-        declarations.into_iter().find_map(|declaration| {
-            declaration
-                .child_by_field_name("type")
-                .and_then(|declared| types::type_name_of(declared, source))
-        })
+            .find_map(|declaration| {
+                declaration
+                    .child_by_field_name("type")
+                    .and_then(|declared| types::type_name_of(declared, source))
+            });
+        declared
     }
 
     /// The type a call produces: resolve the callee, then read its declared
@@ -3925,7 +3931,7 @@ impl CallGraph {
             if current == actual_to {
                 // Reconstruct path
                 let mut path = vec![actual_to.clone()];
-                let mut node = actual_to.clone();
+                let mut node = actual_to;
                 while let Some(pred) = predecessors.get(&node) {
                     path.push(pred.clone());
                     node = pred.clone();

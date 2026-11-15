@@ -1174,7 +1174,7 @@ pub fn find_uninitialized_vars(
     let mut uninit = Vec::new();
     for analysis in analyses {
         for use_ in analysis.uninitialized_uses {
-            uninit.push((analysis.function_name.clone(), use_.clone()));
+            uninit.push((analysis.function_name.clone(), use_));
         }
     }
 
@@ -1192,7 +1192,7 @@ pub fn find_use_after_move(
     let mut violations = Vec::new();
     for analysis in analyses {
         for use_ in analysis.use_after_move {
-            violations.push((analysis.function_name.clone(), use_.clone()));
+            violations.push((analysis.function_name.clone(), use_));
         }
     }
 

@@ -46,6 +46,7 @@ pub struct ChangeFrequency {
 }
 
 /// Git repository interface
+#[derive(Debug, Clone)]
 pub struct GitRepo {
     root: std::path::PathBuf,
 }

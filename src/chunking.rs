@@ -7,6 +7,7 @@ use crate::parser::{LanguageParser, ParsedFile};
 use crate::symbols::SymbolKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 /// A chunk of code with context
@@ -30,8 +31,8 @@ pub struct CodeChunk {
     pub chunk_type: ChunkType,
     /// Associated documentation/comments
     pub doc_comment: Option<String>,
-    /// Import statements at file level (for context)
-    pub imports: Vec<String>,
+    /// Import statements at file level (for context), shared by the file's chunks
+    pub imports: Arc<[String]>,
 }
 
 /// Context about the symbol a chunk belongs to
@@ -118,12 +119,12 @@ impl Default for ChunkerConfig {
 
 /// Parameters for creating a top-level code chunk
 struct ToplevelChunkParams<'a> {
-    content: &'a str,
+    lines: &'a [&'a str],
     file_path: &'a str,
     lang: &'a str,
     start: usize,
     end: usize,
-    imports: &'a [String],
+    imports: &'a Arc<[String]>,
     chunk_id: usize,
 }
 
@@ -195,8 +196,11 @@ impl AstChunker {
         // Extract symbol boundaries from AST
         let boundaries = self.extract_boundaries(tree, content, lang);
 
-        // Extract imports for context
-        let imports = self.extract_imports(tree, content, lang);
+        let imports: Arc<[String]> = if self.config.include_context {
+            self.extract_imports(tree, content, lang).into()
+        } else {
+            Arc::default()
+        };
 
         // Create chunks from boundaries
         let mut chunks = Vec::new();
@@ -225,7 +229,7 @@ impl AstChunker {
             if chunk_lines > self.config.max_chunk_lines {
                 // Split large chunks
                 let split_chunks = self.split_large_chunk(
-                    content,
+                    &lines,
                     file_path,
                     lang,
                     boundary,
@@ -235,7 +239,7 @@ impl AstChunker {
                 chunks.extend(split_chunks);
             } else {
                 let chunk = self.create_chunk_from_boundary(
-                    content, file_path, lang, boundary, &imports, chunk_id,
+                    &lines, file_path, lang, boundary, &imports, chunk_id,
                 );
                 chunks.push(chunk);
                 chunk_id += 1;
@@ -253,7 +257,7 @@ impl AstChunker {
                 let end = i - 1;
                 if end >= start + self.config.min_chunk_lines {
                     chunks.push(self.create_toplevel_chunk(ToplevelChunkParams {
-                        content,
+                        lines: &lines,
                         file_path,
                         lang,
                         start,
@@ -272,7 +276,7 @@ impl AstChunker {
             let end = lines.len();
             if end >= start + self.config.min_chunk_lines {
                 chunks.push(self.create_toplevel_chunk(ToplevelChunkParams {
-                    content,
+                    lines: &lines,
                     file_path,
                     lang,
                     start,
@@ -564,17 +568,16 @@ impl AstChunker {
     /// Create a chunk from a symbol boundary
     fn create_chunk_from_boundary(
         &self,
-        content: &str,
+        lines: &[&str],
         file_path: &str,
         lang: &str,
         boundary: &SymbolBoundary,
-        imports: &[String],
+        imports: &Arc<[String]>,
         chunk_id: usize,
     ) -> CodeChunk {
         let start = boundary.doc_start.unwrap_or(boundary.start_line);
         let end = boundary.end_line;
 
-        let lines: Vec<&str> = content.lines().collect();
         let chunk_content = lines
             .get(start.saturating_sub(1)..end.min(lines.len()))
             .map(|ls| ls.join("\n"))
@@ -615,25 +618,20 @@ impl AstChunker {
             symbol_context,
             chunk_type: boundary.chunk_type,
             doc_comment,
-            imports: if self.config.include_context {
-                imports.to_vec()
-            } else {
-                Vec::new()
-            },
+            imports: Arc::clone(imports),
         }
     }
 
     /// Split a large chunk into smaller pieces
     fn split_large_chunk(
         &self,
-        content: &str,
+        lines: &[&str],
         file_path: &str,
         lang: &str,
         boundary: &SymbolBoundary,
-        imports: &[String],
+        imports: &Arc<[String]>,
         chunk_id: &mut usize,
     ) -> Vec<CodeChunk> {
-        let lines: Vec<&str> = content.lines().collect();
         let start = boundary.doc_start.unwrap_or(boundary.start_line);
         let end = boundary.end_line;
         let mut chunks = Vec::new();
@@ -696,10 +694,10 @@ impl AstChunker {
                 } else {
                     None
                 },
-                imports: if self.config.include_context && is_first {
-                    imports.to_vec()
+                imports: if is_first {
+                    Arc::clone(imports)
                 } else {
-                    Vec::new()
+                    Arc::default()
                 },
             });
 
@@ -717,7 +715,7 @@ impl AstChunker {
 
     /// Create a chunk for top-level code
     fn create_toplevel_chunk(&self, params: ToplevelChunkParams<'_>) -> CodeChunk {
-        let lines: Vec<&str> = params.content.lines().collect();
+        let lines = params.lines;
         let chunk_content = lines
             .get(params.start.saturating_sub(1)..params.end.min(lines.len()))
             .map(|ls| ls.join("\n"))
@@ -733,11 +731,7 @@ impl AstChunker {
             symbol_context: None,
             chunk_type: ChunkType::TopLevel,
             doc_comment: None,
-            imports: if self.config.include_context {
-                params.imports.to_vec()
-            } else {
-                Vec::new()
-            },
+            imports: Arc::clone(params.imports),
         }
     }
 
@@ -765,7 +759,7 @@ impl AstChunker {
                 symbol_context: None,
                 chunk_type: ChunkType::TopLevel,
                 doc_comment: None,
-                imports: Vec::new(),
+                imports: Arc::default(),
             });
 
             chunk_id += 1;

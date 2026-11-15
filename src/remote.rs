@@ -12,6 +12,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use octocrab::Octocrab;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,7 +108,10 @@ pub struct RemoteRepoManager {
     /// Temporary directory for clones
     temp_dir: TempDir,
     /// Map of repo identifier to local path
-    cloned_repos: HashMap<String, PathBuf>,
+    cloned_repos: Mutex<HashMap<String, PathBuf>>,
+    /// Held for a whole clone or sparse checkout: clone directories are named
+    /// after the repository alone, so two concurrent clones could share one.
+    clone_lock: tokio::sync::Mutex<()>,
 }
 
 impl RemoteRepoManager {
@@ -135,7 +139,8 @@ impl RemoteRepoManager {
         Ok(Self {
             octocrab: Arc::new(octocrab),
             temp_dir,
-            cloned_repos: HashMap::new(),
+            cloned_repos: Mutex::new(HashMap::new()),
+            clone_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -245,14 +250,15 @@ impl RemoteRepoManager {
 
     /// Clone a remote repository to a temporary location
     /// Returns the path to the cloned repository
-    pub async fn clone_repo(&mut self, remote: &RemoteRepo) -> Result<PathBuf> {
+    pub async fn clone_repo(&self, remote: &RemoteRepo) -> Result<PathBuf> {
         let identifier = remote.identifier();
+        let _clone = self.clone_lock.lock().await;
 
         // Check if already cloned
-        if let Some(path) = self.cloned_repos.get(&identifier) {
+        if let Some(path) = self.cloned_repos.lock().get(&identifier).cloned() {
             if path.exists() {
                 info!("Repository {} already cloned at {:?}", identifier, path);
-                return Ok(path.clone());
+                return Ok(path);
             }
         }
 
@@ -292,19 +298,18 @@ impl RemoteRepoManager {
         info!("Successfully cloned {} to {:?}", identifier, repo_dir);
 
         // Store in map
-        self.cloned_repos.insert(identifier, repo_dir.clone());
+        self.cloned_repos
+            .lock()
+            .insert(identifier, repo_dir.clone());
 
         Ok(repo_dir)
     }
 
     /// Perform a sparse checkout of specific directories
     /// This is more efficient than cloning the entire repo
-    pub async fn sparse_checkout(
-        &mut self,
-        remote: &RemoteRepo,
-        paths: &[&str],
-    ) -> Result<PathBuf> {
+    pub async fn sparse_checkout(&self, remote: &RemoteRepo, paths: &[&str]) -> Result<PathBuf> {
         let identifier = remote.identifier();
+        let _clone = self.clone_lock.lock().await;
         let repo_dir = self.temp_dir.path().join(&remote.repo);
 
         std::fs::create_dir_all(&repo_dir).context("Failed to create repository directory")?;
@@ -391,21 +396,20 @@ impl RemoteRepoManager {
             identifier, repo_dir
         );
 
-        self.cloned_repos.insert(identifier, repo_dir.clone());
+        self.cloned_repos
+            .lock()
+            .insert(identifier, repo_dir.clone());
 
         Ok(repo_dir)
     }
 
     /// Get statistics about cloned repositories
     pub fn get_stats(&self) -> RemoteStats {
-        let total_size: u64 = self
-            .cloned_repos
-            .values()
-            .filter_map(|path| dir_size(path).ok())
-            .sum();
+        let paths: Vec<PathBuf> = self.cloned_repos.lock().values().cloned().collect();
+        let total_size: u64 = paths.iter().filter_map(|path| dir_size(path).ok()).sum();
 
         RemoteStats {
-            cloned_count: self.cloned_repos.len(),
+            cloned_count: paths.len(),
             total_size_bytes: total_size,
             temp_dir: self.temp_dir.path().to_path_buf(),
         }
@@ -413,11 +417,9 @@ impl RemoteRepoManager {
 
     /// Clean up all cloned repositories
     pub fn cleanup(&mut self) {
-        info!(
-            "Cleaning up {} cloned repositories",
-            self.cloned_repos.len()
-        );
-        self.cloned_repos.clear();
+        let cloned_repos = self.cloned_repos.get_mut();
+        info!("Cleaning up {} cloned repositories", cloned_repos.len());
+        cloned_repos.clear();
         // TempDir will be cleaned up on drop
     }
 }

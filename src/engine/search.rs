@@ -322,7 +322,7 @@ impl CodeIntelEngine {
                                 symbol_context: None,
                                 chunk_type: ChunkType::Module,
                                 doc_comment: None,
-                                imports: Vec::new(),
+                                imports: Default::default(),
                             },
                             common as f64 / query_len,
                         ));

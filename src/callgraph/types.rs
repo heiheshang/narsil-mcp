@@ -491,15 +491,15 @@ fn result_type_name(result: Node, source: &[u8]) -> Option<String> {
         return type_name_of(result, source);
     }
     let mut cursor = result.walk();
-    let declarations: Vec<Node> = result
+    let declared = result
         .children(&mut cursor)
         .filter(|child| child.kind() == "parameter_declaration")
-        .collect();
-    declarations.into_iter().find_map(|declaration| {
-        declaration
-            .child_by_field_name("type")
-            .and_then(|declared| type_name_of(declared, source))
-    })
+        .find_map(|declaration| {
+            declaration
+                .child_by_field_name("type")
+                .and_then(|declared| type_name_of(declared, source))
+        });
+    declared
 }
 
 /// The name of a type as written, reduced to the identifier resolution

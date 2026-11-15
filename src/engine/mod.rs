@@ -486,7 +486,7 @@ pub struct CodeIntelEngine {
     /// LSP manager for enhanced code analysis (when lsp is enabled)
     lsp_manager: Option<Arc<LspManager>>,
     /// Remote repository manager for GitHub integration
-    remote_manager: Option<Arc<tokio::sync::Mutex<RemoteRepoManager>>>,
+    remote_manager: Option<RemoteRepoManager>,
     /// Cached security rules engine (avoids reloading rules on each scan)
     security_engine: Arc<crate::security_rules::SecurityRulesEngine>,
     /// Analysis cache for expensive operations (security scans, call graphs, etc.)
@@ -2538,10 +2538,9 @@ impl CodeIntelEngine {
             // requiring it to exist in the current working tree - it only needs to
             // exist at `rev`, which git itself will report if it doesn't.
             validate_relative_path(path)?;
-            let git_repo = self.git_repos.get(repo).ok_or_else(|| {
-                anyhow!("Git not available for {}. Enable with --git flag.", repo)
-            })?;
-            git_repo.show_file_at_ref(rev, path)?
+            let (rev, rel) = (rev.to_owned(), path.to_owned());
+            self.with_git(repo, move |git| git.show_file_at_ref(&rev, &rel))
+                .await?
         } else {
             let file_path = validate_path(&repo_path, path)?;
             std::fs::read_to_string(&file_path).context("Failed to read file")?
@@ -3483,6 +3482,21 @@ impl CodeIntelEngine {
 
     // === Git Integration Methods ===
 
+    /// Runs `f` on a blocking thread: every [`GitRepo`] query waits on a git
+    /// subprocess.
+    async fn with_git<T, F>(&self, repo: &str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&GitRepo) -> Result<T> + Send + 'static,
+    {
+        let git_repo = self
+            .git_repos
+            .get(repo)
+            .map(|entry| entry.clone())
+            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
+        tokio::task::spawn_blocking(move || f(&git_repo)).await?
+    }
+
     /// Get git blame for a file
     pub async fn get_blame(
         &self,
@@ -3495,17 +3509,15 @@ impl CodeIntelEngine {
         // Validate path to prevent traversal attacks
         validate_path(&repo_path, path)?;
 
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let blame = match (start_line, end_line) {
-            (Some(start), Some(end)) => git_repo.blame_range(path, start, end)?,
-            _ => git_repo.blame(path)?,
-        };
-
-        Ok(git_repo.blame_markdown(&blame))
+        let path = path.to_owned();
+        self.with_git(repo, move |git| {
+            let blame = match (start_line, end_line) {
+                (Some(start), Some(end)) => git.blame_range(&path, start, end)?,
+                _ => git.blame(&path)?,
+            };
+            Ok(git.blame_markdown(&blame))
+        })
+        .await
     }
 
     /// Get git history for a file
@@ -3519,13 +3531,12 @@ impl CodeIntelEngine {
         // Validate path to prevent traversal attacks
         validate_path(&repo_path, path)?;
 
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let history = git_repo.file_history(path, max_commits)?;
-        Ok(git_repo.history_markdown(&history))
+        let path = path.to_owned();
+        self.with_git(repo, move |git| {
+            let history = git.file_history(&path, max_commits)?;
+            Ok(git.history_markdown(&history))
+        })
+        .await
     }
 
     /// Get commits that modified a specific symbol/function
@@ -3540,13 +3551,12 @@ impl CodeIntelEngine {
         // Validate path to prevent traversal attacks
         validate_path(&repo_path, path)?;
 
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let history = git_repo.symbol_history(path, symbol, max_commits)?;
-        Ok(git_repo.history_markdown(&history))
+        let (path, symbol) = (path.to_owned(), symbol.to_owned());
+        self.with_git(repo, move |git| {
+            let history = git.symbol_history(&path, &symbol, max_commits)?;
+            Ok(git.history_markdown(&history))
+        })
+        .await
     }
 
     /// Get the diff for a specific commit
@@ -3562,12 +3572,10 @@ impl CodeIntelEngine {
             validate_path(&repo_path, p)?;
         }
 
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let diff = git_repo.commit_diff(commit, path)?;
+        let (rev, rel) = (commit.to_owned(), path.map(str::to_owned));
+        let diff = self
+            .with_git(repo, move |git| git.commit_diff(&rev, rel.as_deref()))
+            .await?;
 
         let mut output = String::new();
         output.push_str(&format!("# Commit Diff: `{}`\n\n", commit));
@@ -3583,13 +3591,11 @@ impl CodeIntelEngine {
 
     /// Get current branch and repository status
     pub async fn get_branch_info(&self, repo: &str) -> Result<String> {
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let branch = git_repo.current_branch()?;
-        let modified = git_repo.modified_files()?;
+        let (branch, modified) = self
+            .with_git(repo, |git| {
+                Ok((git.current_branch()?, git.modified_files()?))
+            })
+            .await?;
 
         let mut output = String::new();
         output.push_str(&format!("# Git Status: {}\n\n", repo));
@@ -3610,12 +3616,7 @@ impl CodeIntelEngine {
 
     /// Get list of modified files in working tree
     pub async fn get_modified_files(&self, repo: &str) -> Result<String> {
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let modified = git_repo.modified_files()?;
+        let modified = self.with_git(repo, |git| git.modified_files()).await?;
 
         let mut output = String::new();
         output.push_str(&format!("# Modified Files in {}\n\n", repo));
@@ -3634,12 +3635,9 @@ impl CodeIntelEngine {
 
     /// Get recent changes across the repository
     pub async fn get_recent_changes(&self, repo: &str, days: u32) -> Result<String> {
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let changes = git_repo.recent_changes(days)?;
+        let changes = self
+            .with_git(repo, move |git| git.recent_changes(days))
+            .await?;
 
         let mut output = String::new();
         output.push_str(&format!("# Recent Changes (last {} days)\n\n", days));
@@ -3666,12 +3664,9 @@ impl CodeIntelEngine {
         days: u32,
         min_complexity: Option<usize>,
     ) -> Result<String> {
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
-        let freq = git_repo.change_frequency(days)?;
+        let freq = self
+            .with_git(repo, move |git| git.change_frequency(days))
+            .await?;
         let complexity = self.max_complexity_by_file(repo);
 
         let mut output = String::new();
@@ -3771,17 +3766,15 @@ impl CodeIntelEngine {
             validate_path(&repo_path, p)?;
         }
 
-        let git_repo = self
-            .git_repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
-
         let mut output = String::new();
 
         match path {
             Some(p) => {
                 output.push_str(&format!("# Contributors to `{}`\n\n", p));
-                let contributors = git_repo.file_contributors(p)?;
+                let rel = p.to_owned();
+                let contributors = self
+                    .with_git(repo, move |git| git.file_contributors(&rel))
+                    .await?;
 
                 if contributors.is_empty() {
                     output.push_str("*No contributors found for this file.*\n");
@@ -3793,7 +3786,7 @@ impl CodeIntelEngine {
             }
             None => {
                 output.push_str(&format!("# Repository Contributors: {}\n\n", repo));
-                let contributors = git_repo.repo_contributors()?;
+                let contributors = self.with_git(repo, |git| git.repo_contributors()).await?;
 
                 if contributors.is_empty() {
                     output.push_str("*No contributors found.*\n");
@@ -5166,7 +5159,7 @@ impl CodeIntelEngine {
     pub fn init_remote_manager(&mut self) -> Result<()> {
         if self.remote_manager.is_none() {
             let manager = RemoteRepoManager::new()?;
-            self.remote_manager = Some(Arc::new(tokio::sync::Mutex::new(manager)));
+            self.remote_manager = Some(manager);
             info!("Remote repository manager initialized");
         }
         Ok(())
@@ -5180,7 +5173,7 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         // Initialize manager if needed
         let manager = match &self.remote_manager {
-            Some(m) => m.clone(),
+            Some(m) => m,
             None => {
                 return Err(anyhow!(
                     "Remote repository support not initialized. Use init_remote_manager() first."
@@ -5201,19 +5194,16 @@ impl CodeIntelEngine {
         }
         output.push('\n');
 
-        let local_path = {
-            let mut mgr = manager.lock().await;
-            if let Some(paths) = sparse_paths {
-                let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                output.push_str(&format!(
-                    "Performing sparse checkout of {} paths...\n\n",
-                    paths.len()
-                ));
-                mgr.sparse_checkout(&remote, &path_refs).await?
-            } else {
-                output.push_str("Cloning repository...\n\n");
-                mgr.clone_repo(&remote).await?
-            }
+        let local_path = if let Some(paths) = sparse_paths {
+            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            output.push_str(&format!(
+                "Performing sparse checkout of {} paths...\n\n",
+                paths.len()
+            ));
+            manager.sparse_checkout(&remote, &path_refs).await?
+        } else {
+            output.push_str("Cloning repository...\n\n");
+            manager.clone_repo(&remote).await?
         };
 
         output.push_str(&format!("**Local Path**: `{}`\n\n", local_path.display()));
@@ -5228,7 +5218,7 @@ impl CodeIntelEngine {
     /// List files in a remote GitHub repository via API
     pub async fn list_remote_files(&self, url: &str, path: Option<&str>) -> Result<String> {
         let manager = match &self.remote_manager {
-            Some(m) => m.clone(),
+            Some(m) => m,
             None => {
                 // Try to create a temporary manager for API-only operation
                 let mgr = RemoteRepoManager::new()?;
@@ -5250,10 +5240,7 @@ impl CodeIntelEngine {
 
         let remote = crate::remote::RemoteRepo::from_url(url)?;
 
-        let files = {
-            let mgr = manager.lock().await;
-            mgr.list_files(&remote, path).await?
-        };
+        let files = manager.list_files(&remote, path).await?;
 
         let mut output = String::new();
         output.push_str(&format!("# Files in {}\n\n", remote.identifier()));
@@ -5275,7 +5262,7 @@ impl CodeIntelEngine {
     /// Fetch a specific file from a remote GitHub repository
     pub async fn get_remote_file(&self, url: &str, path: &str) -> Result<String> {
         let manager = match &self.remote_manager {
-            Some(m) => m.clone(),
+            Some(m) => m,
             None => {
                 // Try to create a temporary manager for API-only operation
                 let mgr = RemoteRepoManager::new()?;
@@ -5295,16 +5282,12 @@ impl CodeIntelEngine {
 
         let remote = crate::remote::RemoteRepo::from_url(url)?;
 
-        let content = {
-            let mgr = manager.lock().await;
-            mgr.get_file(&remote, path).await?
-        };
+        let content = manager.get_file(&remote, path).await?;
 
         let mut output = String::new();
         output.push_str(&format!("# {} from {}\n\n", path, remote.identifier()));
 
-        let lines: Vec<&str> = content.lines().collect();
-        output.push_str(&format!("**Lines**: {}\n\n", lines.len()));
+        output.push_str(&format!("**Lines**: {}\n\n", content.lines().count()));
 
         output.push_str("```");
         output.push_str(get_language_id(path));
@@ -7569,7 +7552,7 @@ impl CodeIntelEngine {
                         .strip_prefix(&repo_path)
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|_| path.to_string_lossy().to_string());
-                    output.push_str(&rel_path.to_string());
+                    output.push_str(&rel_path);
                     if j < cycle.len() - 1 {
                         output.push_str(" -> ");
                     }
@@ -7645,13 +7628,9 @@ impl CodeIntelEngine {
                     resolver.register_imports(&file_path, imports);
 
                     // Extract exports from symbols in this file
-                    let file_symbols: Vec<_> = symbols
+                    let exports: Vec<ExportedSymbol> = symbols
                         .iter()
                         .filter(|s| s.file_path == symbol.file_path)
-                        .collect();
-
-                    let exports: Vec<ExportedSymbol> = file_symbols
-                        .into_iter()
                         .filter_map(|s| {
                             // Determine if symbol is public from signature
                             let is_public = s

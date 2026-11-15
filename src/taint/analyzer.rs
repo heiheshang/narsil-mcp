@@ -632,7 +632,7 @@ impl TaintAnalyzer {
                     for tainted_var in tainted_vars.clone() {
                         if args.contains(&tainted_var) {
                             // The base collection becomes tainted
-                            tainted_vars.insert(base.clone());
+                            tainted_vars.insert(base);
                             break;
                         }
                     }
