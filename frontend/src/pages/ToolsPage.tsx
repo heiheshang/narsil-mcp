@@ -100,7 +100,27 @@ export function ToolsPage() {
                         API key
                       </span>
                     )}
+                    {tool.annotations.readOnlyHint && (
+                      <span className="px-2 py-1 rounded bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-300">
+                        Read only
+                      </span>
+                    )}
+                    {tool.annotations.idempotentHint && (
+                      <span className="px-2 py-1 rounded bg-cyan-50 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-300">
+                        Idempotent
+                      </span>
+                    )}
                   </div>
+
+                  {(tool.annotations.title ||
+                    tool.annotations.destructiveHint ||
+                    tool.annotations.openWorldHint) && (
+                    <div className="text-xs text-slate-500 dark:text-slate-400 mb-3 space-y-1">
+                      {tool.annotations.title && <p>Title: {tool.annotations.title}</p>}
+                      {tool.annotations.destructiveHint && <p>May modify repository state.</p>}
+                      {tool.annotations.openWorldHint && <p>May depend on external state.</p>}
+                    </div>
+                  )}
 
                   {tool.required_flags.length > 0 && (
                     <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">

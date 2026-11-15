@@ -105,7 +105,7 @@ For **Claude Code** users, we provide a plugin with slash commands and a skill f
 **Install via Marketplace (Recommended):**
 ```shell
 # Add the narsil-mcp marketplace
-/plugin marketplace add postrv/narsil-mcp
+/plugin marketplace add heiheshang/narsil-mcp
 
 # Install the plugin
 /plugin install narsil@narsil-mcp
@@ -113,7 +113,7 @@ For **Claude Code** users, we provide a plugin with slash commands and a skill f
 
 **Or install directly from GitHub:**
 ```shell
-/plugin install github:postrv/narsil-mcp/narsil-plugin
+/plugin install github:heiheshang/narsil-mcp/narsil-plugin
 ```
 
 **What's included:**

@@ -408,6 +408,7 @@ pub struct ToolInfo {
     tags: Vec<String>,
     aliases: Vec<String>,
     input_schema: Value,
+    annotations: Value,
 }
 
 impl HttpServer {
@@ -570,6 +571,7 @@ async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
                     tags,
                     aliases,
                     input_schema: meta.input_schema.clone(),
+                    annotations: meta.mcp_annotations(),
                 }
             })
         })

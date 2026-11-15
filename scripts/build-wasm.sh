@@ -120,11 +120,11 @@ cat > "$OUTPUT_DIR/package.json" << 'EOF'
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/postrv/narsil-mcp.git"
+    "url": "https://github.com/heiheshang/narsil-mcp.git"
   },
-  "homepage": "https://github.com/postrv/narsil-mcp#readme",
+  "homepage": "https://github.com/heiheshang/narsil-mcp#readme",
   "bugs": {
-    "url": "https://github.com/postrv/narsil-mcp/issues"
+    "url": "https://github.com/heiheshang/narsil-mcp/issues"
   }
 }
 EOF
