@@ -1158,6 +1158,104 @@ fn test_constructor_chained_call_resolves_by_constructed_type() {
 /// The hint is only taken when a namesake is actually defined on a type of
 /// that name — a chained call whose inner name is not a factory, or names a
 /// type nothing matches, must stay the guess it was.
+/// A factory taken out of the container into a variable first:
+/// `organisationUse := app.UseCase.OrganisationContainer.OrganisationUseFactory`
+/// and later `organisationUse(nil).Create(...)`. The call site names only the
+/// variable, so the factory name has to come from the binding.
+#[test]
+fn test_go_factory_held_in_a_variable_resolves_like_a_direct_factory_call() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "test/helper/fixture/fixture.go",
+            r#"
+package fixture
+
+func LoadFixture(appContainer *app.AppContainer) {
+	organisationUse := appContainer.UseCase.OrganisationContainer.OrganisationUseFactory
+	organisationUse(nil).Create("a", "a")
+}
+
+func viaParameter(repoFactory organisation_repo.OrganisationRepoFactory) {
+	repoFactory(nil).Save(nil)
+}
+"#,
+        ),
+        (
+            "internal/usecase/organisation/impl/organisation.go",
+            r#"
+package impl
+
+type OrganisationUse struct{}
+
+func (self *OrganisationUse) Create(name string, code string) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/usecase/bank/impl/bank.go",
+            r#"
+package impl
+
+type BankUse struct{}
+
+func (self *BankUse) Create(name string, code string) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/model/organisation/repository/impl/organisation.go",
+            r#"
+package impl
+
+type OrganisationRepo struct{}
+
+func (self *OrganisationRepo) Save(o *Organisation) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/model/bank/repository/impl/bank.go",
+            r#"
+package impl
+
+type BankRepo struct{}
+
+func (self *BankRepo) Save(o *Bank) error {
+	return nil
+}
+"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let create_callers = call_graph.get_callers("OrganisationUse.Create");
+    assert_eq!(create_callers.len(), 1, "got {create_callers:?}");
+    assert!(create_callers[0].target.ends_with("::LoadFixture"));
+    assert_eq!(
+        create_callers[0].resolution,
+        CallResolution::FactoryReceiver
+    );
+    assert!(call_graph.get_callers("BankUse.Create").is_empty());
+
+    let save_callers = call_graph.get_callers("OrganisationRepo.Save");
+    assert_eq!(save_callers.len(), 1, "got {save_callers:?}");
+    assert!(save_callers[0].target.ends_with("::viaParameter"));
+    assert!(call_graph.get_callers("BankRepo.Save").is_empty());
+}
+
 #[test]
 fn test_chained_call_without_factory_naming_stays_a_name_match() {
     let parser = LanguageParser::new().unwrap();

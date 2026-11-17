@@ -12,3 +12,6 @@
 # 4: Go package-level const/var as symbols; the only Go fixture has none, so
 # the hash is the version 1 one.
 4 symbols 8ee212593f8368da215a54ac67673f5c56a605d91ebb5d7f83e182446ef14224
+# 5: Go call graph resolves a factory held in a variable or parameter; the
+# fixtures have no such call, so the hash is the version 1 one.
+5 call_graph 665286e61d3dcfcebe3935812861ec21d40f2b0cf015af37bcd027e58286bf2f

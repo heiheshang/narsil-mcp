@@ -351,6 +351,10 @@ enum LocalKind {
     /// into someone else's code, and the honest answer for them is "not in the
     /// graph" — not this corpus's first `Error` by sort order.
     Foreign,
+    /// Bound to a factory value rather than a call result:
+    /// `useFactory := deps.OrganisationUseFactory`. Calling the name yields
+    /// the type the factory name stands for.
+    Factory(String),
 }
 
 /// What the walk knows about the function it is currently inside: its graph
@@ -388,6 +392,17 @@ impl<'a> CallCtx<'a> {
         match self.declared(name) {
             Some(LocalKind::Type(type_name)) => Some(type_name.as_str()),
             _ => None,
+        }
+    }
+
+    /// The type a call of a local name produces when the name holds a
+    /// factory: bound from one (`f := deps.XFactory`) or declared with a
+    /// factory type (`f organisation.XFactory`).
+    fn local_factory_product(&self, name: &str) -> Option<String> {
+        match self.declared(name)? {
+            LocalKind::Factory(product) => Some(product.clone()),
+            LocalKind::Type(type_name) => CallGraph::factory_type_hint(type_name),
+            LocalKind::Foreign => None,
         }
     }
 
@@ -1191,6 +1206,8 @@ impl CallGraph {
                     if values.len() == 1 && single_meaningful_name {
                         if let Some(type_name) = self.expression_type_hint(values[0], source, ctx) {
                             locals.insert(names[0].clone(), LocalKind::Type(type_name));
+                        } else if let Some(product) = Self::factory_value_hint(values[0], source) {
+                            locals.insert(names[0].clone(), LocalKind::Factory(product));
                         }
                     }
                 }
@@ -1254,6 +1271,17 @@ impl CallGraph {
             }
             _ => None,
         }
+    }
+
+    /// The type a factory produces, when the expression is the factory itself
+    /// rather than a call of it: `deps.OrganisationUseFactory`, `NewStore`.
+    fn factory_value_hint(node: Node, source: &[u8]) -> Option<String> {
+        let name = match node.kind() {
+            "identifier" => node,
+            "selector_expression" => node.child_by_field_name("field")?,
+            _ => return None,
+        };
+        Self::factory_type_hint(name.utf8_text(source).ok()?)
     }
 
     /// Package name (or alias) -> import path, for the file's imports.
@@ -2991,6 +3019,12 @@ impl CallGraph {
         // — a factory held in a struct field, most of this corpus.
         let (callee, _) = Self::callee_slot(operand)?;
         let described = self.describe_callee_in(callee, source, ctx)?;
+        // A local shadows any function of the same name.
+        if described.1 == CallType::Direct && described.2.is_none() {
+            if let Some(product) = ctx.local_factory_product(&described.0) {
+                return Some((product, true));
+            }
+        }
         // A declared result type was read; a factory name was only inferred.
         // The flag is what keeps the two apart in the reported resolution.
         if let Some(declared) = self.call_result_type(&described, ctx) {
