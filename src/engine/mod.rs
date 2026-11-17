@@ -286,6 +286,19 @@ mod file_pattern_tests {
     }
 
     #[test]
+    fn compile_file_pattern_bare_names_in_braces_match_any_depth() {
+        let fp = CodeIntelEngine::compile_file_pattern("{fixture.go,organisation.go}").unwrap();
+        assert!(fp.matches("test/helper/fixture/fixture.go"));
+        assert!(fp.matches("internal/usecase/organisation/impl/organisation.go"));
+        assert!(!fp.matches("internal/usecase/bank/impl/bank.go"));
+
+        let mixed =
+            CodeIntelEngine::compile_file_pattern("{internal/config/*.go,fixture.go}").unwrap();
+        assert!(mixed.matches("internal/config/config.go"));
+        assert!(mixed.matches("test/helper/fixture/fixture.go"));
+    }
+
+    #[test]
     fn compile_file_pattern_rejects_bad_glob() {
         assert!(CodeIntelEngine::compile_file_pattern("src/[").is_err());
         assert!(CodeIntelEngine::compile_file_pattern("**/*.{json").is_err());
@@ -1906,22 +1919,24 @@ impl CodeIntelEngine {
     /// treat `{` literally, matching nothing — and an invalid glob is a hard
     /// error instead of a silently-dropped filter.
     fn compile_file_pattern(pattern: &str) -> Result<FilePattern> {
-        let has_wildcard = pattern.contains(['*', '?', '[', '{']);
-        let normalized = if !pattern.contains('/') && !has_wildcard {
-            format!("**/{}", pattern)
-        } else {
-            pattern.to_string()
-        };
-        let expanded = expand_braces(&normalized).map_err(|e| {
+        let expanded = expand_braces(pattern).map_err(|e| {
             anyhow::anyhow!(
                 "Invalid file pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.{{rs,toml}}')",
                 pattern,
                 e
             )
         })?;
+        // Each alternative is its own pattern: `{a.go,src/*.rs}` is a bare
+        // file name and a path, and only the former matches at any depth.
         let patterns = expanded
             .iter()
-            .map(|alt| glob::Pattern::new(alt))
+            .map(|alt| {
+                if alt.contains('/') || alt.contains(['*', '?', '[']) {
+                    glob::Pattern::new(alt)
+                } else {
+                    glob::Pattern::new(&format!("**/{}", alt))
+                }
+            })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
                 anyhow::anyhow!(
