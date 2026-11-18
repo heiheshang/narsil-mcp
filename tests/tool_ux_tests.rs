@@ -1187,6 +1187,55 @@ impl Big {
     Ok(())
 }
 
+/// Two Go types named `AuthUse` in different packages: a short name
+/// narrows to the type but not to one function, so the answer lists the
+/// callers of every candidate instead of the alphabetically first only.
+#[tokio::test]
+async fn get_callers_answers_every_candidate_of_an_ambiguous_name() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "internal/usecase/auth/impl/auth.go",
+        "package impl\n\ntype AuthUse struct{}\n\nfunc (self *AuthUse) authenticateUser() error { return nil }\n\nfunc (self *AuthUse) AuthJWT() error {\n\treturn self.authenticateUser()\n}\n",
+    )?;
+    repo.add_file(
+        "internal/module/payout/usecase/auth/impl/auth.go",
+        "package impl\n\ntype AuthUse struct{}\n\nfunc (self *AuthUse) authenticateUser() error { return nil }\n\nfunc (self *AuthUse) AuthJWTWithRefresh() error {\n\treturn self.authenticateUser()\n}\n",
+    )?;
+    let (engine, _idx) = engine_with(
+        &repo,
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: true,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let report = engine
+        .get_callers(&repo.name(), "AuthUse::authenticateUser", false, 1, None)
+        .await?;
+    assert!(report.contains("Ambiguous name"), "{report}");
+    assert!(report.contains("the others follow below"), "{report}");
+    assert!(report.contains("AuthUse::AuthJWT`"), "{report}");
+    assert!(report.contains("AuthUse::AuthJWTWithRefresh`"), "{report}");
+
+    let exact = engine
+        .get_callers(
+            &repo.name(),
+            "internal/usecase/auth/impl/auth.go::AuthUse::authenticateUser",
+            false,
+            1,
+            None,
+        )
+        .await?;
+    assert!(!exact.contains("Ambiguous name"), "{exact}");
+    assert!(!exact.contains("AuthJWTWithRefresh"), "{exact}");
+
+    Ok(())
+}
+
 fn git(repo: &TestRepo, args: &[&str]) -> Result<()> {
     let status = std::process::Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])

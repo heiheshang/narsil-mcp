@@ -22,6 +22,7 @@
 use crate::FastMap;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -41,6 +42,10 @@ pub struct Field {
     pub name: String,
     pub type_name: String,
     pub embedded: bool,
+    /// Import path of the package the type was written with
+    /// (`auth_use.AuthUseFactory` -> `go-rest-api/internal/usecase/auth`).
+    /// Two packages may declare types of one name; this says which is meant.
+    pub package: Option<String>,
 }
 
 /// One method an interface requires, with the type it returns — which is how a
@@ -67,12 +72,8 @@ pub struct TypeDecl {
 }
 
 impl TypeDecl {
-    /// The type of a named field, if the type has one.
-    fn field_type(&self, field: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .find(|candidate| candidate.name == field)
-            .map(|found| found.type_name.as_str())
+    fn field(&self, field: &str) -> Option<&Field> {
+        self.fields.iter().find(|candidate| candidate.name == field)
     }
 }
 
@@ -136,6 +137,19 @@ impl TypeIndex {
         for (file, names) in snapshot.by_file {
             self.by_file.insert(file, names);
         }
+    }
+
+    /// The directory of an indexed file declaring a type, among those
+    /// `matches_dir` accepts.
+    ///
+    /// A package of interfaces and factory types has no function at all, so
+    /// the call graph's own file list cannot find its directory.
+    pub fn dir_with_types(&self, matches_dir: &dyn Fn(&str) -> bool) -> Option<String> {
+        self.by_file.iter().find_map(|entry| {
+            let path = entry.key();
+            let dir = &path[..=path.rfind('/')?];
+            matches_dir(dir).then(|| dir.to_string())
+        })
     }
 
     /// Number of distinct type names held, for memory reporting.
@@ -222,8 +236,35 @@ impl TypeIndex {
         prefer_dir: Option<&str>,
     ) -> Option<String> {
         self.walk_from(type_name, 4, prefer_dir, &mut |decl| {
-            decl.field_type(field).map(|found| found.to_string())
+            decl.field(field).map(|found| found.type_name.clone())
         })
+    }
+
+    /// The type of a field together with the import path of the package it
+    /// was written with, for walking a chain of fields across packages that
+    /// reuse type names (`UseCaseContainer` in three registrators).
+    pub fn field_info(
+        &self,
+        type_name: &str,
+        field: &str,
+        prefer_dir: Option<&str>,
+    ) -> Option<(String, Option<String>)> {
+        self.walk_from(type_name, 4, prefer_dir, &mut |decl| {
+            decl.field(field)
+                .map(|found| (found.type_name.clone(), found.package.clone()))
+        })
+    }
+
+    /// Import path of the package `type_name`'s field `field` is typed from,
+    /// when the field's type was written with a package qualifier.
+    pub fn field_package(
+        &self,
+        type_name: &str,
+        field: &str,
+        prefer_dir: Option<&str>,
+    ) -> Option<String> {
+        self.field_info(type_name, field, prefer_dir)
+            .and_then(|(_, package)| package)
     }
 
     /// Names of the types `type_name` embeds, outermost first, following
@@ -337,6 +378,7 @@ impl TypeIndex {
 /// resolution can never use.
 fn collect_go_types(path: &str, root: Node, source: &[u8]) -> Vec<TypeDecl> {
     let mut declarations = Vec::new();
+    let imports = crate::callgraph::go_imports(root, source);
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() != "type_declaration" {
@@ -346,7 +388,7 @@ fn collect_go_types(path: &str, root: Node, source: &[u8]) -> Vec<TypeDecl> {
         for spec in child.children(&mut spec_cursor) {
             match spec.kind() {
                 "type_spec" => {
-                    if let Some(decl) = type_spec_decl(path, spec, source) {
+                    if let Some(decl) = type_spec_decl(path, spec, source, &imports) {
                         declarations.push(decl);
                     }
                 }
@@ -372,13 +414,18 @@ fn collect_go_types(path: &str, root: Node, source: &[u8]) -> Vec<TypeDecl> {
     declarations
 }
 
-fn type_spec_decl(path: &str, spec: Node, source: &[u8]) -> Option<TypeDecl> {
+fn type_spec_decl(
+    path: &str,
+    spec: Node,
+    source: &[u8],
+    imports: &HashMap<String, String>,
+) -> Option<TypeDecl> {
     let name = field_text(spec, "name", source)?;
     let body = spec.child_by_field_name("type")?;
     let (kind, fields, methods, aliased) = match body.kind() {
         "struct_type" => (
             TypeKind::Struct,
-            struct_fields(body, source),
+            struct_fields(body, source, imports),
             Vec::new(),
             None,
         ),
@@ -407,7 +454,11 @@ fn type_spec_decl(path: &str, spec: Node, source: &[u8]) -> Option<TypeDecl> {
     })
 }
 
-fn struct_fields(struct_type: Node, source: &[u8]) -> Vec<Field> {
+fn struct_fields(
+    struct_type: Node,
+    source: &[u8],
+    imports: &HashMap<String, String>,
+) -> Vec<Field> {
     let mut fields = Vec::new();
     let mut finder = struct_type.walk();
     let list = struct_type.child_by_field_name("body").or_else(|| {
@@ -423,11 +474,18 @@ fn struct_fields(struct_type: Node, source: &[u8]) -> Vec<Field> {
         if declaration.kind() != "field_declaration" {
             continue;
         }
-        let Some(type_name) = declaration
-            .child_by_field_name("type")
-            .and_then(|node| type_name_of(node, source))
-        else {
+        let Some(declared) = declaration.child_by_field_name("type") else {
             continue;
+        };
+        let Some(type_name) = type_name_of(declared, source) else {
+            continue;
+        };
+        let package = match classify_type(declared, source) {
+            TypeRef::Named {
+                package: Some(alias),
+                ..
+            } => imports.get(&alias).cloned(),
+            _ => None,
         };
         let names = field_names(declaration, source);
         if names.is_empty() {
@@ -437,6 +495,7 @@ fn struct_fields(struct_type: Node, source: &[u8]) -> Vec<Field> {
                 name: type_name.clone(),
                 type_name,
                 embedded: true,
+                package,
             });
             continue;
         }
@@ -445,6 +504,7 @@ fn struct_fields(struct_type: Node, source: &[u8]) -> Vec<Field> {
                 name,
                 type_name: type_name.clone(),
                 embedded: false,
+                package: package.clone(),
             });
         }
     }
