@@ -61,7 +61,10 @@ pub struct CallEdge {
     pub column: usize,
     /// Is this a direct call or through a reference/closure?
     pub call_type: CallType,
-    /// Scope qualifier from the call site (e.g. "App" from `App::run()`)
+    /// Scope qualifier from the call site (e.g. "App" from `App::run()`).
+    /// A receiver type inferred from a Go factory may carry the directory of
+    /// the factory's package before it, `internal/usecase/auth/AuthUse`;
+    /// receiver matching only ever compares the part after the last `/`.
     #[serde(default)]
     pub scope_hint: Option<Arc<str>>,
     /// Whether the target was resolved to a known function in the graph.
@@ -1287,58 +1290,6 @@ impl CallGraph {
         Some(self.with_factory_package(product, node, source, ctx))
     }
 
-    /// Package name (or alias) -> import path, for the file's imports.
-    ///
-    /// Go's `assert.Len(t, x, 3)` and `config.Get()` look identical to the
-    /// resolver: a qualifier that names neither a receiver type nor a local
-    /// variable. The import list is what tells them apart — one is a third
-    /// party the index has never seen, the other is a package of this very
-    /// repository — and [`resolve_package_qualified`](Self::resolve_package_qualified)
-    /// turns that into either an honest `Unresolved` or a target narrowed to
-    /// the right directory.
-    ///
-    /// Go-shaped `import_spec` only. Python's `from x import y` and JS's
-    /// namespace imports bind names differently and would need their own
-    /// handling rather than sharing this one.
-    pub(crate) fn collect_imports(root: Node, source: &[u8]) -> HashMap<String, String> {
-        let mut imports = HashMap::new();
-        let mut cursor = root.walk();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "import_spec" {
-                let Some(path) = node
-                    .child_by_field_name("path")
-                    .and_then(|path| path.utf8_text(source).ok())
-                    .map(|path| path.trim_matches(['"', '`', '\''].as_slice()).to_string())
-                else {
-                    continue;
-                };
-                let alias = node
-                    .child_by_field_name("name")
-                    .and_then(|name| name.utf8_text(source).ok())
-                    .map(|name| name.to_string());
-                let name = match alias.as_deref() {
-                    // `_ "pkg"` imports for side effects and `. "pkg"` dumps
-                    // the package into the file scope: neither binds a
-                    // qualifier a call site can carry.
-                    Some("_") | Some(".") => continue,
-                    Some(alias) => alias.to_string(),
-                    None => path.rsplit('/').next().unwrap_or(&path).to_string(),
-                };
-                imports.insert(name, path);
-                continue;
-            }
-            for child in node.children(&mut cursor) {
-                // Imports sit at the top of a file; no need to walk into
-                // function bodies looking for them.
-                if child.is_named() && !child.kind().contains("function") {
-                    stack.push(child);
-                }
-            }
-        }
-        imports
-    }
-
     /// The directory of the indexed package an import path names, or `None`
     /// when no indexed file lives there — meaning the package is third-party,
     /// standard library, or simply not part of this index.
@@ -1469,7 +1420,7 @@ impl CallGraph {
         let mut cursor = tree.walk();
 
         // Track current function scope
-        let imports = Self::collect_imports(tree.root_node(), source);
+        let imports = go_imports(tree.root_node(), source);
         let file = FileScope {
             path,
             imports: &imports,
@@ -2618,29 +2569,34 @@ impl CallGraph {
         if let Some(hint) = scope_hint {
             let (package_dir, scope) = Self::split_scope(hint);
             if let Some(candidates) = self.name_index.get(bare_name) {
-                let by_receiver: Vec<&String> = candidates
-                    .iter()
-                    .filter(|key| self.receiver_matches(key, scope, true))
-                    .collect();
                 let resolution = if scope_inferred {
                     CallResolution::FactoryReceiver
                 } else {
                     CallResolution::Receiver
                 };
-                if let [only] = by_receiver.as_slice() {
-                    return ((*only).clone(), resolution);
-                }
-                if by_receiver.len() > 1 {
-                    // The package the factory was declared from names the
-                    // implementation's tree: `internal/usecase/auth/` holds
-                    // `impl/auth.go::AuthUse`, a payout module's does not.
-                    if let Some(dir) = package_dir {
-                        let mut in_package = by_receiver.iter().filter(|key| key.starts_with(dir));
-                        if let (Some(first), None) = (in_package.next(), in_package.next()) {
-                            return ((*first).clone(), resolution);
+                let mut by_receiver = candidates
+                    .iter()
+                    .filter(|key| self.receiver_matches(key, scope, true));
+                match (by_receiver.next(), by_receiver.next()) {
+                    (Some(only), None) => return (only.clone(), resolution),
+                    (Some(first), Some(second)) => {
+                        receiver_pool = [first, second]
+                            .into_iter()
+                            .chain(by_receiver)
+                            .cloned()
+                            .collect();
+                        // The package the factory was declared from names the
+                        // implementation's tree: `internal/usecase/auth/` holds
+                        // `impl/auth.go::AuthUse`, a payout module's does not.
+                        if let Some(dir) = package_dir {
+                            let mut in_package =
+                                receiver_pool.iter().filter(|key| key.starts_with(dir));
+                            if let (Some(found), None) = (in_package.next(), in_package.next()) {
+                                return (found.clone(), resolution);
+                            }
                         }
                     }
-                    receiver_pool = by_receiver.iter().map(|key| (*key).clone()).collect();
+                    _ => {}
                 }
 
                 // 0c. The qualifier names an interface: dispatch is dynamic,
@@ -3196,7 +3152,10 @@ impl CallGraph {
     /// [`with_factory_package`](Self::with_factory_package)) and the type.
     fn split_scope(scope: &str) -> (Option<&str>, &str) {
         match scope.rfind('/') {
-            Some(slash) => (Some(&scope[..=slash]), &scope[slash + 1..]),
+            Some(slash) => {
+                let (dir, type_name) = scope.split_at(slash + 1);
+                (Some(dir), type_name)
+            }
             None => (None, scope),
         }
     }
@@ -4849,6 +4808,60 @@ fn bsl_module_event(file_path: &str, procedure: &str) -> Option<&'static str> {
         .iter()
         .any(|(ru, en)| procedure == *ru || procedure == *en)
         .then_some(*module)
+}
+
+/// Package name (or alias) -> import path, for one Go file's imports.
+///
+/// Go's `assert.Len(t, x, 3)` and `config.Get()` look identical to the
+/// resolver: a qualifier that names neither a receiver type nor a local
+/// variable. The import list is what tells them apart — one is a third
+/// party the index has never seen, the other is a package of this very
+/// repository — and [`CallGraph::resolve_package_qualified`] turns that into
+/// either an honest `Unresolved` or a target narrowed to the right directory.
+///
+/// Go-shaped `import_spec` only. Python's `from x import y` and JS's
+/// namespace imports bind names differently and would need their own
+/// handling rather than sharing this one.
+///
+/// Also read by the type index, which records the package a struct field's
+/// type was written with.
+pub(crate) fn go_imports(root: Node, source: &[u8]) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "import_spec" {
+            let Some(path) = node
+                .child_by_field_name("path")
+                .and_then(|path| path.utf8_text(source).ok())
+                .map(|path| path.trim_matches(['"', '`', '\''].as_slice()).to_string())
+            else {
+                continue;
+            };
+            let alias = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+                .map(|name| name.to_string());
+            let name = match alias.as_deref() {
+                // `_ "pkg"` imports for side effects and `. "pkg"` dumps
+                // the package into the file scope: neither binds a
+                // qualifier a call site can carry.
+                Some("_") | Some(".") => continue,
+                Some(alias) => alias.to_string(),
+                None => path.rsplit('/').next().unwrap_or(&path).to_string(),
+            };
+            imports.insert(name, path);
+            continue;
+        }
+        for child in node.children(&mut cursor) {
+            // Imports sit at the top of a file; no need to walk into
+            // function bodies looking for them.
+            if child.is_named() && !child.kind().contains("function") {
+                stack.push(child);
+            }
+        }
+    }
+    imports
 }
 
 #[cfg(test)]

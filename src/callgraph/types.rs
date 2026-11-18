@@ -141,6 +141,7 @@ impl TypeIndex {
 
     /// The directory of an indexed file declaring a type, among those
     /// `matches_dir` accepts.
+    ///
     /// A package of interfaces and factory types has no function at all, so
     /// the call graph's own file list cannot find its directory.
     pub fn dir_with_types(&self, matches_dir: &dyn Fn(&str) -> bool) -> Option<String> {
@@ -262,10 +263,8 @@ impl TypeIndex {
         field: &str,
         prefer_dir: Option<&str>,
     ) -> Option<String> {
-        self.walk_from(type_name, 4, prefer_dir, &mut |decl| {
-            decl.field(field).map(|found| found.package.clone())
-        })
-        .flatten()
+        self.field_info(type_name, field, prefer_dir)
+            .and_then(|(_, package)| package)
     }
 
     /// Names of the types `type_name` embeds, outermost first, following
@@ -379,7 +378,7 @@ impl TypeIndex {
 /// resolution can never use.
 fn collect_go_types(path: &str, root: Node, source: &[u8]) -> Vec<TypeDecl> {
     let mut declarations = Vec::new();
-    let imports = crate::callgraph::CallGraph::collect_imports(root, source);
+    let imports = crate::callgraph::go_imports(root, source);
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() != "type_declaration" {

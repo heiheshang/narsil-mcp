@@ -57,6 +57,15 @@ fn symbol_kind_to_doc_type(kind: &SymbolKind) -> DocType {
 /// How many namesakes of an ambiguous name `get_callers` answers in full.
 const AMBIGUOUS_CALLERS_SHOWN: usize = 4;
 
+/// The functions sharing the name a tool was asked about.
+struct Namesakes {
+    total: usize,
+    /// More than one of them fits the name as given.
+    ambiguous: bool,
+    /// The ones not reported on first, in the order to list them.
+    others: Vec<String>,
+}
+
 /// A compiled user file glob: one `glob::Pattern` per brace alternative,
 /// matching when any alternative matches.
 #[derive(Debug, Clone)]
@@ -4578,62 +4587,65 @@ impl CodeIntelEngine {
         output
     }
 
-    /// Note which graph node a query resolved to, and warn when the bare name
-    /// is shared by several functions (overloads, same-named methods on
-    /// different types), since only one of them is being reported on.
-    /// The other functions `function` could have meant, when the name the
-    /// caller gave does not single one out; empty when it does.
-    fn ambiguous_namesakes(call_graph: &CallGraph, function: &str, resolved: &str) -> Vec<String> {
-        // An exact graph key is an explicit choice: nothing to resolve, and no
-        // point warning about the other functions sharing the name.
+    /// Every function named like `function`, and whether the name the caller
+    /// gave leaves more than one of them in play. `None` for an exact graph
+    /// key: an explicit choice, with nothing to resolve.
+    fn namesakes(call_graph: &CallGraph, function: &str, resolved: &str) -> Option<Namesakes> {
         if resolved == function {
-            return Vec::new();
+            return None;
         }
-        let candidates = call_graph.find_all_functions(CallGraph::bare_name(function));
+        let all = call_graph.find_all_functions(CallGraph::bare_name(function));
         // `Big::with_options` names one of the `with_options` functions; only
         // namesakes the qualifier does not rule out make the answer a guess.
+        // `AuthUse::authenticateUser` with two `AuthUse` types narrows the
+        // field without settling it.
         let qualified = format!("::{}", function.replace("->", "::").replace('.', "::"));
-        let matching: Vec<&String> = candidates
-            .iter()
-            .filter(|c| c.ends_with(&qualified))
-            .collect();
-        if candidates.len() <= 1 || matching.len() == 1 {
-            return Vec::new();
-        }
-        // `AuthUse::authenticateUser` with two `AuthUse` types: the qualifier
-        // narrowed the field, just not to one.
-        let pool: Vec<&String> = if matching.is_empty() {
-            candidates.iter().collect()
+        let matching = all.iter().filter(|c| c.ends_with(&qualified)).count();
+        let ambiguous = all.len() > 1 && matching != 1;
+        let others = if ambiguous {
+            all.iter()
+                .filter(|c| c.as_str() != resolved)
+                .filter(|c| matching == 0 || c.ends_with(&qualified))
+                .cloned()
+                .collect()
         } else {
-            matching
+            Vec::new()
         };
-        pool.into_iter()
-            .filter(|c| c.as_str() != resolved)
-            .cloned()
-            .collect()
+        Some(Namesakes {
+            total: all.len(),
+            ambiguous,
+            others,
+        })
     }
 
+    /// Note which graph node a query resolved to, and warn when the bare name
+    /// is shared by several functions (overloads, same-named methods on
+    /// different types), since only one of them is being reported on unless
+    /// `others_follow`.
     fn resolution_report(
         call_graph: &CallGraph,
         function: &str,
         resolved: &str,
         others_follow: bool,
     ) -> String {
-        if resolved == function {
+        let Some(namesakes) = Self::namesakes(call_graph, function, resolved) else {
             return String::new();
-        }
+        };
+        Self::render_resolution(call_graph, function, resolved, &namesakes, others_follow)
+    }
 
+    fn render_resolution(
+        call_graph: &CallGraph,
+        function: &str,
+        resolved: &str,
+        namesakes: &Namesakes,
+        others_follow: bool,
+    ) -> String {
         let mut output = format!(
             "Resolved to {}\n\n",
             Self::describe_graph_node(call_graph, resolved)
         );
-        let candidates = call_graph.find_all_functions(CallGraph::bare_name(function));
-        let qualified = format!("::{}", function.replace("->", "::").replace('.', "::"));
-        let matching_qualifier = candidates
-            .iter()
-            .filter(|c| c.ends_with(&qualified))
-            .count();
-        if candidates.len() > 1 && matching_qualifier != 1 {
+        if namesakes.ambiguous {
             let scope = if others_follow {
                 "first; the others follow below"
             } else {
@@ -4641,12 +4653,12 @@ impl CodeIntelEngine {
             };
             output.push_str(&format!(
                 "> **Ambiguous name**: {} functions are named `{}`; reporting on `{}` {}.\n",
-                candidates.len(),
+                namesakes.total,
                 CallGraph::bare_name(function),
                 resolved,
                 scope
             ));
-            for candidate in candidates.iter().filter(|c| *c != resolved).take(5) {
+            for candidate in namesakes.others.iter().take(5) {
                 output.push_str(&format!(
                     "> Other: {}\n",
                     Self::describe_graph_node(call_graph, candidate)
@@ -4680,18 +4692,23 @@ impl CodeIntelEngine {
             output.push_str(&Self::unresolved_function_report(&call_graph, function));
             return Ok(output);
         };
-        let others = if transitive {
-            Vec::new()
-        } else {
-            Self::ambiguous_namesakes(&call_graph, function, &resolved)
+        let namesakes = Self::namesakes(&call_graph, function, &resolved);
+        let others: &[String] = match &namesakes {
+            Some(found) if !transitive && found.others.len() <= AMBIGUOUS_CALLERS_SHOWN => {
+                &found.others
+            }
+            _ => &[],
         };
-        let others_follow = !others.is_empty() && others.len() <= AMBIGUOUS_CALLERS_SHOWN;
-        output.push_str(&Self::resolution_report(
-            &call_graph,
-            function,
-            &resolved,
-            others_follow,
-        ));
+        let others_follow = !others.is_empty();
+        if let Some(found) = &namesakes {
+            output.push_str(&Self::render_resolution(
+                &call_graph,
+                function,
+                &resolved,
+                found,
+                others_follow,
+            ));
+        }
         let function = resolved.as_str();
 
         if transitive {
@@ -4726,7 +4743,7 @@ impl CodeIntelEngine {
         // A handful of namesakes is answered in full, so that a question
         // asked with a short name does not need a second call per candidate.
         if others_follow {
-            for other in &others {
+            for other in others {
                 let callers = call_graph.get_callers(other);
                 output.push_str(&format!(
                     "\n## Callers of {}\n\nFound {} direct callers\n\n",
