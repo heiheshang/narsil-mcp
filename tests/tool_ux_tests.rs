@@ -1306,3 +1306,273 @@ async fn get_hotspots_follows_renames_and_reports_complexity() -> Result<()> {
 
     Ok(())
 }
+
+const BASE_MODULE: &str = "CommonModules/Продажи/Ext/Module.bsl";
+const EXT_MODULE: &str = "Extensions/Расш1/CommonModules/Продажи/Ext/Module.bsl";
+
+const BASE_BODY: &str = "\
+// Заполнение по заказу
+
+Процедура ЗаполнитьПоЗаказу(Документ, Заказ) Экспорт
+\tДокумент.Контрагент = Заказ.Контрагент;
+\tДокумент.Склад = Заказ.Склад;
+\tДля Каждого Строка Из Заказ.Товары Цикл
+\t\tНоваяСтрока = Документ.Товары.Добавить();
+\t\tЗаполнитьЗначенияСвойств(НоваяСтрока, Строка);
+\tКонецЦикла;
+КонецПроцедуры
+";
+
+const EXT_BODY: &str = "\
+&Вместо(\"ЗаполнитьПоЗаказу\")
+Процедура Расш1_ЗаполнитьПоЗаказу(Документ, Заказ)
+\tДокумент.Контрагент = Заказ.Контрагент;
+\tДокумент.Склад = Заказ.СкладОтгрузки;
+\tДля Каждого Строка Из Заказ.Товары Цикл
+\t\tНоваяСтрока = Документ.Товары.Добавить();
+\t\tЗаполнитьЗначенияСвойств(НоваяСтрока, Строка);
+\t\tНоваяСтрока.Цена = 0;
+\tКонецЦикла;
+КонецПроцедуры
+";
+
+async fn compare(engine: &CodeIntelEngine, args: serde_json::Value) -> Result<String> {
+    ToolRegistry::new()
+        .dispatch("compare_symbols", engine, args)
+        .await
+}
+
+#[tokio::test]
+async fn compare_symbols_typical_vs_extension() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    repo.add_file(EXT_MODULE, EXT_BODY)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let out = compare(
+        &engine,
+        json!({
+            "repo": repo.name(),
+            "left_symbol": "ЗаполнитьПоЗаказу",
+            "left_file": BASE_MODULE,
+            "right_symbol": "Расш1_ЗаполнитьПоЗаказу",
+        }),
+    )
+    .await?;
+
+    assert!(out.contains("**Similarity**"), "{out}");
+    assert!(
+        out.contains(&format!("{}:{BASE_MODULE} lines 3-10", repo.name())),
+        "{out}"
+    );
+    // Signature changed (name, Экспорт), one line changed, one added.
+    assert!(out.contains("+3 −2"), "{out}");
+    assert!(
+        out.contains("-  5    │ \tДокумент.Склад = Заказ.Склад;"),
+        "{out}"
+    );
+    assert!(
+        out.contains("+     4 │ \tДокумент.Склад = Заказ.СкладОтгрузки;"),
+        "{out}"
+    );
+    assert!(out.contains("+     8 │ \t\tНоваяСтрока.Цена = 0;"), "{out}");
+    assert!(out.contains("   4  3 │ \tДокумент.Контрагент"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_same_name_by_file() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    repo.add_file(
+        EXT_MODULE,
+        &BASE_BODY.replace("Заказ.Склад;", "Заказ.СкладОтгрузки;"),
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let out = compare(
+        &engine,
+        json!({
+            "repo": repo.name(),
+            "left_symbol": "ЗаполнитьПоЗаказу",
+            "left_file": BASE_MODULE,
+            "right_file": "Расш1",
+        }),
+    )
+    .await?;
+    assert!(out.contains("+1 −1"), "{out}");
+    assert!(out.contains(EXT_MODULE), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_ambiguous_errors() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    repo.add_file(EXT_MODULE, BASE_BODY)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let err = compare(
+        &engine,
+        json!({"repo": repo.name(), "left_symbol": "ЗаполнитьПоЗаказу", "right_file": "Расш1"}),
+    )
+    .await
+    .expect_err("namesakes without left_file must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("left_file"), "{msg}");
+    assert!(
+        msg.contains(BASE_MODULE) && msg.contains(EXT_MODULE),
+        "{msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_same_side_errors() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let err = compare(
+        &engine,
+        json!({"repo": repo.name(), "left_symbol": "ЗаполнитьПоЗаказу"}),
+    )
+    .await
+    .expect_err("comparing a symbol with itself must be rejected");
+    assert!(err.to_string().contains("same symbol"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_unknown_repo_errors() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let err = compare(
+        &engine,
+        json!({
+            "repo": repo.name(),
+            "left_symbol": "ЗаполнитьПоЗаказу",
+            "right_repo": "no-such-repo",
+        }),
+    )
+    .await
+    .expect_err("unknown right_repo must be rejected");
+    assert!(err.to_string().contains("no-such-repo"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_accepts_function_aliases() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    repo.add_file(EXT_MODULE, EXT_BODY)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let out = compare(
+        &engine,
+        json!({
+            "repo": repo.name(),
+            "left_function": "ЗаполнитьПоЗаказу",
+            "right_function": "Расш1_ЗаполнитьПоЗаказу",
+        }),
+    )
+    .await?;
+    assert!(out.contains("+3 −2"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_identical_reports_identical() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    repo.add_file(EXT_MODULE, &BASE_BODY.replace('\t', "    "))?;
+    let (engine, _idx) = engine_for(&repo).await?;
+
+    let args = json!({
+        "repo": repo.name(),
+        "left_symbol": "ЗаполнитьПоЗаказу",
+        "left_file": BASE_MODULE,
+        "right_file": EXT_MODULE,
+    });
+    let out = compare(&engine, args.clone()).await?;
+    assert!(
+        out.contains("**Result**: identical modulo whitespace/case"),
+        "{out}"
+    );
+
+    let mut strict = args;
+    strict["ignore_whitespace"] = json!(false);
+    let out = compare(&engine, strict).await?;
+    assert!(out.contains("+6 −6"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_across_repos() -> Result<()> {
+    let left = TestRepo::new()?;
+    let right = TestRepo::new()?;
+    left.add_file(BASE_MODULE, BASE_BODY)?;
+    right.add_file(
+        BASE_MODULE,
+        &BASE_BODY.replace("Заказ.Склад;", "Заказ.СкладОтгрузки;"),
+    )?;
+    let index_dir = TempDir::new()?;
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![left.path().to_path_buf(), right.path().to_path_buf()],
+        EngineOptions {
+            git_enabled: false,
+            call_graph_enabled: false,
+            persist_enabled: false,
+            watch_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let out = compare(
+        &engine,
+        json!({
+            "left_repo": left.name(),
+            "right_repo": right.name(),
+            "left_symbol": "ЗаполнитьПоЗаказу",
+        }),
+    )
+    .await?;
+    assert!(out.contains("+1 −1"), "{out}");
+    assert!(
+        out.contains(&left.name()) && out.contains(&right.name()),
+        "{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_symbols_reports_stale_index() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(BASE_MODULE, BASE_BODY)?;
+    repo.add_file(EXT_MODULE, EXT_BODY)?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let args = json!({
+        "repo": repo.name(),
+        "left_repo": "",
+        "left_symbol": "ЗаполнитьПоЗаказу",
+        "right_symbol": "Расш1_ЗаполнитьПоЗаказу",
+    });
+
+    // Cut the extension file after the procedure's 4th line, behind the index's back.
+    let cut: String = EXT_BODY.lines().take(5).map(|l| format!("{l}\n")).collect();
+    std::fs::write(repo.path().join(EXT_MODULE), cut)?;
+    let out = compare(&engine, args.clone()).await?;
+    assert!(out.contains("the index is stale"), "{out}");
+
+    std::fs::write(repo.path().join(EXT_MODULE), "")?;
+    let err = compare(&engine, args)
+        .await
+        .expect_err("an empty body must not be diffed");
+    assert!(err.to_string().contains("run reindex"), "{err}");
+    Ok(())
+}

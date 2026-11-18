@@ -1,10 +1,12 @@
 ---
 name: narsil-search
-description: Choose the right narsil-mcp search tool and read its results honestly. Use when locating code by name, string, or description - "where is X defined", "find the function that does Y", "search for this string", "is there code like this snippet", "which file handles Z" - across an indexed repository.
+description: Choose the right narsil-mcp search tool and read its results honestly. Use for every code search instead of Grep or ripgrep - "where is X defined", "find the function that does Y", "search for this string", "поиск по коду", "is there code like this snippet", "which file handles Z" - across an indexed repository. Fall back to Grep only when narsil-mcp is not connected.
 allowed-tools: mcp__narsil-mcp__*
 ---
 
 # Finding code with narsil
+
+Code search goes through narsil-mcp. While that server is connected, do not use the editor Grep tool or shell `rg`. If the server is not connected, say so and only then fall back.
 
 ## Before the first search
 
@@ -152,6 +154,28 @@ A name that is not indexed at all comes back with the closest matches — a
 different case, a wrong qualifier, a substring — so a failed lookup usually
 answers itself without a second call.
 
+## Comparing two symbols
+
+To see how two bodies differ — a base 1C procedure and its `&Вместо` /
+`&ИзменениеИКонтроль` override in an extension, one function in two
+repositories, two copies of a helper — call `compare_symbols` instead of two
+`get_symbol_definition` calls and a diff of your own:
+
+```
+compare_symbols(repo, left_symbol: "ЗаполнитьПоЗаказу", left_file: "CommonModules/Продажи/Ext/Module.bsl",
+                right_symbol: "Расш1_ЗаполнитьПоЗаказу")
+```
+
+Each side is `*_symbol` + `*_file` (+ `*_repo`); `right_symbol` defaults to
+`left_symbol`. A full path in `*_file` wins over a module with the same tail
+inside an extension. Namesakes left after the file filter are an error listing
+them — pass the side's `*_file` and repeat; the tool never picks one for you.
+Indentation does not count by default (`ignore_whitespace: false` to make it
+count), case does (`ignore_case: true` for BSL). The answer is a similarity
+percentage, `+N −M` line counts and hunks with both files' line numbers, or
+`identical` / `identical modulo whitespace/case`; a diff over `max_lines` (400)
+ends with a note of how much was cut.
+
 ## Anti-patterns
 
 | Don't | Do |
@@ -162,6 +186,7 @@ answers itself without a second call.
 | Read a 400-line function whole to find one branch | `outline: true`, then `get_file` on the range it points at |
 | Grep a file for a test case's boundaries | `find_symbols symbol_type: "test"` — the case block is a symbol with a line range |
 | Trust `get_symbol_definition` for an ambiguous name | Read the `**Also defined**` line; re-ask with `receiver` or `file` |
+| Diff two functions with `get_symbol_definition` ×2 and a script | `compare_symbols` with `left_*`/`right_*` |
 | Re-run the same query with `max_results` raised after **0** hits | 0 hits means the wording is wrong, not that the limit was. A *wrong-looking* top-10 is the opposite case: there raising the limit, or narrowing `file_pattern`, is correct |
 | Hunt call sites with `search_code` | `find_symbol_usages` / `find_references`; `search_code` ranks `func Foo(` above `foo.Foo(x)` |
 | Read `Found N results` as "there are N matches" | It is the post-truncation count; N == `max_results` means the list was cut |

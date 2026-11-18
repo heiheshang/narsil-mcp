@@ -53,7 +53,7 @@ narsil-mcp --repos ~/project
 export NARSIL_PRESET=balanced
 narsil-mcp --repos ~/project --git --call-graph
 
-# Apply full preset (all 90 tools)
+# Apply full preset (all 91 tools)
 export NARSIL_PRESET=full
 narsil-mcp --repos ~/project --git --call-graph --neural
 ```
@@ -350,14 +350,14 @@ narsil-mcp --repos ~/project --git --call-graph
 - Research and exploration
 
 **Includes:**
-- ALL 90 tools
+- ALL 91 tools
 - All search modes (including neural with `--neural`)
 - Full security scanning
 - Supply chain analysis
 - Remote GitHub repository support (with `--remote`)
 - All code analysis features
 
-**Expected tool count:** 50-60 tools without flags, 90 tools with all flags
+**Expected tool count:** 50-60 tools without flags, 91 tools with all flags
 
 **Usage:**
 ```bash
@@ -590,7 +590,7 @@ narsil-mcp config export --resolved
 
 ## Categories
 
-narsil-mcp organizes its 90 tools into 12 categories:
+narsil-mcp organizes its 91 tools into 12 categories:
 
 ### Repository (10 tools)
 
@@ -601,10 +601,10 @@ Repository and file operations:
 
 **Always enabled by default**
 
-### Symbols (7 tools)
+### Symbols (8 tools)
 
 Symbol search and navigation:
-- `find_symbols`, `get_symbol_definition`, `find_references`
+- `find_symbols`, `get_symbol_definition`, `compare_symbols`, `find_references`
 - `get_dependencies`, `find_symbol_usages`, `get_export_map`
 - `workspace_symbol_search`
 

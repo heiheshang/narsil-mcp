@@ -103,6 +103,7 @@ rust-stemmers = "1.2"  # Snowball Russian stemmer for Cyrillic tokens (already p
 memmap2 = "0.9"   # Memory-mapped files for speed
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }   # Binary serialization for index persistence
 regex = "1.10"    # Regular expression support
+similar = "2.6"   # Line diff for compare_symbols
 
 # Configuration and rules
 serde-saphyr = "0.0"  # YAML parsing for security rules (panic-free, actively maintained)

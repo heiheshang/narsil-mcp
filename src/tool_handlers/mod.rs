@@ -90,6 +90,7 @@ impl ToolRegistry {
         // Register symbol handlers
         registry.register(Box::new(symbols::FindSymbolsHandler));
         registry.register(Box::new(symbols::GetSymbolDefinitionHandler));
+        registry.register(Box::new(symbols::CompareSymbolsHandler));
         registry.register(Box::new(symbols::FindReferencesHandler));
         registry.register(Box::new(symbols::GetDependenciesHandler));
         registry.register(Box::new(symbols::FindSymbolUsagesHandler));

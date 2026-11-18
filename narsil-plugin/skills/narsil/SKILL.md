@@ -1,12 +1,14 @@
 ---
 name: narsil
-description: Use narsil-mcp code intelligence tools effectively. Use when searching code, finding symbols, analyzing call graphs, scanning for security vulnerabilities, exploring dependencies, or performing static analysis on indexed repositories.
+description: Use narsil-mcp code intelligence tools effectively. Code search goes through narsil-mcp, not Grep or ripgrep, while the server is connected. Use when searching code, finding symbols, analyzing call graphs, scanning for security vulnerabilities, exploring dependencies, or performing static analysis on indexed repositories.
 allowed-tools: mcp__narsil-mcp__*
 ---
 
 # Narsil Code Intelligence
 
-Narsil is an MCP server providing **90 code intelligence tools** (plus 2 prompts: `explain_codebase`, `find_implementation`). This skill is the catalogue: what exists and which tool covers which task.
+Code search goes through narsil-mcp (`narsil-search`: `search_code`, `find_symbols`, `hybrid_search`). While the server is connected, do not use the editor Grep tool or shell `rg`. If it is not connected, say so and only then fall back.
+
+Narsil is an MCP server providing **91 code intelligence tools** (plus 2 prompts: `explain_codebase`, `find_implementation`). This skill is the catalogue: what exists and which tool covers which task.
 
 ## Focused skills
 
@@ -112,6 +114,7 @@ If a tool returns empty results or errors, check `get_index_status` to verify th
 | Get function source | `get_symbol_definition` (namesakes: pass `receiver` or `file`) |
 | Skim a long function | `get_symbol_definition` with `outline=true` |
 | Find a phrase inside one function | `get_symbol_definition` with `contains="..."` |
+| Compare two functions (a base 1C procedure vs its `&Вместо` override, one function in two repos) | `compare_symbols` — `left_symbol`/`left_file`/`left_repo` and the same `right_*` |
 | Find all references | `find_references` |
 | Find all usages (cross-file) | `find_symbol_usages` |
 | See what exports a module has | `get_export_map` |

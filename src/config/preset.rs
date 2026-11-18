@@ -114,9 +114,10 @@ impl Preset {
             "get_index_status",
             "get_incremental_status",
             "get_metrics",
-            // Symbols (7 tools)
+            // Symbols (8 tools)
             "find_symbols",
             "get_symbol_definition",
+            "compare_symbols",
             "find_references",
             "get_dependencies",
             "find_symbol_usages",

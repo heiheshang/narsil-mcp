@@ -5,11 +5,13 @@
 mod indexing;
 mod repo_registry;
 mod search;
+mod symbol_diff;
 mod worktree;
 
 use crate::paths::SlashPath;
 use repo_registry::RepoRegistry;
 pub use repo_registry::{RepoEntry, RepoKind, RepoState};
+pub use symbol_diff::CompareSymbolsQuery;
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -655,25 +657,34 @@ fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
 
 /// Narrow namesakes by the `file` argument.
 ///
-/// A full path or a whole-segment suffix (`payment/store.go`) wins when it
-/// matches anything. Otherwise the argument is taken as a case-insensitive
-/// fragment of the path: agents write `file: "airtime"` for
-/// `internal/airtime/airtime_operation.go`, and demanding the exact tail made
-/// that the most common failed lookup. The precise form goes first so that
-/// `store.go` does not also pick up `audit_store.go`.
+/// A full path wins, then a whole-segment suffix (`payment/store.go`).
+/// Otherwise the argument is taken as a case-insensitive fragment of the path:
+/// agents write `file: "airtime"` for `internal/airtime/airtime_operation.go`,
+/// and demanding the exact tail made that the most common failed lookup. The
+/// precise forms go first so that `store.go` does not also pick up
+/// `audit_store.go`, and a 1C module's full path does not also pick up the
+/// same module inside an extension, whose path ends with it.
 fn filter_by_file<'a>(symbols: Vec<&'a Symbol>, file: Option<&str>) -> Vec<&'a Symbol> {
     let Some(f) = file else {
         return symbols;
     };
     let f = f.trim_start_matches("./");
-    let suffix = format!("/{f}");
-    let exact: Vec<&Symbol> = symbols
+    let full: Vec<&Symbol> = symbols
         .iter()
         .copied()
-        .filter(|s| s.file_path == f || s.file_path.ends_with(&suffix))
+        .filter(|s| s.file_path == f)
         .collect();
-    if !exact.is_empty() {
-        return exact;
+    if !full.is_empty() {
+        return full;
+    }
+    let suffix = format!("/{f}");
+    let by_suffix: Vec<&Symbol> = symbols
+        .iter()
+        .copied()
+        .filter(|s| s.file_path.ends_with(&suffix))
+        .collect();
+    if !by_suffix.is_empty() {
+        return by_suffix;
     }
     let needle = f.to_lowercase();
     symbols

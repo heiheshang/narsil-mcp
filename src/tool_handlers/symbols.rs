@@ -4,7 +4,9 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
-use crate::engine::{CodeIntelEngine, FindSymbolsQuery, SymbolDefinitionQuery};
+use crate::engine::{
+    CodeIntelEngine, CompareSymbolsQuery, FindSymbolsQuery, SymbolDefinitionQuery,
+};
 
 /// Handler for find_symbols tool
 pub struct FindSymbolsHandler;
@@ -52,6 +54,36 @@ impl ToolHandler for GetSymbolDefinitionHandler {
                 max_lines: args.get_u64_or("max_lines", 0) as usize,
                 file: args.get_str("file"),
                 receiver: args.get_str("receiver"),
+            })
+            .await
+    }
+}
+
+/// Handler for compare_symbols tool
+pub struct CompareSymbolsHandler;
+
+#[async_trait::async_trait]
+impl ToolHandler for CompareSymbolsHandler {
+    fn name(&self) -> &'static str {
+        "compare_symbols"
+    }
+
+    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
+        engine
+            .compare_symbols(CompareSymbolsQuery {
+                repo: args.get_str("repo").unwrap_or(""),
+                left_symbol: args
+                    .get_str_any(&["left_symbol", "left_function"])
+                    .unwrap_or(""),
+                left_file: args.get_str("left_file"),
+                left_repo: args.get_str("left_repo"),
+                right_symbol: args.get_str_any(&["right_symbol", "right_function"]),
+                right_file: args.get_str("right_file"),
+                right_repo: args.get_str("right_repo"),
+                ignore_whitespace: args.get_bool_or("ignore_whitespace", true),
+                ignore_case: args.get_bool_or("ignore_case", false),
+                context_lines: args.get_u64_or("context_lines", 3).min(10_000) as usize,
+                max_lines: args.get_limit_any(&["max_lines"], 400),
             })
             .await
     }
