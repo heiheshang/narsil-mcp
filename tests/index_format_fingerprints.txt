@@ -15,3 +15,7 @@
 # 5: Go call graph resolves a factory held in a variable or parameter; the
 # fixtures have no such call, so the hash is the version 1 one.
 5 call_graph 665286e61d3dcfcebe3935812861ec21d40f2b0cf015af37bcd027e58286bf2f
+# 6: Go struct fields keep the package of their type (call-graph snapshot
+# layout), and namesake receiver types are told apart by it; the fixtures have
+# neither, so the hash is the version 1 one.
+6 call_graph 665286e61d3dcfcebe3935812861ec21d40f2b0cf015af37bcd027e58286bf2f

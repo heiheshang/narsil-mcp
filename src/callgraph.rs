@@ -1206,7 +1206,9 @@ impl CallGraph {
                     if values.len() == 1 && single_meaningful_name {
                         if let Some(type_name) = self.expression_type_hint(values[0], source, ctx) {
                             locals.insert(names[0].clone(), LocalKind::Type(type_name));
-                        } else if let Some(product) = Self::factory_value_hint(values[0], source) {
+                        } else if let Some(product) =
+                            self.factory_value_hint(values[0], source, ctx)
+                        {
                             locals.insert(names[0].clone(), LocalKind::Factory(product));
                         }
                     }
@@ -1275,13 +1277,14 @@ impl CallGraph {
 
     /// The type a factory produces, when the expression is the factory itself
     /// rather than a call of it: `deps.OrganisationUseFactory`, `NewStore`.
-    fn factory_value_hint(node: Node, source: &[u8]) -> Option<String> {
+    fn factory_value_hint(&self, node: Node, source: &[u8], ctx: CallCtx) -> Option<String> {
         let name = match node.kind() {
             "identifier" => node,
             "selector_expression" => node.child_by_field_name("field")?,
             _ => return None,
         };
-        Self::factory_type_hint(name.utf8_text(source).ok()?)
+        let product = Self::factory_type_hint(name.utf8_text(source).ok()?)?;
+        Some(self.with_factory_package(product, node, source, ctx))
     }
 
     /// Package name (or alias) -> import path, for the file's imports.
@@ -1297,10 +1300,10 @@ impl CallGraph {
     /// Go-shaped `import_spec` only. Python's `from x import y` and JS's
     /// namespace imports bind names differently and would need their own
     /// handling rather than sharing this one.
-    fn collect_imports(tree: &Tree, source: &[u8]) -> HashMap<String, String> {
+    pub(crate) fn collect_imports(root: Node, source: &[u8]) -> HashMap<String, String> {
         let mut imports = HashMap::new();
-        let mut cursor = tree.walk();
-        let mut stack = vec![tree.root_node()];
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if node.kind() == "import_spec" {
                 let Some(path) = node
@@ -1373,6 +1376,9 @@ impl CallGraph {
                 found = Some(Arc::from(dir));
                 break;
             }
+        }
+        if found.is_none() {
+            found = self.types.dir_with_types(&matches_dir).map(Arc::from);
         }
         self.import_dir_cache
             .insert(import_path.to_string(), found.clone());
@@ -1463,7 +1469,7 @@ impl CallGraph {
         let mut cursor = tree.walk();
 
         // Track current function scope
-        let imports = Self::collect_imports(tree, source);
+        let imports = Self::collect_imports(tree.root_node(), source);
         let file = FileScope {
             path,
             imports: &imports,
@@ -2604,20 +2610,37 @@ impl CallGraph {
         // 0. A scope qualifier naming a receiver type is harder evidence than
         //    the caller's own file: `Store::new()` means `Store`, wherever it
         //    lives. Only a unique match counts.
-        if let Some(scope) = scope_hint {
+        // Namesakes on the hinted receiver type, kept when several packages
+        // declare a type of that name and nothing below picks one: the
+        // receiver type is still known, so the final guess is made among
+        // them rather than among every function of the name.
+        let mut receiver_pool: Vec<String> = Vec::new();
+        if let Some(hint) = scope_hint {
+            let (package_dir, scope) = Self::split_scope(hint);
             if let Some(candidates) = self.name_index.get(bare_name) {
-                let mut by_receiver = candidates
+                let by_receiver: Vec<&String> = candidates
                     .iter()
-                    .filter(|key| self.receiver_matches(key, scope, true));
-                if let Some(first) = by_receiver.next() {
-                    if by_receiver.next().is_none() {
-                        let resolution = if scope_inferred {
-                            CallResolution::FactoryReceiver
-                        } else {
-                            CallResolution::Receiver
-                        };
-                        return (first.clone(), resolution);
+                    .filter(|key| self.receiver_matches(key, scope, true))
+                    .collect();
+                let resolution = if scope_inferred {
+                    CallResolution::FactoryReceiver
+                } else {
+                    CallResolution::Receiver
+                };
+                if let [only] = by_receiver.as_slice() {
+                    return ((*only).clone(), resolution);
+                }
+                if by_receiver.len() > 1 {
+                    // The package the factory was declared from names the
+                    // implementation's tree: `internal/usecase/auth/` holds
+                    // `impl/auth.go::AuthUse`, a payout module's does not.
+                    if let Some(dir) = package_dir {
+                        let mut in_package = by_receiver.iter().filter(|key| key.starts_with(dir));
+                        if let (Some(first), None) = (in_package.next(), in_package.next()) {
+                            return ((*first).clone(), resolution);
+                        }
                     }
+                    receiver_pool = by_receiver.iter().map(|key| (*key).clone()).collect();
                 }
 
                 // 0c. The qualifier names an interface: dispatch is dynamic,
@@ -2733,13 +2756,39 @@ impl CallGraph {
 
                 // 5. Deterministic fallback: alphabetically smallest, no sort.
                 // Nothing distinguished the namesakes, so the edge is a name
-                // match and says so.
+                // match and says so. When the receiver type was known, only
+                // its namesakes are in the running, and for a caller outside
+                // the tests a test double loses to production code: a stub
+                // sorting first under `internal/handler/...` used to collect
+                // every call.
+                let prefer_production = !Self::is_test_path(caller_file);
+                let picked = if receiver_pool.is_empty() {
+                    Self::fallback_pick(candidates.iter(), prefer_production)
+                } else {
+                    Self::fallback_pick(receiver_pool.iter(), prefer_production)
+                };
                 (
-                    candidates.iter().min().cloned().unwrap_or_default(),
+                    picked.cloned().unwrap_or_default(),
                     CallResolution::NameOnly,
                 )
             }
         }
+    }
+
+    /// The alphabetically smallest key, from production code first when
+    /// `prefer_production` is set. Walks the iterator at most twice and
+    /// allocates nothing: a name can have hundreds of namesakes and this runs
+    /// for every unresolved call site.
+    fn fallback_pick<'a>(
+        keys: impl Iterator<Item = &'a String> + Clone,
+        prefer_production: bool,
+    ) -> Option<&'a String> {
+        let production = if prefer_production {
+            keys.clone().filter(|key| !Self::is_test_path(key)).min()
+        } else {
+            None
+        };
+        production.or_else(|| keys.min())
     }
 
     /// Extract the scope qualifier from a scoped call expression.
@@ -2974,6 +3023,64 @@ impl CallGraph {
         }
     }
 
+    /// [`selector_chain_type`](Self::selector_chain_type) for a factory's
+    /// owner: the type at the end of the chain together with the directory to
+    /// look its declaration up in. Each link's package comes from the field
+    /// that leads to it, so a name declared in several packages is still
+    /// followed into the right one; the base may also be a call whose result
+    /// type is declared (`app.RegisterAppContainer().UseCase`).
+    fn selector_chain_with_dir(
+        &self,
+        node: Node,
+        source: &[u8],
+        ctx: CallCtx,
+    ) -> Option<(String, String)> {
+        let mut steps: Vec<&str> = Vec::new();
+        let mut current = node;
+        let (mut type_name, mut dir) = loop {
+            match current.kind() {
+                "selector_expression" => {
+                    if steps.len() >= 4 {
+                        return None;
+                    }
+                    steps.push(
+                        current
+                            .child_by_field_name("field")?
+                            .utf8_text(source)
+                            .ok()?,
+                    );
+                    current = current.child_by_field_name("operand")?;
+                }
+                "identifier" => {
+                    let type_name = match current.utf8_text(source).ok()? {
+                        "self" | "this" => ctx.self_type?.to_string(),
+                        name => ctx.local_type(name)?.to_string(),
+                    };
+                    break (type_name, types::directory_of(ctx.file).to_string());
+                }
+                kind if Self::is_call_kind(kind) => {
+                    let (declared, inferred) =
+                        self.chained_call_scope_hint(current, source, ctx)?;
+                    if inferred {
+                        return None;
+                    }
+                    let (package_dir, type_name) = Self::split_scope(&declared);
+                    let dir = package_dir.unwrap_or(types::directory_of(ctx.file));
+                    break (type_name.to_string(), dir.to_string());
+                }
+                _ => return None,
+            }
+        };
+        for field in steps.iter().rev() {
+            let (next, package) = self.types.field_info(&type_name, field, Some(&dir))?;
+            if let Some(package_dir) = package.and_then(|path| self.package_dir_for(&path)) {
+                dir = package_dir.to_string();
+            }
+            type_name = next;
+        }
+        Some((type_name, dir))
+    }
+
     /// The type a method call on `receiver_type` produces, for the middle of a
     /// chain: the graph's own node when the type is a struct, and the
     /// interface's declaration when it is an interface — an interface method
@@ -2984,6 +3091,7 @@ impl CallGraph {
         method: &str,
         prefer_dir: Option<&str>,
     ) -> Option<String> {
+        let receiver_type = Self::split_scope(receiver_type).1;
         if let Some(declared) =
             self.types
                 .interface_method_result(receiver_type, method, prefer_dir)
@@ -3042,7 +3150,55 @@ impl CallGraph {
                 return Some((declared, false));
             }
         }
-        Self::factory_type_hint(&described.0).map(|inferred| (inferred, true))
+        let inferred = Self::factory_type_hint(&described.0)?;
+        Some((
+            self.with_factory_package(inferred, callee, source, ctx),
+            true,
+        ))
+    }
+
+    /// Prefix an inferred receiver type with the directory of the package the
+    /// factory field was declared from: `self.Depend.AuthUseFactory` typed
+    /// `auth_use.AuthUseFactory` gives `internal/usecase/auth/AuthUse`. Two
+    /// packages declaring an `AuthUse` are then told apart by
+    /// [`resolve_scoped_callee`](Self::resolve_scoped_callee). The type comes
+    /// back unchanged when the field or its package cannot be read.
+    fn with_factory_package(
+        &self,
+        type_name: String,
+        factory: Node,
+        source: &[u8],
+        ctx: CallCtx,
+    ) -> String {
+        match self.factory_package_dir(factory, source, ctx) {
+            Some(dir) => format!("{dir}{type_name}"),
+            None => type_name,
+        }
+    }
+
+    /// Directory of the package a factory field's type was imported from:
+    /// `self.Depend.AuthUseFactory`, declared `auth_use.AuthUseFactory`.
+    fn factory_package_dir(&self, factory: Node, source: &[u8], ctx: CallCtx) -> Option<Arc<str>> {
+        if factory.kind() != "selector_expression" {
+            return None;
+        }
+        let field = factory
+            .child_by_field_name("field")?
+            .utf8_text(source)
+            .ok()?;
+        let operand = factory.child_by_field_name("operand")?;
+        let (owner, dir) = self.selector_chain_with_dir(operand, source, ctx)?;
+        let import_path = self.types.field_package(&owner, field, Some(&dir))?;
+        self.package_dir_for(&import_path)
+    }
+
+    /// Split a scope hint into the package directory it may carry (see
+    /// [`with_factory_package`](Self::with_factory_package)) and the type.
+    fn split_scope(scope: &str) -> (Option<&str>, &str) {
+        match scope.rfind('/') {
+            Some(slash) => (Some(&scope[..=slash]), &scope[slash + 1..]),
+            None => (None, scope),
+        }
     }
 
     /// Describe the callee slot of a call:

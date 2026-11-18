@@ -1256,6 +1256,304 @@ func (self *BankRepo) Save(o *Bank) error {
     assert!(call_graph.get_callers("BankRepo.Save").is_empty());
 }
 
+/// Two packages each declare an `AuthUse` with the same method, and a test
+/// stub of a third type shares the method name. The factory name alone says
+/// `AuthUse` without saying which; the package the factory field is typed
+/// from does. Before, both calls fell through to the alphabetically first
+/// namesake — the stub under `internal/handler/api/auth/test/`.
+#[test]
+fn test_namesake_receiver_types_are_told_apart_by_the_factory_package() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/usecase/auth/auth.go",
+            r#"
+package auth
+
+type AuthUseFactory func(c Ctx) IAuthUse
+
+func RateLimitKey() string { return "" }
+"#,
+        ),
+        (
+            "internal/usecase/auth/impl/auth.go",
+            r#"
+package impl
+
+type AuthUse struct{}
+
+func (self *AuthUse) AuthJWTWithRefresh(login string, password string) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/module/payout_platform/usecase/auth/auth.go",
+            r#"
+package auth
+
+type AuthUseFactory func(c Ctx) IAuthUse
+"#,
+        ),
+        (
+            "internal/module/payout_platform/usecase/auth/impl/auth.go",
+            r#"
+package impl
+
+type AuthUse struct{}
+
+func (self *AuthUse) AuthJWTWithRefresh(email string, token string, otp string) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/handler/api/base.go",
+            r#"
+package api
+
+import (
+	auth_use "go-rest-api/internal/usecase/auth"
+)
+
+type Base struct {
+	AuthUseFactory auth_use.AuthUseFactory
+}
+"#,
+        ),
+        (
+            "internal/handler/api/auth/login_with_refresh.go",
+            r#"
+package auth
+
+import (
+	"go-rest-api/internal/handler/api"
+)
+
+type AuthLoginWithRefresh struct {
+	api.Base
+}
+
+func (self *AuthLoginWithRefresh) Do() error {
+	return self.AuthUseFactory(self.C).AuthJWTWithRefresh("login", "password")
+}
+"#,
+        ),
+        (
+            "internal/handler/api/auth/test/stub_test.go",
+            r#"
+package test
+
+type stubTokenAuthUse struct{}
+
+func (self *stubTokenAuthUse) AuthJWTWithRefresh(login string, password string) error {
+	return nil
+}
+"#,
+        ),
+        (
+            "internal/app/registrator.go",
+            r#"
+package app
+
+import (
+	usecase_registrator "go-rest-api/internal/usecase/registrator"
+)
+
+type AppContainer struct {
+	UseCase usecase_registrator.UseCaseContainer
+}
+
+func RegisterAppContainer() *AppContainer {
+	return &AppContainer{}
+}
+"#,
+        ),
+        (
+            "internal/usecase/registrator/registrator.go",
+            r#"
+package registrator
+
+import (
+	auth_init "go-rest-api/internal/usecase/auth/init"
+)
+
+type UseCaseContainer struct {
+	AuthContainer auth_init.AuthContainer
+}
+"#,
+        ),
+        (
+            "internal/module/payout_platform/usecase/registrator/registrator.go",
+            r#"
+package registrator
+
+import (
+	auth_init "go-rest-api/internal/module/payout_platform/usecase/auth/init"
+)
+
+type UseCaseContainer struct {
+	AuthContainer auth_init.AuthContainer
+}
+"#,
+        ),
+        (
+            "internal/usecase/auth/init/init.go",
+            r#"
+package init
+
+import (
+	"go-rest-api/internal/usecase/auth"
+)
+
+type AuthContainer struct {
+	AuthUseFactory auth.AuthUseFactory
+}
+"#,
+        ),
+        (
+            "internal/module/payout_platform/usecase/auth/init/init.go",
+            r#"
+package init
+
+import (
+	"go-rest-api/internal/module/payout_platform/usecase/auth"
+)
+
+type AuthContainer struct {
+	AuthUseFactory auth.AuthUseFactory
+}
+"#,
+        ),
+        (
+            "internal/usecase/auth/test/auth_test.go",
+            r#"
+package test
+
+import (
+	"go-rest-api/internal/app"
+)
+
+func TestAuth(t *testing.T) {
+	authUse := app.RegisterAppContainer().UseCase.AuthContainer.AuthUseFactory
+	authUse(nil).AuthJWTWithRefresh("login", "password")
+}
+"#,
+        ),
+        (
+            "internal/module/payout_platform/handler/api/auth/login.go",
+            r#"
+package auth
+
+import (
+	auth_use "go-rest-api/internal/module/payout_platform/usecase/auth"
+)
+
+type PayoutPlatformAuthLoginDepend struct {
+	AuthUseFactory auth_use.AuthUseFactory
+}
+
+type PayoutPlatformAuthLogin struct {
+	Depend PayoutPlatformAuthLoginDepend
+}
+
+func (self *PayoutPlatformAuthLogin) Do() error {
+	return self.Depend.AuthUseFactory(self.C).AuthJWTWithRefresh("e", "t", "o")
+}
+"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let main_callers =
+        call_graph.get_callers("internal/usecase/auth/impl/auth.go::AuthUse::AuthJWTWithRefresh");
+    assert_eq!(main_callers.len(), 2, "got {main_callers:?}");
+    assert!(main_callers
+        .iter()
+        .any(|edge| edge.target.ends_with("AuthLoginWithRefresh::Do")));
+    assert!(
+        main_callers
+            .iter()
+            .any(|edge| edge.target.ends_with("auth_test.go::TestAuth")),
+        "a factory taken out of the container into a variable keeps its package"
+    );
+    assert!(main_callers
+        .iter()
+        .all(|edge| edge.resolution == CallResolution::FactoryReceiver));
+
+    let payout_callers = call_graph.get_callers(
+        "internal/module/payout_platform/usecase/auth/impl/auth.go::AuthUse::AuthJWTWithRefresh",
+    );
+    assert_eq!(payout_callers.len(), 1, "got {payout_callers:?}");
+    assert!(payout_callers[0]
+        .target
+        .ends_with("PayoutPlatformAuthLogin::Do"));
+
+    assert!(
+        call_graph
+            .get_callers("stubTokenAuthUse::AuthJWTWithRefresh")
+            .is_empty(),
+        "a test stub of another type must not collect production calls"
+    );
+}
+
+/// When the package cannot be read, the receiver type is still known: the
+/// guess is made among that type's namesakes, never handed to a stub of
+/// another type that happens to sort first.
+#[test]
+fn test_unreadable_factory_package_still_keeps_the_receiver_type() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let files = vec![
+        (
+            "internal/a/impl/auth.go",
+            "package impl\n\ntype AuthUse struct{}\n\nfunc (self *AuthUse) Refresh() error { return nil }\n",
+        ),
+        (
+            "internal/b/impl/auth.go",
+            "package impl\n\ntype AuthUse struct{}\n\nfunc (self *AuthUse) Refresh() error { return nil }\n",
+        ),
+        (
+            "internal/a/handler/test/stub_test.go",
+            "package test\n\ntype stub struct{}\n\nfunc (self *stub) Refresh() error { return nil }\n",
+        ),
+        (
+            "internal/a/handler/login.go",
+            "package handler\n\ntype Login struct{}\n\nfunc (self *Login) Do() error {\n\treturn self.Deps.AuthUseFactory(nil).Refresh()\n}\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, code)| {
+        let tree = parser.parse_to_tree(Path::new(path), code).unwrap();
+        (path.to_string(), code.to_string(), tree)
+    })
+    .collect::<Vec<_>>();
+
+    call_graph.build_from_files(&files).unwrap();
+
+    let edge = call_graph
+        .get_callees("internal/a/handler/login.go::Login::Do")
+        .into_iter()
+        .find(|edge| edge.target.ends_with("::Refresh"))
+        .expect("the call should produce an edge");
+    assert!(
+        edge.target.contains("::AuthUse::"),
+        "went to {}",
+        edge.target
+    );
+    assert_eq!(edge.resolution, CallResolution::NameOnly);
+}
+
 #[test]
 fn test_chained_call_without_factory_naming_stays_a_name_match() {
     let parser = LanguageParser::new().unwrap();
