@@ -54,6 +54,9 @@ fn symbol_kind_to_doc_type(kind: &SymbolKind) -> DocType {
     }
 }
 
+/// How many namesakes of an ambiguous name `get_callers` answers in full.
+const AMBIGUOUS_CALLERS_SHOWN: usize = 4;
+
 /// A compiled user file glob: one `glob::Pattern` per brace alternative,
 /// matching when any alternative matches.
 #[derive(Debug, Clone)]
@@ -4578,9 +4581,44 @@ impl CodeIntelEngine {
     /// Note which graph node a query resolved to, and warn when the bare name
     /// is shared by several functions (overloads, same-named methods on
     /// different types), since only one of them is being reported on.
-    fn resolution_report(call_graph: &CallGraph, function: &str, resolved: &str) -> String {
+    /// The other functions `function` could have meant, when the name the
+    /// caller gave does not single one out; empty when it does.
+    fn ambiguous_namesakes(call_graph: &CallGraph, function: &str, resolved: &str) -> Vec<String> {
         // An exact graph key is an explicit choice: nothing to resolve, and no
         // point warning about the other functions sharing the name.
+        if resolved == function {
+            return Vec::new();
+        }
+        let candidates = call_graph.find_all_functions(CallGraph::bare_name(function));
+        // `Big::with_options` names one of the `with_options` functions; only
+        // namesakes the qualifier does not rule out make the answer a guess.
+        let qualified = format!("::{}", function.replace("->", "::").replace('.', "::"));
+        let matching: Vec<&String> = candidates
+            .iter()
+            .filter(|c| c.ends_with(&qualified))
+            .collect();
+        if candidates.len() <= 1 || matching.len() == 1 {
+            return Vec::new();
+        }
+        // `AuthUse::authenticateUser` with two `AuthUse` types: the qualifier
+        // narrowed the field, just not to one.
+        let pool: Vec<&String> = if matching.is_empty() {
+            candidates.iter().collect()
+        } else {
+            matching
+        };
+        pool.into_iter()
+            .filter(|c| c.as_str() != resolved)
+            .cloned()
+            .collect()
+    }
+
+    fn resolution_report(
+        call_graph: &CallGraph,
+        function: &str,
+        resolved: &str,
+        others_follow: bool,
+    ) -> String {
         if resolved == function {
             return String::new();
         }
@@ -4590,19 +4628,23 @@ impl CodeIntelEngine {
             Self::describe_graph_node(call_graph, resolved)
         );
         let candidates = call_graph.find_all_functions(CallGraph::bare_name(function));
-        // `Big::with_options` names one of the `with_options` functions; only
-        // namesakes the qualifier does not rule out make the answer a guess.
         let qualified = format!("::{}", function.replace("->", "::").replace('.', "::"));
         let matching_qualifier = candidates
             .iter()
             .filter(|c| c.ends_with(&qualified))
             .count();
         if candidates.len() > 1 && matching_qualifier != 1 {
+            let scope = if others_follow {
+                "first; the others follow below"
+            } else {
+                "only"
+            };
             output.push_str(&format!(
-                "> **Ambiguous name**: {} functions are named `{}`; reporting on `{}` only.\n",
+                "> **Ambiguous name**: {} functions are named `{}`; reporting on `{}` {}.\n",
                 candidates.len(),
                 CallGraph::bare_name(function),
-                resolved
+                resolved,
+                scope
             ));
             for candidate in candidates.iter().filter(|c| *c != resolved).take(5) {
                 output.push_str(&format!(
@@ -4638,7 +4680,18 @@ impl CodeIntelEngine {
             output.push_str(&Self::unresolved_function_report(&call_graph, function));
             return Ok(output);
         };
-        output.push_str(&Self::resolution_report(&call_graph, function, &resolved));
+        let others = if transitive {
+            Vec::new()
+        } else {
+            Self::ambiguous_namesakes(&call_graph, function, &resolved)
+        };
+        let others_follow = !others.is_empty() && others.len() <= AMBIGUOUS_CALLERS_SHOWN;
+        output.push_str(&Self::resolution_report(
+            &call_graph,
+            function,
+            &resolved,
+            others_follow,
+        ));
         let function = resolved.as_str();
 
         if transitive {
@@ -4670,6 +4723,24 @@ impl CodeIntelEngine {
             output.push_str(&format!("\nAlso called by the 1C platform: {reason}.\n"));
         }
 
+        // A handful of namesakes is answered in full, so that a question
+        // asked with a short name does not need a second call per candidate.
+        if others_follow {
+            for other in &others {
+                let callers = call_graph.get_callers(other);
+                output.push_str(&format!(
+                    "\n## Callers of {}\n\nFound {} direct callers\n\n",
+                    Self::describe_graph_node(&call_graph, other),
+                    callers.len()
+                ));
+                if callers.is_empty() {
+                    output.push_str("*No callers found.*\n");
+                } else {
+                    output.push_str(&Self::format_call_edges(&callers));
+                }
+            }
+        }
+
         Ok(output)
     }
 
@@ -4697,7 +4768,12 @@ impl CodeIntelEngine {
             output.push_str(&Self::unresolved_function_report(&call_graph, function));
             return Ok(output);
         };
-        output.push_str(&Self::resolution_report(&call_graph, function, &resolved));
+        output.push_str(&Self::resolution_report(
+            &call_graph,
+            function,
+            &resolved,
+            false,
+        ));
         let function = resolved.as_str();
 
         if transitive {
@@ -4770,7 +4846,12 @@ impl CodeIntelEngine {
             output.push_str(&Self::unresolved_function_report(&call_graph, function));
             return Ok(output);
         };
-        output.push_str(&Self::resolution_report(&call_graph, function, &resolved));
+        output.push_str(&Self::resolution_report(
+            &call_graph,
+            function,
+            &resolved,
+            false,
+        ));
 
         match call_graph.get_metrics(&resolved) {
             Some(metrics) => {
