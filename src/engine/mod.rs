@@ -655,6 +655,22 @@ fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
         .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
+/// A Go pointer receiver may be spelled with or without its `*`.
+fn normalize_receiver(receiver: &str) -> &str {
+    receiver.trim().trim_start_matches('*').trim_start()
+}
+
+/// `true` when `receiver` names the type that declares `symbol`.
+fn is_owned_by(symbol: &Symbol, receiver: &str) -> bool {
+    let receiver = normalize_receiver(receiver);
+    symbol
+        .qualified_name
+        .as_deref()
+        .and_then(|q| q.strip_suffix(symbol.name.as_str()))
+        .and_then(|q| q.strip_suffix("::"))
+        == Some(receiver)
+}
+
 /// Narrow namesakes by the `file` argument.
 ///
 /// A full path wins, then a whole-segment suffix (`payment/store.go`).
@@ -762,6 +778,9 @@ pub struct FindSymbolsQuery<'a> {
     pub pattern: Option<&'a str>,
     pub name_regex: Option<&'a str>,
     pub file_pattern: Option<&'a str>,
+    /// Keep only methods whose owning type (Go receiver, Rust `impl`, class)
+    /// is this one.
+    pub receiver: Option<&'a str>,
     pub exclude_tests: Option<bool>,
     pub limit: usize,
     pub compact: bool,
@@ -814,6 +833,7 @@ impl Default for FindSymbolsQuery<'_> {
             pattern: None,
             name_regex: None,
             file_pattern: None,
+            receiver: None,
             exclude_tests: None,
             limit: 200,
             compact: false,
@@ -1785,13 +1805,7 @@ impl CodeIntelEngine {
 
         let candidates: Vec<&Symbol> = filter_by_file(namesakes.clone(), file)
             .into_iter()
-            .filter(|s| match receiver {
-                Some(r) => s
-                    .qualified_name
-                    .as_deref()
-                    .is_some_and(|q| q == format!("{r}::{}", s.name)),
-                None => true,
-            })
+            .filter(|s| receiver.is_none_or(|r| is_owned_by(s, r)))
             .collect();
 
         if candidates.is_empty() {
@@ -1981,6 +1995,7 @@ impl CodeIntelEngine {
             pattern,
             name_regex,
             file_pattern,
+            receiver,
             exclude_tests,
             limit,
             compact,
@@ -1991,6 +2006,9 @@ impl CodeIntelEngine {
                 anyhow::bail!("'pattern' must not be empty; omit it to list all symbols");
             }
         }
+        if receiver.is_some_and(|r| normalize_receiver(r).is_empty()) {
+            anyhow::bail!("'receiver' must not be empty; omit it to search all types");
+        }
 
         // Build cache key from query parameters
         let cache_key = {
@@ -2000,10 +2018,11 @@ impl CodeIntelEngine {
                 exclude_tests,
             };
             let query = format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 pattern.unwrap_or("*"),
                 name_regex.unwrap_or("*"),
                 symbol_type.unwrap_or("all"),
+                receiver.unwrap_or("*"),
                 compact
             );
             QueryCacheKey::code_search_with_options(Some(repo), query, &options)
@@ -2092,6 +2111,9 @@ impl CodeIntelEngine {
                     if !re.is_match(&s.name) {
                         return false;
                     }
+                }
+                if receiver.is_some_and(|r| !is_owned_by(s, r)) {
+                    return false;
                 }
                 // File pattern filter
                 if let Some(ref glob) = glob_pattern {

@@ -305,6 +305,67 @@ pub fn make_target() {}
 }
 
 #[tokio::test]
+async fn find_symbols_receiver_keeps_only_that_types_methods() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "store.go",
+        r#"package store
+
+type PaymentStore struct{}
+type OrderStore struct{}
+
+func (s *PaymentStore) Save() error { return nil }
+func (s *PaymentStore) Load() error { return nil }
+func (s OrderStore) Save() error { return nil }
+func Save() {}
+"#,
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    let out = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "Save", "receiver": "*PaymentStore", "compact": true}),
+        )
+        .await?;
+    assert_eq!(out.lines().count(), 1, "namesakes leaked through:\n{out}");
+    assert!(out.contains("PaymentStore::Save"), "{out}");
+
+    let out = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "receiver": "PaymentStore", "compact": true}),
+        )
+        .await?;
+    let mut names: Vec<&str> = out.lines().map(|l| l.split(' ').next().unwrap()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["PaymentStore::Load", "PaymentStore::Save"], "{out}");
+
+    let out = registry
+        .dispatch(
+            "get_symbol_definition",
+            &engine,
+            json!({"repo": repo.name(), "symbol": "Save", "receiver": "*PaymentStore"}),
+        )
+        .await?;
+    assert!(out.contains("**Qualified**: `PaymentStore::Save`"), "{out}");
+    assert!(out.contains("**Lines**: 6-6"), "{out}");
+
+    registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "receiver": " * "}),
+        )
+        .await
+        .expect_err("an empty receiver must not silently match nothing");
+    Ok(())
+}
+
+#[tokio::test]
 async fn find_symbols_rejects_empty_pattern_and_bad_type() -> Result<()> {
     let repo = TestRepo::new()?;
     repo.add_file("src/lib.rs", "pub fn f() {}\n")?;

@@ -25,6 +25,7 @@ impl ToolHandler for FindSymbolsHandler {
                 pattern: args.get_str_any(&["pattern", "query", "name"]),
                 name_regex: args.get_str("name_regex"),
                 file_pattern: args.get_str("file_pattern"),
+                receiver: args.get_str("receiver"),
                 exclude_tests: args.get_bool("exclude_tests"),
                 limit: args.get_limit_any(&["limit", "max_results"], 200),
                 compact: args.get_bool_or("compact", false),

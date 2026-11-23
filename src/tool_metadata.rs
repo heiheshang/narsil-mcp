@@ -363,6 +363,7 @@ lazy_static! {
                     "name": {"type": "string", "description": "Alias for 'pattern'"},
                     "name_regex": {"type": "string", "description": "Regex (case-insensitive) matched against symbol names, e.g. '^On[A-Z]' or 'Handler$'. Combine with 'pattern' to AND both; omit 'pattern' to match by shape alone."},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py', '**/*.{go,proto}'); a bare filename matches at any depth"},
+                    "receiver": {"type": "string", "description": "Keep only methods of this owning type: the Go receiver (with or without '*'), Rust impl type, or class, e.g. 'PaymentStore'. Omit 'pattern' to list all of its methods."},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
                     "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated. Pass 0 for no limit — a genuine full enumeration."},
                     "max_results": {"type": "integer", "description": "Alias for 'limit'"},
