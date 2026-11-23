@@ -27,7 +27,7 @@ narsil-mcp is a high-performance MCP (Model Context Protocol) server written in 
 │                  McpServer & Tool Registry                   │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │  ToolRegistry (HashMap<name, Box<ToolHandler>>)       │ │
-│  │  - 90 tools across 13 categories                       │ │
+│  │  - 91 tools across 13 categories                       │ │
 │  │  - Async trait-based dispatch                          │ │
 │  │  - Tool metadata management                            │ │
 │  └────────────────────────────────────────────────────────┘ │
@@ -359,7 +359,7 @@ Priority order (highest to lowest):
 **Tool Presets:**
 - `minimal` (26 tools) - Zed, Cursor
 - `balanced` (51 tools) - VS Code
-- `full` (90 tools) - Claude Desktop
+- `full` (91 tools) - Claude Desktop
 - `security-focused` - All security category tools
 
 ---
@@ -509,7 +509,7 @@ Linux kernel (78K+ files):                45 s
 Located in `narsil-plugin/`, provides:
 
 ```
-narsil/                    # Main catalogue (90 tools, parameter naming)
+narsil/                    # Main catalogue (91 tools, parameter naming)
 ├── narsil-search/         # Code search strategies
 ├── narsil-callgraph/      # Call graph analysis
 ├── narsil-static-analysis/ # CFG, DFG, type inference

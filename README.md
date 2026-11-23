@@ -93,7 +93,7 @@ Then run `claude` in the project: the assistant gets the code intelligence tools
 | [Installation Guide](docs/INSTALL.md) | Platform-specific install details |
 | [Configuration](docs/configuration.md) | CLI flags, presets, config files, env vars |
 | [Integrations](docs/integrations.md) | MCP clients, Claude Code plugin, Forgemax, Ralph |
-| [Available Tools](docs/tools.md) | All 90 tools by category |
+| [Available Tools](docs/tools.md) | All 91 tools by category |
 | [Supported Languages](docs/languages.md) | Languages and extracted symbols |
 | [Neural Search](docs/neural-search.md) | Embedding backends and setup |
 | [Visualization Frontend](docs/frontend.md) | Web UI for graphs |

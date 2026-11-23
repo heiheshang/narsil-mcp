@@ -470,7 +470,7 @@ mod tests {
 
     /// Issue #23: the Full preset should expose every registered tool whose
     /// feature requirements are met, regardless of `max_tool_count`. Without
-    /// this bypass, `max_tool_count: 76` silently truncated the 90-tool registry
+    /// this bypass, `max_tool_count: 76` silently truncated the 91-tool registry
     /// even when the user explicitly asked for the Full preset.
     #[test]
     fn test_full_preset_bypasses_performance_budget() {

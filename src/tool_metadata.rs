@@ -363,6 +363,7 @@ lazy_static! {
                     "name": {"type": "string", "description": "Alias for 'pattern'"},
                     "name_regex": {"type": "string", "description": "Regex (case-insensitive) matched against symbol names, e.g. '^On[A-Z]' or 'Handler$'. Combine with 'pattern' to AND both; omit 'pattern' to match by shape alone."},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py', '**/*.{go,proto}'); a bare filename matches at any depth"},
+                    "receiver": {"type": "string", "description": "Keep only methods of this owning type: the Go receiver (with or without '*'), Rust impl type, or class, e.g. 'PaymentStore'. Omit 'pattern' to list all of its methods."},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
                     "limit": {"type": "integer", "description": "Maximum symbols to return (default: 200); output notes when truncated. Pass 0 for no limit — a genuine full enumeration."},
                     "max_results": {"type": "integer", "description": "Alias for 'limit'"},
@@ -400,6 +401,37 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["definition", "symbol_def"],
+        });
+
+        map.insert("compare_symbols", ToolMetadata {
+            name: "compare_symbols",
+            description: "Line diff of two symbol bodies, each addressed by symbol + file (+ repo) — e.g. a base 1C procedure vs its &Вместо/&ИзменениеИКонтроль override in an extension, or the same function in two repos. Namesakes without a narrowing file are an error listing the candidates. Prints similarity, +/− line counts and hunks with file line numbers; says 'identical' when the bodies match. Bodies are read from disk on every call.",
+            category: ToolCategory::Symbols,
+            tags: ["symbol", "diff", "compare", "extension"].iter().copied().collect(),
+            stability: StabilityLevel::Beta,
+            performance: PerformanceImpact::Low,
+            required_flags: HashSet::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository for both sides unless 'left_repo'/'right_repo' override it"},
+                    "left_symbol": {"type": "string", "description": "Name of the first symbol (bare or qualified)"},
+                    "left_function": {"type": "string", "description": "Alias for 'left_symbol'"},
+                    "left_file": {"type": "string", "description": "Narrows the first symbol's namesakes: a repo-relative path, a suffix of one, or a path fragment"},
+                    "left_repo": {"type": "string", "description": "Repository of the first symbol (default: 'repo')"},
+                    "right_symbol": {"type": "string", "description": "Name of the second symbol (default: 'left_symbol')"},
+                    "right_function": {"type": "string", "description": "Alias for 'right_symbol'"},
+                    "right_file": {"type": "string", "description": "Narrows the second symbol's namesakes, like 'left_file'"},
+                    "right_repo": {"type": "string", "description": "Repository of the second symbol (default: 'repo')"},
+                    "ignore_whitespace": {"type": "boolean", "description": "Compare lines with edges trimmed and inner whitespace runs collapsed; original lines are still printed (default: true)"},
+                    "ignore_case": {"type": "boolean", "description": "Compare lines case-insensitively, useful for BSL (default: false)"},
+                    "context_lines": {"type": "integer", "description": "Unchanged lines around each change (default: 3)"},
+                    "max_lines": {"type": "integer", "description": "Cap on printed diff lines; the rest is counted in a truncation note (default: 400, 0 = no cap)"}
+                },
+                "required": ["left_symbol"]
+            }),
+            requires_api_key: false,
+            aliases: vec!["diff_symbols", "symbol_diff"],
         });
 
         map.insert("find_references", ToolMetadata {

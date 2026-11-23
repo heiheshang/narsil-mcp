@@ -234,7 +234,7 @@ pub struct PerformanceConfig {
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
-            // Sized to comfortably hold the full MCP tool registry (90 today)
+            // Sized to comfortably hold the full MCP tool registry (91 today)
             // with headroom; raise as new tools land. The Full preset bypasses
             // this cap entirely (see `ToolFilter::get_enabled_tools`).
             max_tool_count: 128,

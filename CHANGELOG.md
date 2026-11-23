@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`compare_symbols`: a line diff of two symbol bodies.** Comparing a base 1C
+  procedure with its `&Вместо` override in an extension used to take two
+  `get_symbol_definition` calls and a diff written by the agent. Each side is
+  addressed by `left_symbol`/`left_file`/`left_repo` and the same `right_*`
+  (`right_symbol` defaults to the left one); namesakes left after the file
+  filter are an error listing them, not a silent pick. The answer is a
+  similarity percentage, `+N −M` counts and Patience-diff hunks with both
+  files' line numbers, or `identical` (`modulo whitespace/case` when only the
+  normalisation made it so). `ignore_whitespace` (on by default),
+  `ignore_case`, `context_lines` (3) and `max_lines` (400, with a truncation
+  note) tune it. In the `minimal` and `balanced` presets; needs no flags.
+- A full path in `file` now picks that file over a longer path ending with it:
+  `CommonModules/X/Ext/Module.bsl` no longer also matches the same module
+  inside an extension (`get_symbol_definition`, `find_symbol_usages`,
+  `compare_symbols`).
+
 - **Git worktrees are indexed.** A server started on the main checkout used to
   search only that checkout, so in a session inside a git worktree the branch's
   code was not found. The worktrees of every repository in `--repos` are now

@@ -2,7 +2,7 @@
 
 # Available Tools
 
-## Tools by category (90)
+## Tools by category (91)
 
 ### Repository & File Management
 
@@ -23,6 +23,7 @@
 |------|-------------|
 | `find_symbols` | Find structs, classes, functions by type/pattern |
 | `get_symbol_definition` | Get symbol source with surrounding context |
+| `compare_symbols` | Line diff of two symbol bodies (symbol + file + repo per side), e.g. a base 1C procedure vs its `&Вместо` override |
 | `find_references` | Find all references to a symbol |
 | `get_dependencies` | Analyze imports and dependents |
 | `workspace_symbol_search` | Fuzzy search symbols across workspace |
