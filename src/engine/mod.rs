@@ -1985,6 +1985,59 @@ impl CodeIntelEngine {
         Ok(FilePattern { patterns })
     }
 
+    /// For a `find_symbols` name that matched nothing: the files whose path
+    /// has a directory or file named so, with their symbol counts. A 1C
+    /// object (`ПечатьОбщихФорм`), a Go package or a module is not itself a
+    /// symbol, but its procedures are — reachable through `file_pattern`.
+    fn modules_named_like(
+        symbols: &[Symbol],
+        name: &str,
+        keep: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        const SHOWN: usize = 8;
+        let wanted = name.to_lowercase();
+        let names_it = |path: &str| {
+            path.split('/').any(|segment| {
+                let stem = segment.split('.').next().unwrap_or(segment);
+                stem.to_lowercase() == wanted
+            })
+        };
+        let mut files: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        // Symbols of one file are stored together: the path is judged once
+        // per run of them, not once per symbol.
+        let mut last: Option<(&str, bool)> = None;
+        for symbol in symbols {
+            let path = symbol.file_path.as_str();
+            let wanted_file = match last {
+                Some((seen, verdict)) if seen == path => verdict,
+                _ => {
+                    let verdict = names_it(path) && keep(path);
+                    last = Some((path, verdict));
+                    verdict
+                }
+            };
+            if wanted_file {
+                *files.entry(path).or_default() += 1;
+            }
+        }
+        if files.is_empty() {
+            return None;
+        }
+        let mut hint = format!(
+            "No symbol is named `{name}`, but {} file(s) sit under that name — it names a module, \
+             object or package rather than a procedure. List their symbols with \
+             `file_pattern: \"**/{name}/**\"` (or the file path below):\n",
+            files.len()
+        );
+        for (path, count) in files.iter().take(SHOWN) {
+            hint.push_str(&format!("- `{path}` ({count} symbols)\n"));
+        }
+        if files.len() > SHOWN {
+            hint.push_str(&format!("- … and {} more\n", files.len() - SHOWN));
+        }
+        Some(hint)
+    }
+
     pub async fn find_symbols(&self, q: FindSymbolsQuery<'_>) -> Result<String> {
         use crate::security_rules::is_test_file;
         use regex::RegexBuilder;
@@ -2143,6 +2196,13 @@ impl CodeIntelEngine {
 
         let total = filtered.len();
         filtered.truncate(limit);
+        let empty_hint = match (total, pattern, name_regex) {
+            (0, Some(name), None) => Self::modules_named_like(&symbols, name, |path| {
+                !(exclude_tests && is_test_file(path))
+                    && glob_pattern.as_ref().is_none_or(|g| g.matches(path))
+            }),
+            _ => None,
+        };
 
         // Collect dependent files for smart invalidation
         let dependent_files: Vec<String> = filtered.iter().map(|s| s.file_path.clone()).collect();
@@ -2166,6 +2226,9 @@ impl CodeIntelEngine {
                     symbol_location(sym)
                 ));
             }
+            if let Some(hint) = &empty_hint {
+                output.push_str(hint);
+            }
             if self.options.cache_enabled {
                 self.query_cache
                     .insert_with_files(cache_key, output.clone(), dependent_files);
@@ -2182,6 +2245,9 @@ impl CodeIntelEngine {
             ));
         } else {
             output.push_str(&format!("Found {} symbols\n\n", total));
+        }
+        if let Some(hint) = &empty_hint {
+            output.push_str(hint);
         }
 
         // Group by kind

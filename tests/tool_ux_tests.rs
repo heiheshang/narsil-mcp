@@ -304,6 +304,59 @@ pub fn make_target() {}
     Ok(())
 }
 
+/// `ПечатьОбщихФорм` is a 1C data processor, not a procedure: asked for by
+/// that name, `find_symbols` finds nothing, and the answer has to say where
+/// the object's modules are instead of a bare zero.
+#[tokio::test]
+async fn find_symbols_points_an_object_name_at_its_modules() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let module = "Процедура ЗаполнитьРеквизитыШапкиУПД(ДанныеПечати) Экспорт\nКонецПроцедуры\n";
+    repo.add_file(
+        "DataProcessors/ПечатьОбщихФорм/Ext/ManagerModule.bsl",
+        module,
+    )?;
+    repo.add_file(
+        "ОбменСВесамиDIGI/DataProcessors/ПечатьОбщихФорм/Ext/ManagerModule.bsl",
+        "&Вместо(\"ЗаполнитьРеквизитыШапкиТОРГ12\")\nПроцедура DIGIЗаполнитьРеквизитыШапкиТОРГ12(ДанныеПечати)\nКонецПроцедуры\n",
+    )?;
+    repo.add_file(
+        "DataProcessors/ПечатьСчета/Ext/ManagerModule.bsl",
+        "Процедура Печать() Экспорт\nКонецПроцедуры\n",
+    )?;
+    let (engine, _idx) = engine_for(&repo).await?;
+    let registry = ToolRegistry::new();
+
+    for compact in [false, true] {
+        let out = registry
+            .dispatch(
+                "find_symbols",
+                &engine,
+                json!({"repo": repo.name(), "pattern": "печатьобщихформ", "compact": compact}),
+            )
+            .await?;
+        assert!(
+            out.contains("`DataProcessors/ПечатьОбщихФорм/Ext/ManagerModule.bsl` (1 symbols)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ОбменСВесамиDIGI/DataProcessors/ПечатьОбщихФорм/Ext/ManagerModule.bsl"),
+            "{out}"
+        );
+        assert!(out.contains("**/печатьобщихформ/**"), "{out}");
+        assert!(!out.contains("ПечатьСчета"), "{out}");
+    }
+
+    let unknown = registry
+        .dispatch(
+            "find_symbols",
+            &engine,
+            json!({"repo": repo.name(), "pattern": "НетТакогоИмени"}),
+        )
+        .await?;
+    assert!(!unknown.contains("sit under that name"), "{unknown}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn find_symbols_receiver_keeps_only_that_types_methods() -> Result<()> {
     let repo = TestRepo::new()?;
